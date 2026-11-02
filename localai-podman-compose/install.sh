@@ -857,6 +857,7 @@ write_compose_service() {
     "$compose_file" "$tls_project_name" >>"$tmp_service"
 
   log "Installing user systemd compose unit at $user_unit_dir/$tls_service_name"
+  localai_installer_ensure_service_directory "$tls_state_dir/.config/systemd" "TLS systemd configuration directory" "$tls_user" "$tls_user" "$tls_uid" 0700 || die "Unsafe TLS systemd configuration directory."
   localai_installer_ensure_service_directory "$user_unit_dir" "TLS user-unit directory" "$tls_user" "$tls_user" "$tls_uid" 0700 || die "Unsafe TLS user-unit directory."
   localai_installer_check_managed_file "$user_unit_dir/$tls_service_name" "TLS user unit" "$tls_uid" \
     '# Managed by LocalAI secureblue TLS installer.' 'Description=LocalAI TLS reverse proxy compose stack' || die "Refusing to replace an unrelated TLS user unit."

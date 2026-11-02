@@ -448,6 +448,53 @@ source_production_function() {
   source <(/usr/bin/sed -n "/^${function_name}() {$/,/^}/p" "$source_file")
 }
 
+printf 'User unit directory ownership checks\n'
+(
+  source_production_function "$repo_root/secureblue-localai-install/install.sh" install_systemd_service
+  source_production_function "$repo_root/localai-podman-compose/install.sh" write_compose_service
+  # These stubs keep generated files in scratch and record service-owned directories.
+  # shellcheck disable=SC2329
+  localai_installer_mktemp_var() { printf -v "$1" '%s' "$scratch/generated-unit"; }
+  # shellcheck disable=SC2329
+  localai_installer_ensure_service_directory() { printf '%s %s %s %s\n' "$1" "$3" "$4" "$6" >>"$scratch/unit-directories"; }
+  # shellcheck disable=SC2329
+  localai_installer_check_managed_file() { :; }
+  # shellcheck disable=SC2329
+  localai_tls_render_compose_service_template() { printf '[Service]\n'; }
+  # shellcheck disable=SC2329
+  run0_pipe() { :; }
+  # shellcheck disable=SC2329
+  run_as_localai() { :; }
+  # shellcheck disable=SC2329
+  run_as_tls() { :; }
+  # shellcheck disable=SC2329
+  restore_existing_service() { :; }
+  # shellcheck disable=SC2329
+  log() { :; }
+  # shellcheck disable=SC2329
+  die() { exit 1; }
+  # shellcheck disable=SC2329
+  localai_image_ref() { printf 'example.invalid/image:cpu\n'; }
+  for name in models app_home backends download_staging backend_temp data config generated_content upload cache log; do
+    eval "localai_${name}_path() { printf '%s\\n' '$scratch/data'; }"
+  done
+  # The installer calls these two helpers with different names.
+  localai_config_dir() { localai_config_path; }
+  localai_backend_temp_dir() { localai_backend_temp_path; }
+  localai_cache_dir() { localai_cache_path; }
+  localai_log_dir() { localai_log_path; }
+  state_dir="$scratch/backend" service_user=test-service service_uid=12345
+  script_dir="$repo_root/secureblue-localai-install"
+  : >"$scratch/unit-directories"
+  install_systemd_service
+  [[ "$(<"$scratch/unit-directories")" == $"$scratch/backend/.config/systemd test-service test-service 0700"$'\n'$"$scratch/backend/.config/systemd/user test-service test-service 0700" ]]
+  install_service=1 tls_state_dir="$scratch/tls" tls_user=test-tls tls_uid=12346
+  tls_compose_dir="$scratch/compose" tls_compose_file_name=compose.yaml tls_service_name=tls.service tls_project_name=test
+  : >"$scratch/unit-directories"
+  write_compose_service
+  [[ "$(<"$scratch/unit-directories")" == $"$scratch/tls/.config/systemd test-tls test-tls 0700"$'\n'$"$scratch/tls/.config/systemd/user test-tls test-tls 0700" ]]
+) || fail "generated user units lack service-owned parent directories"
+
 printf 'Backend install and upgrade state checks\n'
 (
   source_production_function "$repo_root/secureblue-localai-install/install.sh" snapshot_existing_service_state

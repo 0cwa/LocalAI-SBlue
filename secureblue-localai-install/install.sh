@@ -614,6 +614,7 @@ install_systemd_service() {
     -e "s|@GPU_DEVICE_ARGS@|$gpu_device_args|g" \
     "$script_dir/localai.service.in" >>"$tmp_service"
 
+  localai_installer_ensure_service_directory "$state_dir/.config/systemd" "LocalAI systemd configuration directory" "$service_user" "$service_user" "$service_uid" 0700 || die "Unsafe LocalAI systemd configuration directory."
   localai_installer_ensure_service_directory "$user_unit_dir" "LocalAI user-unit directory" "$service_user" "$service_user" "$service_uid" 0700 || die "Unsafe LocalAI user-unit directory."
   if [[ -e "$user_unit_dir/localai.service" || -L "$user_unit_dir/localai.service" ]]; then
     [[ ! -L "$user_unit_dir/localai.service" && -f "$user_unit_dir/localai.service" ]] || die "Refusing to replace a non-regular LocalAI service unit."
