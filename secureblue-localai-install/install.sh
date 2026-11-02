@@ -428,12 +428,31 @@ ensure_gpu_groups() {
 }
 
 install_project_files() {
-  local asset_real project_real
+  local asset_real project_real legacy_assets=0 project_owner
   log "Installing LocalAI project files to $project_dir"
   asset_real="$(readlink -f "$asset_dir")"
   project_real="$(readlink -f "$project_dir" 2>/dev/null || true)"
 
-  localai_installer_ensure_service_directory "$project_dir" "LOCALAI_PROJECT_DIR" "$service_user" "$service_user" "$service_uid" 0750 || die "Unsafe LocalAI project path."
+  localai_installer_check_directory_chain "${project_dir%/*}" "LOCALAI_PROJECT_DIR parent" "$service_uid" || die "Unsafe LocalAI project parent."
+  [[ ! -L "$project_dir" ]] || die "Unsafe LocalAI project path."
+  if [[ -d "$project_dir" ]]; then
+    project_owner="$(/usr/bin/stat -c '%u' -- "$project_dir")" || die "Cannot inspect LocalAI project path."
+    if [[ "$project_owner" != 0 && "$project_owner" != "$service_uid" ]]; then
+      log "Warning: leaving the existing project asset copy untouched because it has a different owner; installation uses the supplied asset bundle."
+      return 0
+    fi
+  fi
+  localai_installer_check_directory_chain "$project_dir" "LOCALAI_PROJECT_DIR" "$service_uid" || die "Unsafe LocalAI project path."
+  if [[ -d "$project_dir" && ! -L "$project_dir" ]]; then
+    project_owner="$(/usr/bin/stat -c '%u' -- "$project_dir")" || die "Cannot inspect LocalAI project path."
+    if [[ "$project_owner" == 0 && "$service_uid" != 0 ]] && [[ -n "$(/usr/bin/find -P "$project_dir" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+      localai_installer_check_legacy_assets "$project_dir" "$asset_dir" 0 || die "Refusing unknown contents in root-owned LocalAI project path."
+      legacy_assets=1
+    fi
+  fi
+  if [[ "$legacy_assets" == 0 ]]; then
+    localai_installer_ensure_service_directory "$project_dir" "LOCALAI_PROJECT_DIR" "$service_user" "$service_user" "$service_uid" 0750 || die "Unsafe LocalAI project path."
+  fi
   project_real="$(readlink -f "$project_dir")"
 
   if [[ "$asset_real" == "$project_real" ]]; then
@@ -443,6 +462,11 @@ install_project_files() {
       die "Refusing to update project tree with symbolic links: $project_dir"
     fi
     run0_pipe /usr/bin/cp -a "$asset_dir/." "$project_dir/"
+    # cp -a copies the source directory's metadata onto the destination.
+    # Restore the managed directory without touching the copied contents.
+    if [[ "$legacy_assets" == 0 ]]; then
+      run0_pipe /usr/bin/install -d -o "$service_user" -g "$service_user" -m 0750 "$project_dir"
+    fi
   fi
 
   if [[ -x /usr/sbin/restorecon ]]; then

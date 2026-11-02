@@ -90,6 +90,20 @@ localai_installer_check_config_parent /etc/localai/localai.conf || fail "canonic
 expect_reject noncanonical-config-parent localai_installer_check_config_parent /etc/unrelated/localai.conf
 expect_reject service-data-under-etc localai_installer_validate_managed_path /etc/localai state
 
+mkdir -p "$scratch/old-assets" "$scratch/new-assets"
+printf 'old\n' > "$scratch/old-assets/localai.lock"
+printf 'new\n' > "$scratch/new-assets/localai.lock"
+localai_installer_check_legacy_assets "$scratch/old-assets" "$scratch/new-assets" "$(id -u)" || fail "known legacy assets rejected"
+printf 'unknown\n' > "$scratch/old-assets/unknown"
+expect_reject unknown-legacy-asset localai_installer_check_legacy_assets "$scratch/old-assets" "$scratch/new-assets" "$(id -u)"
+rm "$scratch/old-assets/unknown"
+chmod 0666 "$scratch/old-assets/localai.lock"
+expect_reject writable-legacy-asset localai_installer_check_legacy_assets "$scratch/old-assets" "$scratch/new-assets" "$(id -u)"
+chmod 0644 "$scratch/old-assets/localai.lock"
+rm "$scratch/old-assets/localai.lock"
+ln -s "$scratch/new-assets/localai.lock" "$scratch/old-assets/localai.lock"
+expect_reject linked-legacy-asset localai_installer_check_legacy_assets "$scratch/old-assets" "$scratch/new-assets" "$(id -u)"
+
 expect_reject_with_message() {
   local description="$1" expected_message="$2" output
   shift 2
@@ -483,6 +497,22 @@ source_production_function() {
   # shellcheck disable=SC1090
   source <(/usr/bin/sed -n "/^${function_name}() {$/,/^}/p" "$source_file")
 }
+
+(
+  source_production_function "$repo_root/secureblue-localai-install/install.sh" install_project_files
+  # Exercise the refusal to touch a project copy owned by another user.
+  project_dir="$scratch/foreign-project"
+  asset_dir="$scratch/new-assets"
+  service_uid=1234567
+  mkdir -p "$project_dir"
+  printf 'preserve\n' > "$project_dir/sentinel"
+  localai_installer_check_directory_chain() { :; }
+  log() { printf '%s\n' "$*" >> "$scratch/foreign-project-log"; }
+  die() { fail "$*"; }
+  install_project_files
+  [[ "$(<"$project_dir/sentinel")" == preserve ]] || fail "foreign project copy changed"
+  rg -q 'leaving the existing project asset copy untouched' "$scratch/foreign-project-log" || fail "foreign project copy warning missing"
+)
 
 printf 'User unit directory ownership checks\n'
 (

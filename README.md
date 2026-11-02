@@ -298,6 +298,9 @@ the new release, review changes to `config/localai.conf.example`, and rerun the
 backend and TLS installers as needed. The installers preserve service state
 unless a destructive purge option is selected. Pin image digests in the shared
 config when you need to reproduce a specific backend image.
+If an older project asset copy has another owner, the installer leaves that
+copy untouched and uses the supplied release bundle; inspect the old copy
+before removing it manually.
 
 To roll back, stop the services, restore the previous release and shared
 config, and rerun its installers to regenerate service files. Restore

@@ -172,6 +172,24 @@ localai_installer_ensure_service_directory() {
   /usr/bin/install -d -o "$owner" -g "$group" -m "$mode" -- "$path"
 }
 
+# Older copies left the asset directory root-owned. Permit that layout only
+# when every existing entry is a regular, root-owned, non-writable asset with
+# a corresponding name in the new bundle. Never adopt the directory.
+localai_installer_check_legacy_assets() {
+  local path="$1" assets="$2" expected_owner="$3" entry name owner mode
+  [[ -d "$path" && ! -L "$path" && -d "$assets" ]] || return 1
+  owner="$(/usr/bin/stat -c '%u' -- "$path")" || return 1
+  mode="$(/usr/bin/stat -c '%a' -- "$path")" || return 1
+  [[ "$owner" == "$expected_owner" ]] && (( (8#$mode & 0022) == 0 )) || return 1
+  while IFS= read -r -d '' entry; do
+    name="${entry##*/}"
+    [[ -f "$entry" && ! -L "$entry" && -f "$assets/$name" && ! -L "$assets/$name" ]] || return 1
+    owner="$(/usr/bin/stat -c '%u' -- "$entry")" || return 1
+    mode="$(/usr/bin/stat -c '%a' -- "$entry")" || return 1
+    [[ "$owner" == "$expected_owner" ]] && (( (8#$mode & 0022) == 0 )) || return 1
+  done < <(/usr/bin/find -P "$path" -mindepth 1 -maxdepth 1 -print0)
+}
+
 # Old releases could leave the intermediate systemd directory root-owned and
 # non-traversable. Only repair the known layout with a private, service-owned
 # user directory; never adopt or expose unknown contents.
