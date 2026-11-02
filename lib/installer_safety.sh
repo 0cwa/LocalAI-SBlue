@@ -190,6 +190,13 @@ localai_installer_check_legacy_assets() {
   done < <(/usr/bin/find -P "$path" -mindepth 1 -maxdepth 1 -print0)
 }
 
+localai_installer_copy_project_assets() {
+  local assets="$1" destination="$2"
+  # Copy children rather than '.', so source directory metadata never changes
+  # the checked destination. New files are owned by the privileged installer.
+  /usr/bin/find -P "$assets" -mindepth 1 -maxdepth 1 -exec /usr/bin/cp -a --no-preserve=ownership -t "$destination/" -- '{}' +
+}
+
 # Old releases could leave the intermediate systemd directory root-owned and
 # non-traversable. Only repair the known layout with a private, service-owned
 # user directory; never adopt or expose unknown contents.

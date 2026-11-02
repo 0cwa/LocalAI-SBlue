@@ -103,6 +103,12 @@ chmod 0644 "$scratch/old-assets/localai.lock"
 rm "$scratch/old-assets/localai.lock"
 ln -s "$scratch/new-assets/localai.lock" "$scratch/old-assets/localai.lock"
 expect_reject linked-legacy-asset localai_installer_check_legacy_assets "$scratch/old-assets" "$scratch/new-assets" "$(id -u)"
+mkdir -p "$scratch/copy-source" "$scratch/copy-destination"
+printf 'asset\n' > "$scratch/copy-source/tool"
+chmod 0755 "$scratch/copy-source/tool" "$scratch/copy-source"
+chmod 0700 "$scratch/copy-destination"
+localai_installer_copy_project_assets "$scratch/copy-source" "$scratch/copy-destination" || fail "asset copy failed"
+[[ "$(stat -c '%a' "$scratch/copy-destination")" == 700 && -x "$scratch/copy-destination/tool" ]] || fail "asset copy changed destination mode or lost executable mode"
 
 expect_reject_with_message() {
   local description="$1" expected_message="$2" output

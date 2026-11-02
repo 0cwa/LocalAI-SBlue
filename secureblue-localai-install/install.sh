@@ -475,12 +475,7 @@ install_project_files() {
     if [[ -n "$(/usr/bin/find -P "$project_dir" -mindepth 1 -type l -print -quit 2>/dev/null)" ]]; then
       die "Refusing to update project tree with symbolic links: $project_dir"
     fi
-    run0_pipe /usr/bin/cp -a "$asset_dir/." "$project_dir/"
-    # cp -a copies the source directory's metadata onto the destination.
-    # Restore the managed directory without touching the copied contents.
-    if [[ "$legacy_assets" == 0 ]]; then
-      run0_pipe /usr/bin/install -d -o "$service_user" -g "$service_user" -m 0750 "$project_dir"
-    fi
+    localai_installer_copy_project_assets "$asset_dir" "$project_dir" || die "Could not update LocalAI project assets."
   fi
 
   if [[ -x /usr/sbin/restorecon ]]; then
