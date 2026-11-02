@@ -5,6 +5,8 @@ has been runtime-qualified on secureblue or on a GPU.
 
 ## Unreleased
 
+- Record the Quadlet migration decision and generator prototype.
+
 - Use one version source for packages and the controller, with attested tag-driven releases.
 
 - Consolidate planning on the public roadmap and document evidence, secrets, and data safety.

@@ -1,0 +1,3 @@
+# Copy to a .conf drop-in only when boot activation is explicitly requested.
+[Install]
+WantedBy=default.target
