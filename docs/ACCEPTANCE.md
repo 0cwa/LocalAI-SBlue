@@ -6,8 +6,8 @@ clean machine or a disposable VM. The script refuses existing LocalAI service
 accounts, shared configuration, installer metadata, service state, and managed
 forwarding units. Never point it at a deployment you need to keep.
 
-The receipt records mode, secureblue deployment checksum, kernel, Podman and
-systemd versions, image reference and digest, and the command and outcome of
+The receipt records mode, project version and source-archive SHA-256, secureblue
+deployment checksum, kernel, Podman and systemd versions, image reference and digest, and the command and outcome of
 each bounded step. It does not include raw command output. A failed or timed-out
 step stops the run. The receipt states when TLS has not been exercised; a VM
 run does not qualify a physical host, a GPU, a model, or another secureblue
@@ -62,4 +62,5 @@ scripts/host-acceptance.sh --host --resume
 
 The runner compares boot IDs before post-reboot checks and resumes completed
 steps from root-owned checkpoints. A host-mode test performed inside a VM is
-recorded as VM evidence. Never treat a VM or mocked run as GPU qualification.
+recorded as VM evidence. If virtualization is not detected, the receipt says
+`host-unverified`; it does not establish that physical hardware was used. Never treat a VM or mocked run as GPU qualification.

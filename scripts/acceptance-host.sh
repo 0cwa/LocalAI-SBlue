@@ -29,7 +29,7 @@ write_phase() {
 disable_runner() { systemctl disable "$unit_name" >/dev/null 2>&1 || :; }
 
 begin() {
-  local source_root="$1" archive version
+  local source_root="$1" archive version archive_digest
   [[ ! -e "$state" && ! -L "$state" && ! -e "$unit" && ! -L "$unit" ]] || fail 'an acceptance run or unit already exists; inspect it before starting.'
   [[ "$(getenforce)" == Enforcing ]] || fail 'host SELinux must be enforcing.'
   systemctl is-active --quiet debug-shell.service && fail 'debug shell must be inactive.'
@@ -55,6 +55,9 @@ begin() {
   version="$(<"$source_root/VERSION")"
   [[ "$version" =~ ^[0-9A-Za-z.+-]+$ ]] || fail 'invalid package version.'
   archive="$state/dist/localai-secureblue-$version.tar.gz"
+  read -r archive_digest _ <"$archive.sha256" || fail 'could not read package digest.'
+  [[ "$archive_digest" =~ ^[a-f0-9]{64}$ ]] || fail 'invalid package digest.'
+  printf 'project-version: %s\nproject-archive-sha256: %s\n' "$version" "$archive_digest" >>"$state/receipt"
   tar -xz --strip-components=1 -C "$state/source" <"$archive" || fail 'could not extract the source package.'
   write_phase prepared
   cat >"$unit" <<'UNIT'

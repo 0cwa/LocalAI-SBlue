@@ -32,6 +32,39 @@ if systemctl is-active --quiet debug-shell.service; then
   fail 'debug shell must be inactive during acceptance.'
 fi
 
+ensure_initial_isolation() {
+  if [[ "$mode" == vm ]]; then
+    localai_acceptance_clean_install / || fail 'pre-existing LocalAI state is not an isolated test install.'
+  elif [[ ! -e "$host_state/install-started" && ! -L "$host_state/install-started" ]]; then
+    localai_acceptance_clean_install / || fail 'pre-existing LocalAI state is not an isolated test install.'
+    printf 'started\n' >"$host_state/install-started"
+  elif [[ ! -f "$host_state/install-started" || -L "$host_state/install-started" ]]; then
+    fail 'host install marker is not a regular file.'
+  fi
+}
+
+evidence_mode_for_host() {
+  local status=0
+  systemd-detect-virt --vm --quiet || status=$?
+  case "$status" in
+    0) printf 'vm\n' ;;
+    1) printf 'host-unverified\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+wait_for_health() {
+  local controller="$1" output deadline=$((SECONDS + 80))
+  while (( SECONDS < deadline )); do
+    output="$("$controller" doctor 2>&1)" || :
+    if [[ "$output" == *"health result: HTTP 200"* || "$output" == *"health result: HTTP 401"* ]]; then
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
 service_systemctl() {
   local uid
   uid="$(id -u localai)" || return 1
@@ -39,6 +72,34 @@ service_systemctl() {
     --setenv=HOME=/var/lib/localai --setenv="XDG_RUNTIME_DIR=/run/user/$uid" \
     --setenv="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" \
     --setenv=PATH=/usr/bin:/bin -- /usr/bin/systemctl --user "$@"
+}
+
+cpu_image=docker.io/localai/localai:latest-cpu
+service_podman() {
+  local uid
+  uid="$(id -u localai)" || return 1
+  systemd-run --user --machine=localai@.host --wait --pipe --collect \
+    --setenv=HOME=/var/lib/localai --setenv="XDG_RUNTIME_DIR=/run/user/$uid" \
+    --setenv="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" \
+    --setenv=PATH=/usr/bin:/bin -- /usr/bin/podman "$@"
+}
+
+unrelated_container_matches() {
+  local run_id="$1" actual
+  [[ "$run_id" =~ ^[a-f0-9]{32}$ ]] || return 2
+  actual="$(service_podman inspect localai-acceptance-unrelated --format '{{index .Config.Labels "io.localai.acceptance.run"}}' 2>/dev/null)" || return 1
+  [[ "$actual" == "$run_id" ]]
+}
+
+ensure_unrelated_container() {
+  local run_id="$1" status=0
+  [[ "$run_id" =~ ^[a-f0-9]{32}$ ]] || return 2
+  service_podman container exists localai-acceptance-unrelated >/dev/null 2>&1 || status=$?
+  case "$status" in
+    0) unrelated_container_matches "$run_id" ;;
+    1) service_podman create --name localai-acceptance-unrelated --label "io.localai.acceptance.run=$run_id" "$cpu_image" >/dev/null ;;
+    *) return 1 ;;
+  esac
 }
 
 check_unit() {
@@ -50,6 +111,21 @@ check_unit() {
 
 if [[ "${1:-}" == --check-unit && "$#" == 3 ]]; then
   check_unit "$2" "$3"
+  exit $?
+fi
+
+if [[ "${1:-}" == --check-health && "$#" == 2 ]]; then
+  wait_for_health "$2"
+  exit $?
+fi
+
+if [[ "${1:-}" == --verify-unrelated && "$#" == 2 ]]; then
+  unrelated_container_matches "$2"
+  exit $?
+fi
+
+if [[ "${1:-}" == --ensure-unrelated && "$#" == 2 ]]; then
+  ensure_unrelated_container "$2"
   exit $?
 fi
 
@@ -104,7 +180,7 @@ step() {
     preserve-config) description='compare installed config with pre-upgrade copy' ;;
     preserve-data|uninstall-preserves-data) description='check persistent test marker' ;;
     conservative-uninstall) description='backend uninstaller --yes' ;;
-    uninstall-preserves-unrelated-container) description='podman container exists unrelated test container' ;;
+    uninstall-preserves-unrelated-container) description='podman inspect unrelated test container ownership label' ;;
     *) fail 'unknown acceptance step.' ;;
   esac
   printf 'command %s: %s\n' "$label" "$description" >>"$receipt"
@@ -161,12 +237,9 @@ check() {
 }
 installer="$repo_root/secureblue-localai-install/install.sh"
 controller="$repo_root/bin/localaictl"
-cpu_image=docker.io/localai/localai:latest-cpu
 
 if [[ "$phase" == install ]]; then
-  if [[ "$mode" == vm ]]; then
-    localai_acceptance_clean_install / || fail 'pre-existing LocalAI state is not an isolated test install.'
-  fi
+  ensure_initial_isolation
   os_id="$(awk -F= '$1 == "ID" {gsub(/"/, "", $2); print $2}' /etc/os-release)"
   os_version="$(awk -F= '$1 == "VERSION_ID" {gsub(/"/, "", $2); print $2}' /etc/os-release)"
   image_id="$(awk -F= '$1 == "IMAGE_ID" {gsub(/"/, "", $2); print $2}' /etc/os-release)"
@@ -181,7 +254,9 @@ if [[ "$phase" == install ]]; then
   [[ "$os_id" == secureblue ]] || fail 'acceptance requires secureblue.'
   {
     evidence_mode="$mode"
-    if [[ "$mode" == host ]] && systemd-detect-virt --vm --quiet; then evidence_mode=vm; fi
+    if [[ "$mode" == host ]]; then
+      evidence_mode="$(evidence_mode_for_host)" || fail 'could not determine host virtualization state.'
+    fi
     printf 'mode: %s\nscope: backend only; TLS not exercised\nos: %s %s %s\nos-deployment: %s\nkernel: %s\npodman: %s\nsystemd: %s\nimage: %s\n' \
       "$evidence_mode" "$os_id" "$os_version" "$image_id" "$deployment" "$kernel" "$podman_version" "$systemd_version" "$cpu_image"
     printf 'security: SELinux enforcing; container-domain user namespaces requested\n'
@@ -277,12 +352,7 @@ else
       /usr/bin/podman inspect localai --format "{{.State.Running}}")
     [[ "$state" == true ]]
   '
-  # The inner shell expands its own positional parameter.
-  # shellcheck disable=SC2016
-  step doctor 90 bash -c '
-    output=$("$1" doctor 2>&1) || :
-    [[ "$output" == *"health result: HTTP 200"* || "$output" == *"health result: HTTP 401"* ]]
-  ' bash "$controller"
+  step doctor 90 "$0" --check-health "$controller"
   if [[ ! -e "$work/config-before" && ! -L "$work/config-before" ]]; then
     cp -- /etc/localai/localai.conf "$work/config-before"
   fi
@@ -295,9 +365,15 @@ else
     grep -qx 'localai acceptance marker' /var/lib/localai/models/.acceptance-marker || fail 'test-data marker is not owned by this run.'
     if [[ "$mode" == host ]]; then printf 'created\n' >"$progress/test-marker-created"; fi
   fi
-  step create-unrelated-container 120 systemd-run --user --machine=localai@.host --wait --pipe --collect \
-    --setenv=HOME=/var/lib/localai --setenv=PATH=/usr/bin:/bin -- \
-    /usr/bin/podman create --name localai-acceptance-unrelated "$cpu_image"
+  if [[ ! -e "$work/container-run-id" && ! -L "$work/container-run-id" ]]; then
+    id_tmp="$(mktemp "$work/container-run-id.XXXXXX")"
+    od -An -N16 -tx1 /dev/urandom | tr -d ' \n' >"$id_tmp"
+    mv -- "$id_tmp" "$work/container-run-id"
+  fi
+  [[ -f "$work/container-run-id" && ! -L "$work/container-run-id" ]] || fail 'test container identity is not a regular file.'
+  run_id="$(<"$work/container-run-id")"
+  [[ "$run_id" =~ ^[a-f0-9]{32}$ ]] || fail 'test container identity is invalid.'
+  step create-unrelated-container 120 "$0" --ensure-unrelated "$run_id"
   step upgrade-disabled-running 1200 env LOCALAI_IMAGE_REF_OVERRIDE="$cpu_image" bash "$installer" --yes --no-pull
   check upgrade-disabled-running-state active disabled
   step enable-boot 30 "$0" --set-unit-enabled enable
@@ -314,7 +390,5 @@ else
   step preserve-data 30 grep -qx 'localai acceptance marker' /var/lib/localai/models/.acceptance-marker
   step conservative-uninstall 900 bash "$repo_root/secureblue-localai-install/uninstall.sh" --yes
   step uninstall-preserves-data 30 grep -qx 'localai acceptance marker' /var/lib/localai/models/.acceptance-marker
-  step uninstall-preserves-unrelated-container 120 systemd-run --user --machine=localai@.host --wait --pipe --collect \
-    --setenv=HOME=/var/lib/localai --setenv=PATH=/usr/bin:/bin -- \
-    /usr/bin/podman container exists localai-acceptance-unrelated
+  step uninstall-preserves-unrelated-container 120 "$0" --verify-unrelated "$run_id"
 fi

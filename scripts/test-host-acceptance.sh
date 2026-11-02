@@ -53,6 +53,78 @@ fi
   step fresh-idle 2 true
   [[ -f "$progress/fresh-idle" ]]
 )
+# Host evidence fails closed when virtualization is not reliably detected.
+(
+  # shellcheck disable=SC1090
+  source <(sed -n '/^evidence_mode_for_host() {$/,/^}/p' "$repo_root/scripts/acceptance-guest.sh")
+  # shellcheck disable=SC2329
+  systemd-detect-virt() { return "$VIRT_STATUS"; }
+  [[ "$(VIRT_STATUS=0 evidence_mode_for_host)" == vm ]]
+  [[ "$(VIRT_STATUS=1 evidence_mode_for_host)" == host-unverified ]]
+  if VIRT_STATUS=2 evidence_mode_for_host >/dev/null; then exit 1; fi
+)
+# Recheck isolation at the start of a host install and retain the retry marker.
+(
+  # shellcheck disable=SC1090
+  source <(sed -n '/^ensure_initial_isolation() {$/,/^}/p' "$repo_root/scripts/acceptance-guest.sh")
+  # shellcheck disable=SC2034
+  mode=host host_state="$work/host-isolation"
+  mkdir -p "$host_state"
+  # shellcheck disable=SC2329
+  fail() { exit 1; }
+  # shellcheck disable=SC2329
+  localai_acceptance_clean_install() { [[ "${MOCK_CLEAN:-0}" == 1 ]]; }
+  if (MOCK_CLEAN=0 ensure_initial_isolation); then exit 1; fi
+  [[ ! -e "$host_state/install-started" ]]
+  MOCK_CLEAN=1 ensure_initial_isolation
+  [[ -f "$host_state/install-started" ]]
+  MOCK_CLEAN=0 ensure_initial_isolation
+)
+# An interrupted create can reuse only the container labeled for this run.
+(
+  # shellcheck disable=SC1090
+  source <(sed -n '/^ensure_unrelated_container() {$/,/^}/p' "$repo_root/scripts/acceptance-guest.sh")
+  # shellcheck disable=SC1090
+  source <(sed -n '/^unrelated_container_matches() {$/,/^}/p' "$repo_root/scripts/acceptance-guest.sh")
+  # shellcheck disable=SC2034
+  cpu_image=example.invalid/image:cpu
+  run_id=0123456789abcdef0123456789abcdef
+  # shellcheck disable=SC2329
+  service_podman() {
+    case "$1:$2" in
+      container:exists) [[ -f "$work/container-label" ]] ;;
+      inspect:*) cat "$work/container-label" ;;
+      create:--name) printf '%s\n' "$run_id" >"$work/container-label"; printf 'created\n' >>"$work/container-creates" ;;
+      *) return 2 ;;
+    esac
+  }
+  ensure_unrelated_container "$run_id"
+  ensure_unrelated_container "$run_id"
+  unrelated_container_matches "$run_id"
+  [[ "$(wc -l <"$work/container-creates")" == 1 ]]
+  printf 'different\n' >"$work/container-label"
+  if ensure_unrelated_container "$run_id"; then exit 1; fi
+  if unrelated_container_matches "$run_id"; then exit 1; fi
+  if ensure_unrelated_container invalid; then exit 1; fi
+)
+# Health checks retry a briefly unavailable service without recording output.
+(
+  # shellcheck disable=SC1090
+  source <(sed -n '/^wait_for_health() {$/,/^}/p' "$repo_root/scripts/acceptance-guest.sh")
+  cat >"$work/fake-doctor" <<'EOF'
+#!/usr/bin/env bash
+printf 'call\n' >>"${HEALTH_CALLS:?}"
+if [[ "$(wc -l <"$HEALTH_CALLS")" -lt 2 ]]; then exit 1; fi
+printf 'health result: HTTP 401\n'
+EOF
+  chmod 0755 "$work/fake-doctor"
+  export HEALTH_CALLS="$work/health-calls"
+  # shellcheck disable=SC2329
+  sleep() { :; }
+  wait_for_health "$work/fake-doctor"
+  [[ "$(wc -l <"$HEALTH_CALLS")" == 2 ]]
+)
+printf 'Acceptance isolation, identity, and readiness tests passed\n'
 printf 'Acceptance checkpoint tests passed\n'
 # The policy operation has its own named timeout and never emits command output.
 (
@@ -155,7 +227,8 @@ ssh() {
   esac
 }
 result="$(HOME="$vm_mock_dir/test-home" main --vm "$vm_mock_dir/base.qcow2" "$vm_mock_dir/key" "$vm_mock_dir/vars" "$vm_mock_dir/hostkey.pub")"
-[[ "$result" == $'step install: pass\nstep verify: pass' ]]
+[[ "$result" == "project-version: $(<"$repo_root/VERSION")"$'\n'project-archive-sha256:\ *$'\nstep install: pass\nstep verify: pass' ]]
+grep -Eq '^project-archive-sha256: [a-f0-9]{64}$' <<<"$result"
 [[ -e "$vm_mock_dir/rebooted" ]]
 [[ -z "$(find "$vm_mock_dir/test-home/agent-scratch/LocalAI-SBlue/acceptance-vm" -mindepth 1 -print -quit)" ]]
 if result="$(MOCK_INSTALL_FAIL=1 HOME="$vm_mock_dir/test-home" main --vm "$vm_mock_dir/base.qcow2" "$vm_mock_dir/key" "$vm_mock_dir/vars" "$vm_mock_dir/hostkey.pub" 2>/dev/null)"; then

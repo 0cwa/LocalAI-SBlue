@@ -104,7 +104,11 @@ wait_for_guest
 LOCALAI_PACKAGE_DIST_DIR="$work/dist" LOCALAI_PACKAGE_SCRATCH_DIR="$work/package" \
   "$repo_root/scripts/package-release.sh" >"$work/package.log" 2>&1 || fail 'could not prepare public source archive.'
 version="$(<"$repo_root/VERSION")"
+[[ "$version" =~ ^[0-9A-Za-z.+-]+$ ]] || fail 'invalid package version.'
 archive="$work/dist/localai-secureblue-$version.tar.gz"
+read -r archive_digest _ <"$archive.sha256" || fail 'could not read package digest.'
+[[ "$archive_digest" =~ ^[a-f0-9]{64}$ ]] || fail 'invalid package digest.'
+printf 'project-version: %s\nproject-archive-sha256: %s\n' "$version" "$archive_digest"
 timeout 120s ssh "${ssh_args[@]}" root@127.0.0.1 'mkdir -p /root/agent-scratch/LocalAI-SBlue/acceptance-source && tar -xz --strip-components=1 -C /root/agent-scratch/LocalAI-SBlue/acceptance-source' <"$archive" >/dev/null 2>&1 || fail 'could not copy source into the VM.'
 worker=/root/agent-scratch/LocalAI-SBlue/acceptance-source/scripts/acceptance-guest.sh
 printf 'Waiting for VM install and initial idle checks...\n' >&2
