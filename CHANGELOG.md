@@ -5,6 +5,8 @@ has been runtime-qualified on secureblue or on a GPU.
 
 ## Unreleased
 
+- Add bounded host and disposable VM lifecycle acceptance with sanitized receipts.
+
 - Record the Quadlet migration decision and generator prototype.
 
 - Use one version source for packages and the controller, with attested tag-driven releases.

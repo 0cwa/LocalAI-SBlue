@@ -43,6 +43,7 @@ manifest=(
   bin/localaictl
   config/localai.conf.example
   lib/config.sh
+  lib/acceptance.sh
   lib/installer_safety.sh
   lib/tls_compose_render.sh
   localai/localai.lock
@@ -75,6 +76,11 @@ manifest=(
   localai-tray/install.sh
   localai-tray/uninstall.sh
   scripts/check.sh
+  scripts/host-acceptance.sh
+  scripts/acceptance-host.sh
+  scripts/acceptance-policy.sh
+  scripts/acceptance-guest.sh
+  scripts/test-host-acceptance.sh
   scripts/check-public-tree.py
   scripts/test-public-tree.sh
   scripts/package-release.sh
@@ -92,6 +98,7 @@ manifest=(
   scripts/test-package-relocation.sh
   docs/PUBLIC_BOUNDARIES.md
   docs/EVIDENCE_AND_SECRETS.md
+  docs/ACCEPTANCE.md
   docs/QUADLET_DECISION.md
   docs/quadlet-spike/localai.container
   docs/quadlet-spike/localai-tls.container

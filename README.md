@@ -203,6 +203,13 @@ polling never requests elevation. If a manager state is unavailable, run the
 controller's `status --elevated` command from a terminal for details. Remove
 the launcher with `localai-tray/uninstall.sh`.
 
+## Lifecycle acceptance
+
+A clean host or disposable VM can run the bounded lifecycle checks and produce
+an allowlisted receipt. Host mode reboots automatically and refuses an
+existing LocalAI installation. See [lifecycle acceptance](docs/ACCEPTANCE.md)
+for setup, limitations, and resume instructions.
+
 ## Troubleshooting
 
 | Symptom | Next step |

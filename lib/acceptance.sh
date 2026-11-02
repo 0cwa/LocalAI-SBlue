@@ -9,7 +9,8 @@ localai_acceptance_step() {
   timeout --kill-after=10s "${limit}s" "$@" >/dev/null 2>&1 || status=$?
   case "$status" in
     0) result=pass ;;
-    124|137) result=timeout ;;
+    124) result=timeout ;;
+    137) result=fail ;; # A killed command is not necessarily a timeout.
     *) result=fail ;;
   esac
   printf 'step %s: %s\n' "$label" "$result" >>"$receipt"
@@ -35,7 +36,7 @@ localai_acceptance_clean_install() {
       fi
     fi
   done
-  for path in etc/localai var/lib/localai var/lib/localai-tls \
+  for path in etc/localai etc/localai.conf var/lib/localai var/lib/localai-tls var/lib/localai-installer \
     etc/systemd/system/localai-tls-forward.socket \
     etc/systemd/system/localai-tls-forward.service; do
     if [[ -e "${root%/}/$path" || -L "${root%/}/$path" ]]; then
