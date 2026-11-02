@@ -478,6 +478,11 @@ label_container_state() {
   fi
 }
 
+preflight_user_systemd_parent() {
+  [[ "$install_service" == 1 ]] || return 0
+  localai_installer_check_user_systemd_parent "$state_dir/.config/systemd" "LocalAI systemd configuration directory" "$service_uid" || die "Unsafe LocalAI systemd configuration directory."
+}
+
 ensure_user_manager() {
   log "Enabling linger and starting user manager"
   run0_pipe /usr/bin/loginctl enable-linger "$service_user"
@@ -614,7 +619,7 @@ install_systemd_service() {
     -e "s|@GPU_DEVICE_ARGS@|$gpu_device_args|g" \
     "$script_dir/localai.service.in" >>"$tmp_service"
 
-  localai_installer_ensure_service_directory "$state_dir/.config/systemd" "LocalAI systemd configuration directory" "$service_user" "$service_user" "$service_uid" 0700 || die "Unsafe LocalAI systemd configuration directory."
+  localai_installer_ensure_user_systemd_parent "$state_dir/.config/systemd" "LocalAI systemd configuration directory" "$service_user" "$service_user" "$service_uid" || die "Unsafe LocalAI systemd configuration directory."
   localai_installer_ensure_service_directory "$user_unit_dir" "LocalAI user-unit directory" "$service_user" "$service_user" "$service_uid" 0700 || die "Unsafe LocalAI user-unit directory."
   if [[ -e "$user_unit_dir/localai.service" || -L "$user_unit_dir/localai.service" ]]; then
     [[ ! -L "$user_unit_dir/localai.service" && -f "$user_unit_dir/localai.service" ]] || die "Refusing to replace a non-regular LocalAI service unit."
@@ -713,6 +718,7 @@ install_project_files
 install_container_policy
 label_container_state
 preflight_existing_backend_state
+preflight_user_systemd_parent
 ensure_user_manager
 snapshot_existing_service_state
 stop_existing_managed_service

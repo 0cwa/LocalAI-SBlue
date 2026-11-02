@@ -546,15 +546,21 @@ label_container_state() {
   fi
 }
 
+preflight_user_systemd_parent() {
+  [[ "$install_service" == 1 ]] || return 0
+  localai_installer_check_user_systemd_parent "$tls_state_dir/.config/systemd" "TLS systemd configuration directory" "$tls_uid" || die "Unsafe TLS systemd configuration directory."
+}
+
 guard_tls_manager_start() {
   local status=0 unit="$tls_state_dir/.config/systemd/user/$tls_service_name"
+  local legacy="$tls_state_dir/.config/systemd/user/$legacy_tls_service_name"
   if localai_installer_user_manager_is_active "$tls_uid"; then
     return 0
   else
     status=$?
   fi
   [[ "$status" == 3 ]] || die "Could not determine whether the TLS user manager is active."
-  if [[ -e "$unit" || -L "$unit" ]]; then
+  if [[ -e "$unit" || -L "$unit" || -e "$legacy" || -L "$legacy" ]]; then
     die "Cannot safely preserve TLS service state while its user manager is inactive."
   fi
 }
@@ -857,7 +863,7 @@ write_compose_service() {
     "$compose_file" "$tls_project_name" >>"$tmp_service"
 
   log "Installing user systemd compose unit at $user_unit_dir/$tls_service_name"
-  localai_installer_ensure_service_directory "$tls_state_dir/.config/systemd" "TLS systemd configuration directory" "$tls_user" "$tls_user" "$tls_uid" 0700 || die "Unsafe TLS systemd configuration directory."
+  localai_installer_ensure_user_systemd_parent "$tls_state_dir/.config/systemd" "TLS systemd configuration directory" "$tls_user" "$tls_user" "$tls_uid" || die "Unsafe TLS systemd configuration directory."
   localai_installer_ensure_service_directory "$user_unit_dir" "TLS user-unit directory" "$tls_user" "$tls_user" "$tls_uid" 0700 || die "Unsafe TLS user-unit directory."
   localai_installer_check_managed_file "$user_unit_dir/$tls_service_name" "TLS user unit" "$tls_uid" \
     '# Managed by LocalAI secureblue TLS installer.' 'Description=LocalAI TLS reverse proxy compose stack' || die "Refusing to replace an unrelated TLS user unit."
@@ -1196,6 +1202,7 @@ require_cmd run0
 validate_names
 resolve_localai_user
 ensure_tls_user
+preflight_user_systemd_parent
 guard_tls_manager_start
 ensure_subids
 install_dirs

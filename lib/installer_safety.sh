@@ -143,10 +143,8 @@ localai_installer_check_directory_chain() {
   done
 }
 
-localai_installer_ensure_service_directory() {
-  local path="$1" label="$2" owner="$3" group="$4" uid="$5" mode="$6"
-  local parent="${path%/*}" current_owner entries
-  [[ -n "$parent" ]] || parent=/
+localai_installer_preflight_service_directory() {
+  local path="$1" label="$2" uid="$3" current_owner entries
   localai_installer_check_directory_chain "$path" "$label" "$uid" || return 1
   if [[ -d "$path" && ! -L "$path" ]]; then
     current_owner="$(/usr/bin/stat -c '%u' -- "$path")" || return 1
@@ -161,10 +159,62 @@ localai_installer_ensure_service_directory() {
       fi
     fi
   fi
+}
+
+localai_installer_ensure_service_directory() {
+  local path="$1" label="$2" owner="$3" group="$4" uid="$5" mode="$6"
+  local parent="${path%/*}"
+  [[ -n "$parent" ]] || parent=/
+  localai_installer_preflight_service_directory "$path" "$label" "$uid" || return 1
   # The chain was checked above. Newly created parents stay root-owned; only
   # the exact managed directory is handed to the service account.
   /usr/bin/mkdir -p -- "$parent" || return 1
   /usr/bin/install -d -o "$owner" -g "$group" -m "$mode" -- "$path"
+}
+
+# Old releases could leave the intermediate systemd directory root-owned and
+# non-traversable. Only repair the known layout with a private, service-owned
+# user directory; never adopt or expose unknown contents.
+localai_installer_systemd_stat() { /usr/bin/stat "$@"; }
+
+localai_installer_check_user_systemd_parent() {
+  local path="$1" label="$2" uid="$3" owner mode other child_owner child_mode
+  localai_installer_check_directory_chain "$path" "$label" "$uid" || return 1
+  localai_installer_preflight_service_directory "$path/user" "$label user directory" "$uid" || return 1
+  [[ -d "$path" && ! -L "$path" ]] || return 0
+  owner="$(localai_installer_systemd_stat -c '%u' -- "$path")" || return 1
+  [[ "$owner" == 0 && "$uid" != 0 ]] || return 0
+  mode="$(localai_installer_systemd_stat -c '%a' -- "$path")" || return 1
+  (( (8#$mode & 0022) == 0 )) || { localai_installer_error "$label is writable by other users"; return 1; }
+  (( (8#$mode & 0001) == 0 )) || return 0
+  other="$(/usr/bin/find -P "$path" -mindepth 1 -maxdepth 1 ! -name user -print -quit 2>/dev/null)" || return 1
+  [[ -z "$other" ]] || { localai_installer_error "$label contains unknown entries"; return 1; }
+  if [[ -e "$path/user" || -L "$path/user" ]]; then
+    [[ -d "$path/user" && ! -L "$path/user" ]] || return 1
+    child_owner="$(localai_installer_systemd_stat -c '%u' -- "$path/user")" || return 1
+    child_mode="$(localai_installer_systemd_stat -c '%a' -- "$path/user")" || return 1
+    if [[ "$child_owner" != "$uid" ]] || (( (8#$child_mode & 0077) != 0 )); then
+      localai_installer_error "$label user directory is not private and service-owned"
+      return 1
+    fi
+  fi
+}
+
+localai_installer_ensure_user_systemd_parent() {
+  local path="$1" label="$2" owner="$3" group="$4" uid="$5" current_owner entries mode
+  localai_installer_check_user_systemd_parent "$path" "$label" "$uid" || return 1
+  if [[ -d "$path" && ! -L "$path" ]]; then
+    current_owner="$(localai_installer_systemd_stat -c '%u' -- "$path")" || return 1
+    if [[ "$current_owner" == 0 && "$uid" != 0 ]]; then
+      entries="$(/usr/bin/find -P "$path" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" || return 1
+      if [[ -n "$entries" ]]; then
+        mode="$(localai_installer_systemd_stat -c '%a' -- "$path")" || return 1
+        (( (8#$mode & 0001) != 0 )) || /usr/bin/chmod o+x -- "$path"
+        return
+      fi
+    fi
+  fi
+  localai_installer_ensure_service_directory "$path" "$label" "$owner" "$group" "$uid" 0700
 }
 
 localai_installer_validate_service_account_name() {

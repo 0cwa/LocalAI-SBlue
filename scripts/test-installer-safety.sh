@@ -149,9 +149,45 @@ before_mode="$(/usr/bin/stat -c '%a' -- "$scratch/no-op-on-failure")"
   [[ "$(/usr/bin/stat -c '%a' -- "$scratch/no-op-on-failure")" == "$before_mode" ]]
 ) || fail "service-directory helper changed ownership or mode after path rejection"
 
+printf 'Legacy user-unit parent migration checks\n'
+(
+  legacy_parent="$scratch/legacy-systemd"
+  mkdir -p "$legacy_parent/user"
+  chmod 0750 "$legacy_parent"
+  chmod 0700 "$legacy_parent/user"
+  printf 'managed unit\n' >"$legacy_parent/user/localai.service"
+  test_uid="$(id -u)" test_user="$(id -un)" test_group="$(id -gn)"
+  # The fixture is in task scratch; only this exact synthetic path is allowed.
+  # shellcheck disable=SC2329
+  localai_installer_validate_managed_path() {
+    [[ "$1" == "$legacy_parent" || "$1" == "$legacy_parent/user" ]]
+  }
+  # Simulate the legacy root owner while retaining a user-owned scratch fixture.
+  # shellcheck disable=SC2329
+  localai_installer_systemd_stat() {
+    if [[ "$1" == -c && "$2" == %u && "$4" == "$legacy_parent" ]]; then
+      printf '0\n'
+    else
+      /usr/bin/stat "$@"
+    fi
+  }
+  localai_installer_check_user_systemd_parent "$legacy_parent" legacy "$test_uid"
+  localai_installer_ensure_user_systemd_parent "$legacy_parent" legacy "$test_user" "$test_group" "$test_uid"
+  [[ "$(stat -c %a "$legacy_parent")" == 751 ]]
+  [[ "$(<"$legacy_parent/user/localai.service")" == 'managed unit' ]]
+  chmod 0750 "$legacy_parent"
+  : >"$legacy_parent/unknown"
+  expect_reject unknown-legacy-entry localai_installer_check_user_systemd_parent "$legacy_parent" legacy "$test_uid"
+  [[ "$(stat -c %a "$legacy_parent")" == 750 ]]
+  rm "$legacy_parent/unknown"
+  chmod 0755 "$legacy_parent/user"
+  expect_reject public-legacy-user-dir localai_installer_check_user_systemd_parent "$legacy_parent" legacy "$test_uid"
+  [[ "$(stat -c %a "$legacy_parent")" == 750 ]]
+)
+
 printf 'Installer lifecycle guard ordering checks\n'
 assert_call_order "$repo_root/secureblue-localai-install/install.sh" \
-  preflight_existing_backend_state ensure_user_manager stop_existing_managed_service
+  preflight_existing_backend_state preflight_user_systemd_parent stop_existing_managed_service
 assert_call_order "$repo_root/secureblue-localai-install/install.sh" \
   stop_existing_managed_service remove_preflighted_existing_container ensure_container_userns
 assert_call_order "$repo_root/localai-podman-compose/install.sh" \
@@ -458,6 +494,8 @@ printf 'User unit directory ownership checks\n'
   # shellcheck disable=SC2329
   localai_installer_ensure_service_directory() { printf '%s %s %s %s\n' "$1" "$3" "$4" "$6" >>"$scratch/unit-directories"; }
   # shellcheck disable=SC2329
+  localai_installer_ensure_user_systemd_parent() { printf '%s %s %s 0700\n' "$1" "$3" "$4" >>"$scratch/unit-directories"; }
+  # shellcheck disable=SC2329
   localai_installer_check_managed_file() { :; }
   # shellcheck disable=SC2329
   localai_tls_render_compose_service_template() { printf '[Service]\n'; }
@@ -578,11 +616,14 @@ printf 'TLS install and upgrade state checks\n'
       [[ "$running" == active || "$running" == inactive ]]
     done
   done
-  tls_state_dir="$scratch/tls-state" tls_service_name=localai-tls-compose.service tls_uid=955
+  tls_state_dir="$scratch/tls-state" tls_service_name=localai-tls-compose.service legacy_tls_service_name=localai-tls.service tls_uid=955
   mkdir -p "$tls_state_dir/.config/systemd/user"
   manager_status=3
   guard_tls_manager_start
   : >"$tls_state_dir/.config/systemd/user/$tls_service_name"
+  if (guard_tls_manager_start); then exit 1; fi
+  rm "$tls_state_dir/.config/systemd/user/$tls_service_name"
+  : >"$tls_state_dir/.config/systemd/user/$legacy_tls_service_name"
   if (guard_tls_manager_start); then exit 1; fi
   manager_status=0
   guard_tls_manager_start
