@@ -295,5 +295,7 @@ The release archive uses an explicit public-file manifest. Local deployment
 records, private PKI notes, and local certificates are not included. See
 [`SOURCE_PROVENANCE.md`](SOURCE_PROVENANCE.md),
 [`docs/PUBLIC_BOUNDARIES.md`](docs/PUBLIC_BOUNDARIES.md),
-[`proposals.md`](proposals.md), [`CONTRIBUTING.md`](CONTRIBUTING.md), and
+[roadmap and milestones](https://github.com/0cwa/LocalAI-SBlue/issues/10),
+[`docs/EVIDENCE_AND_SECRETS.md`](docs/EVIDENCE_AND_SECRETS.md),
+[`CONTRIBUTING.md`](CONTRIBUTING.md), and
 [`SECURITY.md`](SECURITY.md).

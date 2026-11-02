@@ -59,6 +59,7 @@ required = {
     f"{package_name}/README.md",
     f"{package_name}/SOURCE_PROVENANCE.md",
     f"{package_name}/proposals.md",
+    f"{package_name}/docs/EVIDENCE_AND_SECRETS.md",
     f"{package_name}/lib/installer_safety.sh",
     f"{package_name}/lib/tls_compose_render.sh",
     f"{package_name}/localai/inspect-runtime-state.sh",
