@@ -31,6 +31,7 @@ assume_yes=0
 enable_container_userns=0
 service_user_created=0
 existing_service_unit=0
+existing_service_active=0
 
 usage() {
   cat <<'EOF'
@@ -336,15 +337,25 @@ preflight_existing_backend_state() {
     "$(localai_backends_path)" "$service_uid" "$state_dir" "${container_names[@]}" || die "LocalAI backend state is not safe to stop or replace."
 }
 
+snapshot_existing_service_state() {
+  local status=0 state
+  [[ "$existing_service_unit" == 1 && "$install_service" == 1 ]] || return 0
+  state="$(run_as_localai /usr/bin/systemctl --user is-active localai.service)" || status=$?
+  case "$state:$status" in
+    active:0) existing_service_active=1 ;;
+    inactive:3|failed:3) existing_service_active=0 ;;
+    *) die "Cannot upgrade while the existing LocalAI service state is unknown or changing." ;;
+  esac
+}
+
 stop_existing_managed_service() {
-  [[ "$existing_service_unit" == 1 ]] || return 0
-  log "Stopping the checked existing LocalAI service before Podman migration"
-  run_as_localai /usr/bin/systemctl --user daemon-reload
+  [[ "$existing_service_unit" == 1 && "$existing_service_active" == 1 && "$install_service" == 1 && "$start_service" == 1 ]] || return 0
+  log "Stopping the checked existing LocalAI service for upgrade"
   run_as_localai /usr/bin/systemctl --user stop localai.service
 }
 
 remove_preflighted_existing_container() {
-  [[ "$install_service" == 1 && "$start_service" == 1 ]] || return 0
+  [[ "$existing_service_active" == 1 && "$install_service" == 1 && "$start_service" == 1 ]] || return 0
   local container_id
   for container_id in "${LOCALAI_INSTALLER_VALIDATED_CONTAINER_IDS[@]}"; do
     log "Removing preflight-checked LocalAI container $container_id if it remains after service stop"
@@ -531,6 +542,15 @@ pull_image() {
   run_localai_unit /usr/bin/podman pull "$image_ref"
 }
 
+restore_existing_service() {
+  if [[ "$existing_service_active" == 1 && "$start_service" == 1 ]]; then
+    log "Restoring the previously running localai.service"
+    run_as_localai /usr/bin/systemctl --user start localai.service
+  else
+    log "Service installed without starting it; existing boot enablement is unchanged."
+  fi
+}
+
 install_systemd_service() {
   local tmp_service image_ref bind_host bind_port user_unit_dir
   local container_name models_path data_path config_dir generated_content_path upload_path cache_dir log_dir
@@ -603,12 +623,7 @@ install_systemd_service() {
   rm -f "$tmp_service"
   run_as_localai /usr/bin/systemctl --user daemon-reload
 
-  if [[ "$start_service" == "1" ]]; then
-    log "Enabling and starting localai.service in the $service_user user manager"
-    run_as_localai /usr/bin/systemctl --user enable --now localai.service
-  else
-    log "Service installed but not started (--no-start)."
-  fi
+  restore_existing_service
 }
 
 while [[ "$#" -gt 0 ]]; do
@@ -698,6 +713,7 @@ install_container_policy
 label_container_state
 preflight_existing_backend_state
 ensure_user_manager
+snapshot_existing_service_state
 stop_existing_managed_service
 remove_preflighted_existing_container
 ensure_container_userns

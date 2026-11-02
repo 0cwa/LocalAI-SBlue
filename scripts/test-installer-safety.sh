@@ -448,6 +448,50 @@ source_production_function() {
   source <(/usr/bin/sed -n "/^${function_name}() {$/,/^}/p" "$source_file")
 }
 
+printf 'Backend install and upgrade state checks\n'
+(
+  source_production_function "$repo_root/secureblue-localai-install/install.sh" snapshot_existing_service_state
+  source_production_function "$repo_root/secureblue-localai-install/install.sh" stop_existing_managed_service
+  source_production_function "$repo_root/secureblue-localai-install/install.sh" restore_existing_service
+  # The functions below are called by the production helpers.
+  # shellcheck disable=SC2329
+  log() { :; }
+  # shellcheck disable=SC2329
+  die() { return 1; }
+  # shellcheck disable=SC2329
+  run_as_localai() {
+    case "${*:3}" in
+      'is-active localai.service') printf '%s\n' "$mock_active"; [[ "$mock_active" == active ]] && return 0; return 3 ;;
+      'stop localai.service'|'start localai.service') printf '%s\n' "${*:3}" >>"$scratch/state-calls" ;;
+      *) return 1 ;;
+    esac
+  }
+  install_service=1 start_service=1 existing_service_unit=1
+  for mock_enabled in enabled disabled; do
+    for mock_active in active inactive; do
+      : >"$scratch/state-calls"
+      existing_service_active=0
+      snapshot_existing_service_state
+      stop_existing_managed_service
+      restore_existing_service
+      if [[ "$mock_active" == active ]]; then
+        [[ "$(<"$scratch/state-calls")" == $'stop localai.service\nstart localai.service' ]]
+      else
+        [[ ! -s "$scratch/state-calls" ]]
+      fi
+      [[ "$mock_enabled" == enabled || "$mock_enabled" == disabled ]]
+    done
+  done
+  existing_service_unit=0 existing_service_active=0
+  : >"$scratch/state-calls"
+  snapshot_existing_service_state
+  stop_existing_managed_service
+  restore_existing_service
+  [[ ! -s "$scratch/state-calls" ]]
+  existing_service_unit=1 mock_active=activating
+  if snapshot_existing_service_state; then exit 1; fi
+) || fail "backend fresh or upgrade state changed unexpectedly"
+
 TEST_CONTAINER_STATE_DIR="$synthetic_state_root"
 TEST_CONTAINER_BACKENDS="$synthetic_state_root/backends"
 TEST_CONTAINER_ID="$synthetic_container_id"
@@ -505,6 +549,8 @@ run_install_preflight_sequence() {
     # The value is consumed by a sourced or dynamically extracted helper.
     # shellcheck disable=SC2034
     existing_service_unit=0
+    # Simulate a running managed service after the ownership preflight.
+    existing_service_active=1
     # The value is consumed by a sourced or dynamically extracted helper.
     # shellcheck disable=SC2034
     install_service=1
