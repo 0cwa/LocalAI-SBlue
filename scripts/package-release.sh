@@ -92,6 +92,11 @@ manifest=(
   scripts/test-package-relocation.sh
   docs/PUBLIC_BOUNDARIES.md
   docs/EVIDENCE_AND_SECRETS.md
+  docs/QUADLET_DECISION.md
+  docs/quadlet-spike/localai.container
+  docs/quadlet-spike/localai-tls.container
+  docs/quadlet-spike/localai-isolated.network
+  docs/quadlet-spike/localai.container.d/10-boot.conf.example
 )
 
 mkdir -p "$dist_dir" "$scratch_root"

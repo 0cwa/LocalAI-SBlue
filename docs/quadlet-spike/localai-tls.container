@@ -1,0 +1,17 @@
+# Prototype only: the backend and TLS accounts share the host network.
+[Unit]
+Description=LocalAI TLS Quadlet prototype
+
+[Container]
+Image=docker.io/library/caddy:2-alpine
+ContainerName=localai-tls
+Network=host
+UserNS=keep-id
+Volume=/var/lib/localai-tls/caddy-config:/config
+Volume=/var/lib/localai-tls/caddy-data:/data
+Exec=caddy run --config /config/Caddyfile
+PodmanArgs=--security-opt=no-new-privileges --pids-limit=512
+
+[Service]
+TimeoutStartSec=240
+Restart=on-failure

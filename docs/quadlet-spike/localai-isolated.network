@@ -1,0 +1,3 @@
+# Prototype only. Not attached to the separate-account host-network design.
+[Network]
+NetworkName=localai-spike

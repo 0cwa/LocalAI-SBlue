@@ -1,0 +1,21 @@
+# Prototype only: illustrative paths and values, not installer output.
+[Unit]
+Description=LocalAI backend Quadlet prototype
+
+[Container]
+Image=docker.io/localai/localai:latest-gpu-hipblas
+ContainerName=localai
+Network=host
+UserNS=keep-id
+Label=io.localai.secureblue.managed=localai
+Label=io.localai.secureblue.state=/var/lib/localai
+Label=io.localai.secureblue.container=localai
+Environment=LOCALAI_ADDRESS=127.0.0.1:11455
+Volume=/var/lib/localai/models:/var/lib/localai/models
+PodmanArgs=--group-add=keep-groups --no-healthcheck
+
+[Service]
+TimeoutStartSec=240
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=10
