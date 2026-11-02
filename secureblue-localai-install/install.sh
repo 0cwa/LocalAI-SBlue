@@ -351,14 +351,19 @@ preflight_existing_backend_state() {
 }
 
 snapshot_existing_service_state() {
-  local status=0 state
+  local status state attempt
   [[ "$existing_service_unit" == 1 && "$install_service" == 1 ]] || return 0
-  state="$(run_as_localai /usr/bin/systemctl --user is-active localai.service)" || status=$?
-  case "$state:$status" in
-    active:0) existing_service_active=1 ;;
-    inactive:3|failed:3) existing_service_active=0 ;;
-    *) die "Cannot upgrade while the existing LocalAI service state is unknown or changing." ;;
-  esac
+  for ((attempt=0; attempt<30; attempt++)); do
+    status=0
+    state="$(run_as_localai /usr/bin/systemctl --user is-active localai.service)" || status=$?
+    case "$state:$status" in
+      active:0) existing_service_active=1; return 0 ;;
+      inactive:3|failed:3) existing_service_active=0; return 0 ;;
+      activating:3|deactivating:3|reloading:0) sleep 1 ;;
+      *) die "Cannot upgrade while the existing LocalAI service state is unknown." ;;
+    esac
+  done
+  die "Cannot upgrade while the existing LocalAI service state keeps changing."
 }
 
 stop_existing_managed_service() {

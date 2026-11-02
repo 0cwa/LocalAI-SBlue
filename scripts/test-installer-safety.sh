@@ -601,6 +601,27 @@ printf 'Backend install and upgrade state checks\n'
 rg -q 'Failed to restore' "$scratch/failed-upgrade-error" || fail "failed restoration was not reported"
 (
   source_production_function "$repo_root/secureblue-localai-install/install.sh" snapshot_existing_service_state
+  # These mocks and settings are used by the extracted function.
+  # shellcheck disable=SC2329
+  sleep() { :; }
+  # shellcheck disable=SC2329
+  die() { return 1; }
+  # shellcheck disable=SC2329
+  run_as_localai() {
+    if [[ ! -e "$scratch/transition-seen" ]]; then
+      : > "$scratch/transition-seen"
+      printf 'activating\n'
+      return 3
+    fi
+    printf 'active\n'
+  }
+  # shellcheck disable=SC2034
+  existing_service_unit=1 install_service=1 existing_service_active=0
+  snapshot_existing_service_state
+  [[ "$existing_service_active" == 1 ]] || fail "transitional service did not settle to active"
+)
+(
+  source_production_function "$repo_root/secureblue-localai-install/install.sh" snapshot_existing_service_state
   source_production_function "$repo_root/secureblue-localai-install/install.sh" stop_existing_managed_service
   source_production_function "$repo_root/secureblue-localai-install/install.sh" restore_existing_service
   # The functions below are called by the production helpers.
