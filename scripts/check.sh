@@ -13,6 +13,10 @@ trap 'rm -rf -- "$check_tmp_dir"' EXIT
 
 status=0
 
+printf 'Public tree safety check\n'
+python3 scripts/check-public-tree.py
+bash scripts/test-public-tree.sh
+
 while IFS= read -r script; do
   printf 'bash -n %s\n' "$script"
   bash -n "$script" || status=1

@@ -15,3 +15,10 @@ constrained
 to existing container mounts and checked for service-account readability.
 Release archives normalize ownership metadata so the build host account is not
 embedded in the public package.
+
+
+The public repository is now the canonical development source. Changes start
+on branches from its main branch and land through reviewed pull requests;
+releases are built from this public tree. The earlier private checkout remains
+an archive and is not exported into the public history. Repository checks help
+prevent deployment-specific material from entering future changes.

@@ -70,6 +70,8 @@ manifest=(
   localai-tray/install.sh
   localai-tray/uninstall.sh
   scripts/check.sh
+  scripts/check-public-tree.py
+  scripts/test-public-tree.sh
   scripts/package-release.sh
   scripts/test-support.sh
   scripts/test-config.sh

@@ -33,3 +33,18 @@ outside the shared config; it is intended for non-secret runtime settings.
 Update the explicit release manifest in `scripts/package-release.sh` when a
 public runtime file, helper, or document is added. Check the generated archive
 contents before including a new path.
+
+## Canonical source and public changes
+
+The public repository at https://github.com/0cwa/LocalAI-SBlue is the
+canonical source. Develop on a branch of its current main and submit a pull
+request; no export from the private archive is needed. This keeps reviews,
+issues and releases connected to the same history. The old private checkout
+is an archive, not a development source. Keep its deployment records and PKI
+material outside this repository.
+
+The public-tree check rejects private IPv4 addresses, internal hostnames,
+user home paths, certificate or key files and PEM material. The generic
+`localai.internal` and `/home/test-user` fixtures are permitted. Review changes
+for secrets and deployment details too: automated checks cannot find every
+sensitive value.
