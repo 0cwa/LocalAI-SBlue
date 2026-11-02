@@ -155,7 +155,7 @@ assert_call_order "$repo_root/secureblue-localai-install/install.sh" \
 assert_call_order "$repo_root/secureblue-localai-install/install.sh" \
   stop_existing_managed_service remove_preflighted_existing_container ensure_container_userns
 assert_call_order "$repo_root/localai-podman-compose/install.sh" \
-  preflight_localai_backend_state ensure_user_manager stop_existing_localai_service
+  preflight_localai_backend_state ensure_user_manager ensure_container_userns
 assert_call_order "$repo_root/localai-podman-compose/install.sh" \
   pull_image label_container_state write_caddyfile
 assert_call_order "$repo_root/localai-podman-compose/install.sh" \
@@ -491,6 +491,47 @@ printf 'Backend install and upgrade state checks\n'
   existing_service_unit=1 mock_active=activating
   if snapshot_existing_service_state; then exit 1; fi
 ) || fail "backend fresh or upgrade state changed unexpectedly"
+
+printf 'TLS install and upgrade state checks\n'
+(
+  source_production_function "$repo_root/localai-podman-compose/install.sh" localai_service_lifecycle_requested
+  source_production_function "$repo_root/localai-podman-compose/install.sh" guard_tls_manager_start
+  source_production_function "$repo_root/localai-podman-compose/install.sh" preserve_linked_service_states
+  # These functions are called by the production helpers.
+  # shellcheck disable=SC2329
+  log() { :; }
+  # shellcheck disable=SC2329
+  die() { exit 1; }
+  # shellcheck disable=SC2329
+  run_as_tls() { exit 1; }
+  # shellcheck disable=SC2329
+  run_as_localai() { exit 1; }
+  # shellcheck disable=SC2329
+  run0_pipe() { exit 1; }
+  # shellcheck disable=SC2329
+  localai_installer_user_manager_is_active() { return "$manager_status"; }
+  install_service=1 start_service=1 rebind_localai_loopback=0
+  if localai_service_lifecycle_requested; then exit 1; fi
+  rebind_localai_loopback=1
+  localai_service_lifecycle_requested
+  for enabled in enabled disabled; do
+    for running in active inactive; do
+      preserve_linked_service_states
+      [[ "$enabled" == enabled || "$enabled" == disabled ]]
+      [[ "$running" == active || "$running" == inactive ]]
+    done
+  done
+  tls_state_dir="$scratch/tls-state" tls_service_name=localai-tls-compose.service tls_uid=955
+  mkdir -p "$tls_state_dir/.config/systemd/user"
+  manager_status=3
+  guard_tls_manager_start
+  : >"$tls_state_dir/.config/systemd/user/$tls_service_name"
+  if (guard_tls_manager_start); then exit 1; fi
+  manager_status=0
+  guard_tls_manager_start
+  manager_status=1
+  if (guard_tls_manager_start); then exit 1; fi
+) || fail "TLS fresh or upgrade state changed unexpectedly"
 
 TEST_CONTAINER_STATE_DIR="$synthetic_state_root"
 TEST_CONTAINER_BACKENDS="$synthetic_state_root/backends"

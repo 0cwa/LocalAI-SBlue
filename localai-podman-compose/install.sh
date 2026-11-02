@@ -385,7 +385,7 @@ run_localai_unit() {
 }
 
 localai_service_lifecycle_requested() {
-  [[ "$rebind_localai_loopback" == 1 || ( "$install_service" == 1 && "$start_service" == 1 ) ]]
+  [[ "$rebind_localai_loopback" == 1 ]]
 }
 
 preflight_localai_backend_state() {
@@ -430,14 +430,6 @@ preflight_localai_backend_state() {
 
   localai_installer_preflight_backend_containers run_as_localai \
     "${LOCALAI_BACKENDS_PATH:-$localai_state_dir/backends}" "$localai_uid" "$localai_state_dir" "${container_names[@]}" || die "LocalAI backend state is not safe to stop or replace."
-}
-
-stop_existing_localai_service() {
-  [[ "${existing_localai_service_unit:-0}" == 1 ]] || return 0
-  localai_service_lifecycle_requested || return 0
-  log "Stopping the checked existing LocalAI service before Podman migration"
-  run_as_localai /usr/bin/systemctl --user daemon-reload
-  run_as_localai /usr/bin/systemctl --user stop localai.service
 }
 
 run_localai_unit() {
@@ -551,6 +543,19 @@ label_container_state() {
       -xdev -exec "$(command -v chcon)" -h -t container_file_t -- {} +
   else
     log "SELinux is not enabled; skipping container volume relabel."
+  fi
+}
+
+guard_tls_manager_start() {
+  local status=0 unit="$tls_state_dir/.config/systemd/user/$tls_service_name"
+  if localai_installer_user_manager_is_active "$tls_uid"; then
+    return 0
+  else
+    status=$?
+  fi
+  [[ "$status" == 3 ]] || die "Could not determine whether the TLS user manager is active."
+  if [[ -e "$unit" || -L "$unit" ]]; then
+    die "Cannot safely preserve TLS service state while its user manager is inactive."
   fi
 }
 
@@ -1066,25 +1071,14 @@ EOF
   run0_pipe semodule -i "$cil_file"
 }
 
-start_linked_services() {
-  [[ "$install_service" == "1" && "$start_service" == "1" ]] || return 0
-
-  if [[ "$rebind_localai_loopback" == "1" ]]; then
-    log "Ensuring LocalAI service is bound on localhost before starting TLS proxy"
+preserve_linked_service_states() {
+  [[ "$install_service" == 1 ]] || return 0
+  if [[ "$start_service" == 0 ]]; then
+    log "TLS units installed without starting them (--no-start)."
+  else
+    log "TLS units installed; existing service and socket states are unchanged."
   fi
-  run_as_localai /usr/bin/systemctl --user enable --now localai.service
-
-  log "Enabling and starting compose service $tls_service_name in the $tls_user user manager"
-  run_as_tls /usr/bin/systemctl --user enable --now "$tls_service_name"
-
-  if [[ "$install_public_socket" == "1" ]]; then
-    log "Ensuring $tls_forward_socket_name is active for external HTTPS"
-    run0_pipe /usr/bin/systemctl stop "$tls_forward_service_name" || true
-    if /usr/bin/systemctl list-unit-files "$tls_forward_socket_name" >/dev/null 2>&1; then
-      run0_pipe /usr/bin/systemctl reset-failed "$tls_forward_socket_name" || true
-    fi
-    run0_pipe /usr/bin/systemctl enable --now "$tls_forward_socket_name"
-  fi
+  log "Restart an already-running TLS service explicitly to apply changed configuration."
 }
 
 retire_legacy_direct_tls_service() {
@@ -1201,13 +1195,13 @@ require_cmd run0
 validate_names
 resolve_localai_user
 ensure_tls_user
+guard_tls_manager_start
 ensure_subids
 install_dirs
 install_container_policy
 existing_localai_service_unit=0
 preflight_localai_backend_state
 ensure_user_manager
-stop_existing_localai_service
 ensure_container_userns
 rebind_localai_if_requested
 pull_image
@@ -1221,7 +1215,7 @@ label_forward_selinux_ports
 install_forward_bind_selinux_policy
 persist_tls_lifecycle_config
 retire_legacy_direct_tls_service
-start_linked_services
+preserve_linked_service_states
 
 log "Compose-based TLS proxy install complete."
 if [[ "$install_public_socket" == "1" ]]; then
