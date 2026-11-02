@@ -37,10 +37,11 @@ cd LocalAI-SBlue
    cd secureblue-localai-install
    ./install.sh
    ```
-4. Check the service and local endpoint:
+4. Start the service explicitly, then check the service and local endpoint:
 
    ```sh
    cd ..
+   bin/localaictl start
    bin/localaictl status
    bin/localaictl doctor
    ```
@@ -129,10 +130,11 @@ through the proxy:
 ./install.sh --hide-direct-http
 ```
 
-After installation, check all three service components:
+After installation, start the configured stack and check its components:
 
 ```sh
 cd ..
+bin/localaictl start
 bin/localaictl status
 bin/localaictl logs tls
 ```
@@ -176,6 +178,27 @@ bin/localaictl stop
 bin/localaictl logs backend
 bin/localaictl logs tls
 ```
+
+A fresh install leaves the backend, optional TLS service, and optional
+forwarding socket stopped and disabled. The application-menu launcher starts
+the configured stack when selected; tray polling alone does not start it.
+Service-account lingering can start the user managers without starting disabled
+application units. On upgrade, existing service and socket states are retained.
+If TLS configuration changes while its service is running, run `bin/localaictl restart`
+to apply the changes.
+
+To opt into boot activation, use the standard systemd enable commands for the
+components you installed (omit TLS commands when TLS is not installed, and
+omit the socket command when no public socket is installed):
+
+```sh
+run0 systemctl --user --machine=localai@.host enable localai.service
+run0 systemctl --user --machine=localai-tls@.host enable localai-tls-compose.service
+run0 systemctl enable localai-tls-forward.socket
+```
+
+These commands enable later boot activation. Use `bin/localaictl start` to
+start the configured stack now. Use `disable` in place of `enable` to opt out.
 
 The older start, stop, status, and logs scripts remain compatibility wrappers.
 They use the same controller and preserve the separate `localai` and

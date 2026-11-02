@@ -512,6 +512,8 @@ printf 'TLS install and upgrade state checks\n'
   localai_installer_user_manager_is_active() { return "$manager_status"; }
   install_service=1 start_service=1 rebind_localai_loopback=0
   if localai_service_lifecycle_requested; then exit 1; fi
+  # The production helper consumes this value indirectly.
+  # shellcheck disable=SC2034
   rebind_localai_loopback=1
   localai_service_lifecycle_requested
   for enabled in enabled disabled; do
@@ -591,6 +593,7 @@ run_install_preflight_sequence() {
     # shellcheck disable=SC2034
     existing_service_unit=0
     # Simulate a running managed service after the ownership preflight.
+    # shellcheck disable=SC2034
     existing_service_active=1
     # The value is consumed by a sourced or dynamically extracted helper.
     # shellcheck disable=SC2034

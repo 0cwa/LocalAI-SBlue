@@ -6,6 +6,7 @@ has been runtime-qualified on secureblue or on a GPU.
 ## Unreleased
 
 - Add bounded host and disposable VM lifecycle acceptance with sanitized receipts.
+- Leave new installations idle and preserve existing backend and TLS service states on upgrades.
 
 - Record the Quadlet migration decision and generator prototype.
 
