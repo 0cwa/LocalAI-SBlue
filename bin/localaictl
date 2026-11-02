@@ -6,6 +6,8 @@ repo_root="$(cd -- "$script_dir/.." && pwd)"
 # shellcheck source=../lib/config.sh
 config_lib="${LOCALAI_CONFIG_LIB:-$repo_root/lib/config.sh}"
 [[ -f "$config_lib" ]] || config_lib="$script_dir/config.sh"
+# The source path is selected or generated at runtime.
+# shellcheck disable=SC1090
 source "$config_lib"
 
 run0_bin="${LOCALAI_RUN0_BIN:-/usr/bin/run0}"
@@ -57,6 +59,8 @@ tls_enabled() {
 
 service_uid() { "$id_bin" -u "$1"; }
 
+# The function is called indirectly by a helper or test.
+# shellcheck disable=SC2329
 user_manager_systemctl() {
   local service_user="$1"
   shift
@@ -72,9 +76,15 @@ user_manager_systemctl() {
   fi
 }
 
+# The function is called indirectly by a helper or test.
+# shellcheck disable=SC2329
 backend_systemctl() { user_manager_systemctl "$LOCALAI_SERVICE_USER" "$@"; }
+# The function is called indirectly by a helper or test.
+# shellcheck disable=SC2329
 tls_systemctl() { user_manager_systemctl "$LOCALAI_TLS_USER" "$@"; }
 
+# The function is called indirectly by a helper or test.
+# shellcheck disable=SC2329
 root_systemctl() {
   if [[ "${1:-}" == is-active && "$status_elevated" != 1 ]]; then
     "$systemctl_bin" --no-ask-password "$@"

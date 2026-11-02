@@ -74,18 +74,21 @@ export LOCALAI_ID_BIN="$tmp_dir/id"
 export LOCALAI_SYSTEM_UNIT_DIR="$tmp_dir/systemd"
 mkdir -p "$tmp_dir/systemd"
 
-status="$($install_dir/localaictl status --json)"
+status="$("$install_dir"/localaictl status --json)"
 [[ "$status" == *'"backend":"active"'* ]]
 [[ "$status" == *'"endpoint":"https://first.example.test"'* ]]
-! rg -q -F 'run0 ' "$LOCALAI_SYSTEMCTL_LOG"
+if rg -q -F 'run0 ' "$LOCALAI_SYSTEMCTL_LOG"; then
+  printf 'Unexpected match in negative assertion\n' >&2
+  exit 1
+fi
 rg -q -F 'systemctl --no-ask-password --user --machine=localai@.host is-active localai.service' "$LOCALAI_SYSTEMCTL_LOG"
 
 # The installed controller rereads shared settings on each command; an old
 # per-user snapshot and a legacy duplicate URL cannot freeze the tray endpoint.
 sed -i 's/first\.example\.test/second\.example\.test/' "$tmp_dir/shared/localai.conf"
-status="$($install_dir/localaictl status --json)"
+status="$("$install_dir"/localaictl status --json)"
 [[ "$status" == *'"endpoint":"https://second.example.test"'* ]]
-status="$($install_dir/localaictl status --json --elevated)"
+status="$("$install_dir"/localaictl status --json --elevated)"
 [[ "$status" == *'"backend":"active"'* ]]
 rg -q -F "run0 -i $tmp_dir/systemctl --no-ask-password --user --machine=localai@.host is-active localai.service" "$LOCALAI_SYSTEMCTL_LOG"
 

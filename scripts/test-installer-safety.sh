@@ -290,6 +290,8 @@ printf 'Backend volume preflight checks with multiple mounts\n'
 
   mkdir -p "$synthetic_backend_volume"
   printf 'existing-backend\n' >"$synthetic_backend_volume/marker"
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   fake_podman() {
     [[ "$1" == /usr/bin/podman ]] || return 90
     shift
@@ -369,6 +371,8 @@ fake_nonlist_mounts_podman() {
 expect_reject_with_message non-list-mount-metadata 'has malformed mount metadata' \
   localai_installer_preflight_backend_containers fake_nonlist_mounts_podman "$synthetic_backend_bind" "$(id -u)" "$synthetic_state_root" localai
 
+# The function is called indirectly by a helper or test.
+# shellcheck disable=SC2329
 fake_podman() {
   [[ "$1" == /usr/bin/podman ]] || return 90
   shift
@@ -388,6 +392,8 @@ fake_podman() {
 }
 localai_installer_preflight_backend_containers fake_podman "$synthetic_backend_bind" "$(id -u)" "$synthetic_state_root" localai || fail "canonical host-backed /backends mount was rejected"
 
+# The function is called indirectly by a helper or test.
+# shellcheck disable=SC2329
 fake_podman() {
   [[ "$1" == /usr/bin/podman ]] || return 90
   shift
@@ -432,6 +438,8 @@ expect_reject_with_message writable-layer-backend-data 'has writable-layer data 
 printf 'Managed-container ownership integration checks\n'
 source_production_function() {
   local source_file="$1" function_name="$2"
+  # The source path is selected or generated at runtime.
+  # shellcheck disable=SC1090
   source <(/usr/bin/sed -n "/^${function_name}() {$/,/^}/p" "$source_file")
 }
 
@@ -445,6 +453,8 @@ TEST_CONTAINER_CALLS="$scratch/container-lifecycle.calls"
 fake_container_runner() {
   [[ "$1" == /usr/bin/podman ]] || return 90
   shift
+  # Separate redirects keep the test operations explicit.
+  # shellcheck disable=SC2129
   printf 'podman' >>"$TEST_CONTAINER_CALLS"
   printf ' %q' "$@" >>"$TEST_CONTAINER_CALLS"
   printf '\n' >>"$TEST_CONTAINER_CALLS"
@@ -483,16 +493,34 @@ run_install_preflight_sequence() {
     source_production_function "$repo_root/secureblue-localai-install/install.sh" stop_existing_managed_service
     source_production_function "$repo_root/secureblue-localai-install/install.sh" remove_preflighted_existing_container
     service_uid=955
+    # The value is consumed by a sourced or dynamically extracted helper.
+    # shellcheck disable=SC2034
     service_user_created=0
     state_dir="$TEST_CONTAINER_STATE_DIR"
+    # The value is consumed by a sourced or dynamically extracted helper.
+    # shellcheck disable=SC2034
     existing_service_unit=0
+    # The value is consumed by a sourced or dynamically extracted helper.
+    # shellcheck disable=SC2034
     install_service=1
+    # The value is consumed by a sourced or dynamically extracted helper.
+    # shellcheck disable=SC2034
     start_service=1
     LOCALAI_CONTAINER_NAME=localai
+    # The function is called indirectly by a helper or test.
+    # shellcheck disable=SC2329
     localai_backends_path() { printf '%s\n' "$TEST_CONTAINER_BACKENDS"; }
+    # The function is called indirectly by a helper or test.
+    # shellcheck disable=SC2329
     localai_installer_user_manager_is_active() { return 0; }
+    # The function is called indirectly by a helper or test.
+    # shellcheck disable=SC2329
     run_as_localai() { fake_container_runner "$@"; }
+    # The function is called indirectly by a helper or test.
+    # shellcheck disable=SC2329
     log() { :; }
+    # The function is called indirectly by a helper or test.
+    # shellcheck disable=SC2329
     die() { printf 'ERROR: %s\n' "$*" >&2; return 1; }
     ensure_user_manager() { printf 'manager-start\n' >>"$TEST_CONTAINER_CALLS"; }
     preflight_existing_backend_state && ensure_user_manager && \
@@ -506,6 +534,8 @@ run_install_preflight_sequence() {
 run_uninstall_preflight_sequence() {
   (
     TEST_CONTAINER_LABELS="$1"
+    # The subshell change is isolated deliberately.
+    # shellcheck disable=SC2030
     TEST_CONTAINER_CALLS="$2"
     TEST_CONTAINER_ID="$synthetic_container_id"
     source_production_function "$repo_root/secureblue-localai-install/uninstall.sh" preflight_backend_state
@@ -514,24 +544,44 @@ run_uninstall_preflight_sequence() {
     source_production_function "$repo_root/secureblue-localai-install/uninstall.sh" remove_container
     service_uid=955
     service_user=localai
+    # The value is consumed by a sourced or dynamically extracted helper.
+    # shellcheck disable=SC2034
     container_name=localai
     state_dir="$TEST_CONTAINER_STATE_DIR"
+    # The value is consumed by a sourced or dynamically extracted helper.
+    # shellcheck disable=SC2034
     purge_state=1
+    # The value is consumed by a sourced or dynamically extracted helper.
+    # shellcheck disable=SC2034
     purge_state_confirmed=0
+    # The value is consumed by a sourced or dynamically extracted helper.
+    # shellcheck disable=SC2034
     LOCALAI_CONTAINER_NAME=localai
+    # The function is called indirectly by a helper or test.
+    # shellcheck disable=SC2329
     localai_installer_user_manager_is_active() { return 0; }
+    # The function is called indirectly by a helper or test.
+    # shellcheck disable=SC2329
     run_as_localai() {
       if [[ "$1" == /usr/bin/podman ]]; then
         fake_container_runner "$@"
       else
+        # Separate redirects keep the test operations explicit.
+        # shellcheck disable=SC2129
         printf 'lifecycle %q' "$1" >>"$TEST_CONTAINER_CALLS"
         printf ' %q' "${@:2}" >>"$TEST_CONTAINER_CALLS"
         printf '\n' >>"$TEST_CONTAINER_CALLS"
         return 0
       fi
     }
+    # The function is called indirectly by a helper or test.
+    # shellcheck disable=SC2329
     confirm() { printf 'purge-confirmed\n' >>"$TEST_CONTAINER_CALLS"; return 0; }
+    # The function is called indirectly by a helper or test.
+    # shellcheck disable=SC2329
     log() { :; }
+    # The function is called indirectly by a helper or test.
+    # shellcheck disable=SC2329
     die() { printf 'ERROR: %s\n' "$*" >&2; return 1; }
     preflight_backend_state && {
       TEST_CONTAINER_ID="$TEST_REPLACEMENT_CONTAINER_ID"
@@ -543,55 +593,113 @@ run_uninstall_preflight_sequence() {
 managed_state_labels="$(printf '{"io.localai.secureblue.managed":"localai","io.localai.secureblue.state":"%s","io.localai.secureblue.container":"localai"}' "$TEST_CONTAINER_STATE_DIR")"
 wrong_state_labels='{"io.localai.secureblue.managed":"localai","io.localai.secureblue.state":"/var/lib/localai-other","io.localai.secureblue.container":"localai"}'
 
+# The subshell change is isolated deliberately.
+# shellcheck disable=SC2031
 : >"$TEST_CONTAINER_CALLS"
+# The subshell change is isolated deliberately.
+# shellcheck disable=SC2031
 expect_reject_with_message install-unowned-name-collision \
   "container localai is not marked for LocalAI state $TEST_CONTAINER_STATE_DIR" \
   run_install_preflight_sequence '{}' "$TEST_CONTAINER_CALLS"
+# The subshell change is isolated deliberately.
+# shellcheck disable=SC2031
 ! rg -q 'podman diff|podman rm|podman stop|podman run|manager-start|lifecycle' "$TEST_CONTAINER_CALLS" || fail "install continued past unowned container collision"
 
+# The subshell change is isolated deliberately.
+# shellcheck disable=SC2031
 : >"$TEST_CONTAINER_CALLS"
+# The subshell change is isolated deliberately.
+# shellcheck disable=SC2031
 expect_reject_with_message install-wrong-state-container \
   "container localai is not marked for LocalAI state $TEST_CONTAINER_STATE_DIR" \
   run_install_preflight_sequence "$wrong_state_labels" "$TEST_CONTAINER_CALLS"
+# The subshell change is isolated deliberately.
+# shellcheck disable=SC2031
 ! rg -q 'podman diff|podman rm|podman stop|podman run|manager-start|lifecycle' "$TEST_CONTAINER_CALLS" || fail "install accepted container state for another deployment"
 
+# The subshell change is isolated deliberately.
+# shellcheck disable=SC2031
 : >"$TEST_CONTAINER_CALLS"
 wrong_role_labels="$(printf '{\"io.localai.secureblue.managed\":\"other\",\"io.localai.secureblue.state\":\"%s\",\"io.localai.secureblue.container\":\"localai\"}' "$TEST_CONTAINER_STATE_DIR")"
+# The subshell change is isolated deliberately.
+# shellcheck disable=SC2031
 expect_reject_with_message install-wrong-role-container \
   "container localai is not marked for LocalAI state $TEST_CONTAINER_STATE_DIR" \
   run_install_preflight_sequence "$wrong_role_labels" "$TEST_CONTAINER_CALLS"
+# The subshell change is isolated deliberately.
+# shellcheck disable=SC2031
 ! rg -q 'podman diff|podman rm|podman stop|podman run|manager-start|lifecycle' "$TEST_CONTAINER_CALLS" || fail "install accepted a container with a different role label"
 
+# The subshell change is isolated deliberately.
+# shellcheck disable=SC2031
 : >"$TEST_CONTAINER_CALLS"
 wrong_container_labels="$(printf '{\"io.localai.secureblue.managed\":\"localai\",\"io.localai.secureblue.state\":\"%s\",\"io.localai.secureblue.container\":\"other\"}' "$TEST_CONTAINER_STATE_DIR")"
+# The subshell change is isolated deliberately.
+# shellcheck disable=SC2031
 expect_reject_with_message install-wrong-container-label \
   "container localai is not marked for LocalAI state $TEST_CONTAINER_STATE_DIR" \
   run_install_preflight_sequence "$wrong_container_labels" "$TEST_CONTAINER_CALLS"
+# The subshell change is isolated deliberately.
+# shellcheck disable=SC2031
 ! rg -q 'podman diff|podman rm|podman stop|podman run|manager-start|lifecycle' "$TEST_CONTAINER_CALLS" || fail "install accepted a different container-name ownership label"
 
+# The subshell change is isolated deliberately.
+# shellcheck disable=SC2031
 : >"$TEST_CONTAINER_CALLS"
+# The subshell change is isolated deliberately.
+# shellcheck disable=SC2031
 run_install_preflight_sequence "$managed_state_labels" "$TEST_CONTAINER_CALLS" || fail "install rejected a matching managed container with ephemeral /tmp data"
+# The subshell change is isolated deliberately.
+# shellcheck disable=SC2031
 rg -q "^podman diff $synthetic_container_id$" "$TEST_CONTAINER_CALLS" || fail "matching managed install did not reach writable-layer validation by ID"
+# The subshell change is isolated deliberately.
+# shellcheck disable=SC2031
 rg -q '^manager-start$' "$TEST_CONTAINER_CALLS" || fail "matching managed install did not proceed after preflight"
+# The subshell change is isolated deliberately.
+# shellcheck disable=SC2031
 rg -q "^podman rm -f $synthetic_container_id$" "$TEST_CONTAINER_CALLS" || fail "matching managed install did not remove its preflight-checked container ID"
 
+# The subshell change is isolated deliberately.
+# shellcheck disable=SC2031
 : >"$TEST_CONTAINER_CALLS"
+# The subshell change is isolated deliberately.
+# shellcheck disable=SC2031
 expect_reject_with_message uninstall-unowned-name-collision-even-with-purge \
   "container localai is not marked for LocalAI state $TEST_CONTAINER_STATE_DIR" \
   run_uninstall_preflight_sequence '{}' "$TEST_CONTAINER_CALLS"
+# The subshell change is isolated deliberately.
+# shellcheck disable=SC2031
 rg -q '^purge-confirmed$' "$TEST_CONTAINER_CALLS" || fail "purge fixture did not exercise the explicit confirmation path"
+# The subshell change is isolated deliberately.
+# shellcheck disable=SC2031
 ! rg -q 'podman diff|podman rm|podman stop|podman run|lifecycle' "$TEST_CONTAINER_CALLS" || fail "uninstall purge bypassed container ownership preflight"
 
+# The subshell change is isolated deliberately.
+# shellcheck disable=SC2031
 : >"$TEST_CONTAINER_CALLS"
+# The subshell change is isolated deliberately.
+# shellcheck disable=SC2031
 expect_reject_with_message uninstall-wrong-state-container-even-with-purge \
   "container localai is not marked for LocalAI state $TEST_CONTAINER_STATE_DIR" \
   run_uninstall_preflight_sequence "$wrong_state_labels" "$TEST_CONTAINER_CALLS"
+# The subshell change is isolated deliberately.
+# shellcheck disable=SC2031
 ! rg -q 'podman diff|podman rm|podman stop|podman run|lifecycle' "$TEST_CONTAINER_CALLS" || fail "uninstall accepted a container owned by another state path"
 
+# The subshell change is isolated deliberately.
+# shellcheck disable=SC2031
 : >"$TEST_CONTAINER_CALLS"
+# The subshell change is isolated deliberately.
+# shellcheck disable=SC2031
 run_uninstall_preflight_sequence "$managed_state_labels" "$TEST_CONTAINER_CALLS" || fail "uninstall rejected a matching managed container with ephemeral /tmp data"
+# The subshell change is isolated deliberately.
+# shellcheck disable=SC2031
 rg -q "^podman diff $synthetic_container_id$" "$TEST_CONTAINER_CALLS" || fail "matching managed uninstall did not reach writable-layer validation by ID"
+# The subshell change is isolated deliberately.
+# shellcheck disable=SC2031
 rg -q '^lifecycle /usr/bin/systemctl --user disable --now localai.service$' "$TEST_CONTAINER_CALLS" || fail "matching managed uninstall did not stop its service"
+# The subshell change is isolated deliberately.
+# shellcheck disable=SC2031
 rg -q "^podman rm -f $synthetic_container_id$" "$TEST_CONTAINER_CALLS" || fail "matching managed uninstall did not remove its preflight-checked container ID"
 
 printf 'No account-wide migration or image-force cleanup checks\n'
@@ -604,12 +712,26 @@ run_backend_existing_storage_subid_guard() (
   state_dir="$scratch/backend-existing-storage"
   mkdir -p "$state_dir/.local/share/containers/storage"
   service_user=localai
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   has_subid() { return 1; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   find_common_subid_range() { printf '200000-265535\n'; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   subid_line() { :; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   confirm() { printf 'unexpected-confirm\n' >>"$TEST_SUBID_CALLS"; return 0; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   log() { :; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   run0_pipe() { printf '%s\n' "$*" >>"$TEST_SUBID_CALLS"; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
   ensure_subids
 )
@@ -619,12 +741,26 @@ run_tls_existing_storage_subid_guard() (
   tls_state_dir="$scratch/tls-existing-storage"
   mkdir -p "$tls_state_dir/.local/share/containers/storage"
   tls_user=localai-tls
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   has_subid() { return 1; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   find_common_subid_range() { printf '200000-265535\n'; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   subid_line() { :; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   confirm() { printf 'unexpected-confirm\n' >>"$TEST_SUBID_CALLS"; return 0; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   log() { :; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   run0_pipe() { printf '%s\n' "$*" >>"$TEST_SUBID_CALLS"; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
   ensure_subids
 )
@@ -633,12 +769,26 @@ run_backend_fresh_subid_add() (
   source_production_function "$repo_root/secureblue-localai-install/install.sh" ensure_subids
   state_dir="$scratch/backend-fresh-account"
   service_user=localai
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   has_subid() { return 1; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   find_common_subid_range() { printf '200000-265535\n'; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   subid_line() { :; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   confirm() { return 0; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   log() { :; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   run0_pipe() { printf '%s\n' "$*" >>"$TEST_SUBID_CALLS"; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
   ensure_subids
 )
@@ -647,12 +797,26 @@ run_tls_fresh_subid_add() (
   source_production_function "$repo_root/localai-podman-compose/install.sh" ensure_subids
   tls_state_dir="$scratch/tls-fresh-account"
   tls_user=localai-tls
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   has_subid() { return 1; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   find_common_subid_range() { printf '200000-265535\n'; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   subid_line() { :; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   confirm() { return 0; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   log() { :; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   run0_pipe() { printf '%s\n' "$*" >>"$TEST_SUBID_CALLS"; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
   ensure_subids
 )
@@ -677,7 +841,11 @@ run_backend_disable_linger_only() (
   disable_linger=1
   remove_user=0
   remove_user_confirmed=0
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   log() { :; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   run0_pipe() { printf '%s\n' "$*" >>"$TEST_ACCOUNT_CALLS"; }
   disable_user_linger
 )
@@ -689,7 +857,11 @@ run_backend_approved_user_removal() (
   disable_linger=1
   remove_user=1
   remove_user_confirmed=1
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   log() { :; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   run0_pipe() { printf '%s\n' "$*" >>"$TEST_ACCOUNT_CALLS"; }
   disable_user_linger
 )
@@ -698,11 +870,19 @@ run_backend_unapproved_user_removal() (
   source_production_function "$repo_root/secureblue-localai-install/uninstall.sh" disable_user_linger
   service_uid=955
   service_user=localai
+  # The value is consumed by a sourced or dynamically extracted helper.
+  # shellcheck disable=SC2034
   disable_linger=1
   remove_user=1
   remove_user_confirmed=0
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   log() { :; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   run0_pipe() { printf '%s\n' "$*" >>"$TEST_ACCOUNT_CALLS"; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
   disable_user_linger
 )
@@ -713,7 +893,11 @@ run_tls_approved_user_removal() (
   tls_user=localai-tls
   remove_user=1
   remove_user_confirmed=1
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   log() { :; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   run0_pipe() { printf '%s\n' "$*" >>"$TEST_ACCOUNT_CALLS"; }
   disable_tls_user_linger
 )
@@ -724,8 +908,14 @@ run_tls_unapproved_user_removal() (
   tls_user=localai-tls
   remove_user=1
   remove_user_confirmed=0
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   log() { :; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   run0_pipe() { printf '%s\n' "$*" >>"$TEST_ACCOUNT_CALLS"; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
   disable_tls_user_linger
 )
@@ -736,9 +926,17 @@ run_backend_user_delete_after_approval() (
   service_user=localai
   remove_user=1
   remove_user_confirmed=1
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   getent() { return 0; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   confirm() { printf 'unexpected-late-confirmation\n' >>"$TEST_ACCOUNT_CALLS"; return 1; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   log() { :; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   run0_pipe() { printf '%s\n' "$*" >>"$TEST_ACCOUNT_CALLS"; }
   remove_service_user
 )
@@ -749,9 +947,17 @@ run_tls_user_delete_after_approval() (
   tls_user=localai-tls
   remove_user=1
   remove_user_confirmed=1
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   getent() { return 0; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   confirm() { printf 'unexpected-late-confirmation\n' >>"$TEST_ACCOUNT_CALLS"; return 1; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   log() { :; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   run0_pipe() { printf '%s\n' "$*" >>"$TEST_ACCOUNT_CALLS"; }
   remove_tls_user
 )
@@ -800,7 +1006,11 @@ run_backend_account_removal_confirmation() (
   service_user=localai
   remove_user=1
   remove_user_confirmed=0
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   confirm() { printf 'PROMPT: %s\n' "$1"; return 0; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
   confirm_service_account_removal
   [[ "$remove_user_confirmed" == 1 ]]
@@ -812,7 +1022,11 @@ run_tls_account_removal_confirmation() (
   tls_user=localai-tls
   remove_user=1
   remove_user_confirmed=0
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   confirm() { printf 'PROMPT: %s\n' "$1"; return 0; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
   confirm_tls_service_account_removal
   [[ "$remove_user_confirmed" == 1 ]]
@@ -826,6 +1040,8 @@ run_backend_yes_account_removal_confirmation() (
   service_user=localai
   remove_user=1
   remove_user_confirmed=0
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
   confirm_service_account_removal
   printf 'confirmed=%s\n' "$remove_user_confirmed"
@@ -834,11 +1050,21 @@ run_backend_yes_account_removal_confirmation() (
 run_tls_yes_account_removal_confirmation() (
   source_production_function "$repo_root/localai-podman-compose/uninstall.sh" confirm
   source_production_function "$repo_root/localai-podman-compose/uninstall.sh" confirm_tls_service_account_removal
+  # The value is consumed by a sourced or dynamically extracted helper.
+  # shellcheck disable=SC2034
   assume_yes=1
+  # The value is consumed by a sourced or dynamically extracted helper.
+  # shellcheck disable=SC2034
   tls_uid=956
+  # The value is consumed by a sourced or dynamically extracted helper.
+  # shellcheck disable=SC2034
   tls_user=localai-tls
+  # The value is consumed by a sourced or dynamically extracted helper.
+  # shellcheck disable=SC2034
   remove_user=1
   remove_user_confirmed=0
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
   confirm_tls_service_account_removal
   printf 'confirmed=%s\n' "$remove_user_confirmed"
@@ -855,12 +1081,26 @@ TEST_IMAGE_CALLS="$scratch/image-remove.calls"
 TEST_IMAGE_OUTPUT="$scratch/image-remove.output"
 run_image_removal_with_in_use_container() (
   source_production_function "$repo_root/secureblue-localai-install/uninstall.sh" remove_local_image
+  # The value is consumed by a sourced or dynamically extracted helper.
+  # shellcheck disable=SC2034
   remove_image=1
+  # The value is consumed by a sourced or dynamically extracted helper.
+  # shellcheck disable=SC2034
   service_uid=955
+  # The value is consumed by a sourced or dynamically extracted helper.
+  # shellcheck disable=SC2034
   image_ref=docker.io/localai/localai:test
+  # The value is consumed by a sourced or dynamically extracted helper.
+  # shellcheck disable=SC2034
   service_user=localai
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   confirm() { return 0; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   log() { printf '%s\n' "$*" >>"$TEST_IMAGE_OUTPUT"; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
   run_localai_unit() {
     printf '%s\n' "$*" >>"$TEST_IMAGE_CALLS"
     printf 'Error: image is in use by another container\n' >&2

@@ -20,6 +20,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends --yes ripgrep
 
+      - name: Install pinned static analysis tools
+        run: python3 -m pip install --break-system-packages shellcheck-py==0.11.0.1 ruff==0.15.19
+
       - name: Run repository checks
         run: make check
 

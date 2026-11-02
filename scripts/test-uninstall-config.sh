@@ -10,6 +10,8 @@ trap 'rm -rf -- "$tmp_dir"' EXIT
 marker="$tmp_dir/localai-uninstall-config-pwned"
 mkdir -p "$tmp_dir/assets"
 
+# The quoted text is intentionally evaluated by another shell.
+# shellcheck disable=SC2016
 printf 'LOCK_SCHEMA=1\nLOCALAI_BIND_HOST=$(touch %s)\n' "$marker" >"$tmp_dir/assets/localai.lock"
 
 if LOCALAI_ASSET_DIR="$tmp_dir/assets" \

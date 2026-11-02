@@ -6,8 +6,12 @@ repo_root="$(cd -- "$script_dir/.." && pwd)"
 asset_dir="${LOCALAI_ASSET_DIR:-$repo_root/localai}"
 lock_file="$asset_dir/localai.lock"
 config_lib="${LOCALAI_CONFIG_LIB:-$repo_root/lib/config.sh}"
+# The source path is selected or generated at runtime.
+# shellcheck disable=SC1090
 source "$config_lib"
 safety_lib="${LOCALAI_INSTALLER_SAFETY_LIB:-$repo_root/lib/installer_safety.sh}"
+# The source path is selected or generated at runtime.
+# shellcheck disable=SC1090
 source "$safety_lib"
 canonical_config="$LOCALAI_INSTALLER_CONFIG_DEST"
 requested_config="${LOCALAI_CONFIG_FILE:-}"
@@ -30,13 +34,19 @@ localai_installer_load_config "$LOCALAI_INSTALLER_CONFIG_SOURCE" "$LOCALAI_INSTA
 service_user="$LOCALAI_SERVICE_USER"
 state_dir="$LOCALAI_STATE_DIR"
 project_dir="${LOCALAI_PROJECT_DIR:-$state_dir/build/localai-oci}"
+# The value is consumed by a sourced or dynamically extracted helper.
+# shellcheck disable=SC2034
 SERVICE_BIND_HOST="$LOCALAI_BIND_HOST"
+# The value is consumed by a sourced or dynamically extracted helper.
+# shellcheck disable=SC2034
 SERVICE_BIND_PORT="$LOCALAI_BIND_PORT"
 
 image_ref="${LOCALAI_IMAGE_REF_OVERRIDE:-${LOCALAI_IMAGE_REF:-docker.io/localai/localai:latest-gpu-hipblas}}"
 if [[ -n "${LOCALAI_IMAGE_DIGEST:-}" ]]; then
   image_ref="${image_ref%@*}@${LOCALAI_IMAGE_DIGEST}"
 fi
+# The value is consumed by a sourced or dynamically extracted helper.
+# shellcheck disable=SC2034
 container_name="${LOCALAI_CONTAINER_NAME:-localai}"
 
 remove_image=0

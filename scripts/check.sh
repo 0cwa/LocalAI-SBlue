@@ -22,6 +22,20 @@ while IFS= read -r script; do
   bash -n "$script" || status=1
 done < <(find bin lib localai secureblue-localai-install localai-podman-compose localai-tray scripts -type f -name '*.sh' | sort)
 
+if command -v shellcheck >/dev/null 2>&1; then
+  printf 'ShellCheck all shell scripts and controller\n'
+  find bin lib localai secureblue-localai-install localai-podman-compose localai-tray scripts -type f -name '*.sh' -print0 |
+    sort -z | xargs -0 shellcheck bin/localaictl
+else
+  printf 'ShellCheck not installed; skipping shell lint.\n'
+fi
+if command -v ruff >/dev/null 2>&1; then
+  printf 'Ruff Python checks\n'
+  ruff check --no-cache localai-tray scripts/*.py
+else
+  printf 'Ruff not installed; skipping Python lint.\n'
+fi
+
 printf 'bash -n bin/localaictl\n'
 bash -n bin/localaictl || status=1
 

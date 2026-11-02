@@ -7,10 +7,16 @@ asset_dir="${LOCALAI_ASSET_DIR:-$repo_root/localai}"
 lock_file="$asset_dir/localai.lock"
 policy_file="$asset_dir/localai-tls-containers-policy.json"
 config_lib="${LOCALAI_CONFIG_LIB:-$repo_root/lib/config.sh}"
+# The source path is selected or generated at runtime.
+# shellcheck disable=SC1090
 source "$config_lib"
 safety_lib="${LOCALAI_INSTALLER_SAFETY_LIB:-$repo_root/lib/installer_safety.sh}"
+# The source path is selected or generated at runtime.
+# shellcheck disable=SC1090
 source "$safety_lib"
 compose_render_lib="${LOCALAI_TLS_COMPOSE_RENDER_LIB:-$repo_root/lib/tls_compose_render.sh}"
+# The source path is selected or generated at runtime.
+# shellcheck disable=SC1090
 source "$compose_render_lib"
 canonical_config="$LOCALAI_INSTALLER_CONFIG_DEST"
 requested_config="${LOCALAI_CONFIG_FILE:-}"
@@ -372,6 +378,8 @@ run_as_localai() {
   if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then "${command[@]}"; else run0 -i "${command[@]}"; fi
 }
 
+# The function is called indirectly by a helper or test.
+# shellcheck disable=SC2329
 run_localai_unit() {
   run_as_localai "$@"
 }
@@ -669,6 +677,8 @@ localai_tls_preflight_static_paths() {
   if [[ "$run_pull" != "1" ]]; then
     run_as_tls /usr/bin/podman image exists "$tls_image_ref" >/dev/null 2>&1 || return 3
   fi
+  # The quoted text is intentionally evaluated by another shell.
+  # shellcheck disable=SC2016
   run_as_tls /usr/bin/podman run --rm --pull=never \
     --userns=keep-id --security-opt=no-new-privileges --network=none \
     "${volume_args[@]}" --entrypoint /bin/sh "$tls_image_ref" \

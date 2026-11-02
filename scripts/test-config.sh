@@ -6,6 +6,8 @@ TEST_REPO_ROOT="$repo_root"
 source "$repo_root/scripts/test-support.sh"
 test_sanitize_localai_environment
 # shellcheck source=../lib/config.sh
+# The sourced helper is checked independently.
+# shellcheck disable=SC1091
 source "$repo_root/lib/config.sh"
 
 tmp_dir="$(test_mktemp_dir config-test)"
@@ -25,6 +27,8 @@ LOCALAI_BIND_PORT=11456
 EOF
 expect_failure "$tmp_dir/duplicate.conf"
 
+# The quoted text is intentionally evaluated by another shell.
+# shellcheck disable=SC2016
 printf 'LOCALAI_BIND_HOST=$(touch %s)\n' "$tmp_dir/config-injection" >"$tmp_dir/injection.conf"
 expect_failure "$tmp_dir/injection.conf"
 [[ ! -e "$tmp_dir/config-injection" ]]
@@ -53,6 +57,8 @@ expect_failure "$tmp_dir/systemd-specifier.conf"
 
 # Environment overrides use the same strict grammar as file values, before
 # callers can render them into systemd Environment= lines.
+# The quoted text is intentionally evaluated by another shell.
+# shellcheck disable=SC2016
 if env LOCALAI_LOG_LEVEL='%n' bash -c '
   source "$1"
   localai_config_load "$2"
@@ -60,6 +66,8 @@ if env LOCALAI_LOG_LEVEL='%n' bash -c '
   printf 'configuration accepted a systemd specifier from the environment\n' >&2
   exit 1
 fi
+# The quoted text is intentionally evaluated by another shell.
+# shellcheck disable=SC2016
 if env LOCALAI_LOG_LEVEL='%n' bash -c '
   source "$1"
   localai_config_load_compat "$2" "$3"
@@ -91,6 +99,8 @@ EOF
 # exported variables. The snapshot remains stable across repeated loads; use
 # localai_config_override for a same-process change after loading.
 (
+  # The subshell change is isolated deliberately.
+  # shellcheck disable=SC2030
   export LOCALAI_BIND_HOST=127.0.0.6 LOCALAI_TLS_BIND_HOST=localhost LOCALAI_TLS_BIND_PORT=8443
   localai_config_load "$tmp_dir/good.conf"
   [[ "$LOCALAI_BIND_HOST" == 127.0.0.6 ]]
@@ -106,21 +116,35 @@ EOF
 )
 
 localai_config_load "$repo_root/config/localai.conf.example"
+# The subshell change is isolated deliberately.
+# shellcheck disable=SC2031
 [[ "$LOCALAI_BIND_HOST" == 127.0.0.1 ]]
 [[ "$LOCALAI_AUTH" == true ]]
 [[ "$LOCALAI_REGISTRATION_MODE" == approval ]]
 [[ "$LOCALAI_TLS_CONFIG_DIR" == /var/lib/localai-tls/caddy ]]
 
 localai_config_load "$tmp_dir/good.conf"
+# The subshell change is isolated deliberately.
+# shellcheck disable=SC2031
 [[ "$LOCALAI_BIND_HOST" == 127.0.0.3 ]]
+# The value is assigned by a sourced helper.
+# shellcheck disable=SC2153
 [[ "$LOCALAI_BIND_PORT" == 11456 ]]
 [[ "$LOCALAI_TLS_ENABLED" == false ]]
 localai_config_load "$tmp_dir/second.conf"
+# The subshell change is isolated deliberately.
+# shellcheck disable=SC2031
 [[ "$LOCALAI_BIND_HOST" == 127.0.0.4 ]]
 localai_config_override LOCALAI_BIND_HOST 127.0.0.5
+# The subshell change is isolated deliberately.
+# shellcheck disable=SC2031
 [[ "$LOCALAI_BIND_HOST" == 127.0.0.5 ]]
+# The subshell change is isolated deliberately.
+# shellcheck disable=SC2031
 [[ -n "${LOCALAI_CONFIG_SEEN[LOCALAI_BIND_HOST]+x}" ]]
 localai_config_load "$tmp_dir/second.conf"
+# The subshell change is isolated deliberately.
+# shellcheck disable=SC2031
 [[ "$LOCALAI_BIND_HOST" == 127.0.0.4 ]]
 
 [[ "$LOCALAI_AUTH" == true ]]
@@ -142,6 +166,8 @@ localai_config_load "$tmp_dir/custom-tls-state.conf"
 [[ "$LOCALAI_TLS_CERT_DIR" == /srv/localai/tls/certs ]]
 
 localai_config_load_compat "$tmp_dir/no-canonical.conf" "$repo_root/localai/localai.lock"
+# The subshell change is isolated deliberately.
+# shellcheck disable=SC2031
 [[ "$LOCALAI_BIND_HOST" == 127.0.0.1 ]]
 [[ "$LOCALAI_BIND_PORT" == 11455 ]]
 [[ "$LOCALAI_IMAGE_REF" == docker.io/localai/localai:latest-gpu-hipblas ]]

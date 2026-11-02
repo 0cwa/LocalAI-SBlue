@@ -176,28 +176,68 @@ localai_config_load_legacy_file() {
 localai_config_defaults() {
   localai_config_capture_environment
   LOCALAI_CONFIG_SEEN=()
+  # The value is consumed by a sourced or dynamically extracted helper.
+  # shellcheck disable=SC2034
   LOCALAI_IMAGE_REF="docker.io/localai/localai:latest-gpu-hipblas"
+  # The value is consumed by a sourced or dynamically extracted helper.
+  # shellcheck disable=SC2034
   LOCALAI_IMAGE_DIGEST=""
+  # The value is consumed by a sourced or dynamically extracted helper.
+  # shellcheck disable=SC2034
   LOCALAI_CONTAINER_NAME="localai"
+  # The value is consumed by a sourced or dynamically extracted helper.
+  # shellcheck disable=SC2034
   LOCALAI_SERVICE_USER="localai"
+  # The value is consumed by a sourced or dynamically extracted helper.
+  # shellcheck disable=SC2034
   LOCALAI_STATE_DIR="/var/lib/localai"
   LOCALAI_BIND_HOST="127.0.0.1"
   LOCALAI_BIND_PORT="11455"
+  # The value is consumed by a sourced or dynamically extracted helper.
+  # shellcheck disable=SC2034
   LOCALAI_AUTH="true"
+  # The value is consumed by a sourced or dynamically extracted helper.
+  # shellcheck disable=SC2034
   LOCALAI_REGISTRATION_MODE="approval"
+  # The value is consumed by a sourced or dynamically extracted helper.
+  # shellcheck disable=SC2034
   LOCALAI_LOG_LEVEL="info"
+  # The value is consumed by a sourced or dynamically extracted helper.
+  # shellcheck disable=SC2034
   LOCALAI_MODELS_PATH="/var/lib/localai/models"
+  # The value is consumed by a sourced or dynamically extracted helper.
+  # shellcheck disable=SC2034
   LOCALAI_BACKENDS_PATH="/var/lib/localai/backends"
+  # The value is consumed by a sourced or dynamically extracted helper.
+  # shellcheck disable=SC2034
   LOCALAI_DOWNLOAD_STAGING_PATH="/var/lib/localai/downloading"
+  # The value is consumed by a sourced or dynamically extracted helper.
+  # shellcheck disable=SC2034
   LOCALAI_BACKEND_TEMP_DIR="/var/lib/localai/tmp"
+  # The value is consumed by a sourced or dynamically extracted helper.
+  # shellcheck disable=SC2034
   LOCALAI_DATA_PATH="/var/lib/localai/data"
+  # The value is consumed by a sourced or dynamically extracted helper.
+  # shellcheck disable=SC2034
   LOCALAI_CONFIG_DIR="/var/lib/localai/config"
+  # The value is consumed by a sourced or dynamically extracted helper.
+  # shellcheck disable=SC2034
   LOCALAI_GENERATED_CONTENT_PATH="/var/lib/localai/generated"
+  # The value is consumed by a sourced or dynamically extracted helper.
+  # shellcheck disable=SC2034
   LOCALAI_UPLOAD_PATH="/var/lib/localai/uploads"
+  # The value is consumed by a sourced or dynamically extracted helper.
+  # shellcheck disable=SC2034
   LOCALAI_CACHE_DIR="/var/lib/localai/cache"
+  # The value is consumed by a sourced or dynamically extracted helper.
+  # shellcheck disable=SC2034
   LOCALAI_LOG_DIR="/var/lib/localai/logs"
+  # The value is consumed by a sourced or dynamically extracted helper.
+  # shellcheck disable=SC2034
   LOCALAI_F16="true"
   LOCALAI_TLS_ENABLED="false"
+  # The value is consumed by a sourced or dynamically extracted helper.
+  # shellcheck disable=SC2034
   LOCALAI_TLS_USER="localai-tls"
   LOCALAI_TLS_STATE_DIR="/var/lib/localai-tls"
   # Empty TLS subpaths derive from LOCALAI_TLS_STATE_DIR after config/env
@@ -207,22 +247,46 @@ localai_config_defaults() {
   LOCALAI_TLS_CERT_DIR=""
   LOCALAI_TLS_COMPOSE_DIR=""
   LOCALAI_TLS_COMPOSE_FILE_NAME="localai-tls-compose.yaml"
+  # The value is consumed by a sourced or dynamically extracted helper.
+  # shellcheck disable=SC2034
   LOCALAI_TLS_COMPOSE_PROJECT_NAME="localai-tls"
   LOCALAI_TLS_PUBLIC_SOCKET="true"
   LOCALAI_TLS_PUBLIC_HOST=""
   LOCALAI_TLS_PUBLIC_PORT="443"
+  # The value is consumed by a sourced or dynamically extracted helper.
+  # shellcheck disable=SC2034
   LOCALAI_TLS_INTERNAL_HOST="127.0.0.1"
+  # The value is consumed by a sourced or dynamically extracted helper.
+  # shellcheck disable=SC2034
   LOCALAI_TLS_INTERNAL_PORT="8443"
+  # The value is consumed by a sourced or dynamically extracted helper.
+  # shellcheck disable=SC2034
   LOCALAI_TLS_HOSTNAMES="localai.internal"
+  # The value is consumed by a sourced or dynamically extracted helper.
+  # shellcheck disable=SC2034
   LOCALAI_TLS_IMAGE_REF="docker.io/library/caddy:2-alpine"
+  # The value is consumed by a sourced or dynamically extracted helper.
+  # shellcheck disable=SC2034
   LOCALAI_TLS_IMAGE_DIGEST=""
+  # The value is consumed by a sourced or dynamically extracted helper.
+  # shellcheck disable=SC2034
   LOCALAI_TLS_CONTAINER_NAME="localai-tls"
+  # The value is consumed by a sourced or dynamically extracted helper.
+  # shellcheck disable=SC2034
   LOCALAI_TLS_SERVICE_NAME="localai-tls-compose.service"
+  # The value is consumed by a sourced or dynamically extracted helper.
+  # shellcheck disable=SC2034
   LOCALAI_TLS_FORWARD_SERVICE_NAME="localai-tls-forward.service"
+  # The value is consumed by a sourced or dynamically extracted helper.
+  # shellcheck disable=SC2034
   LOCALAI_TLS_FORWARD_SOCKET_NAME="localai-tls-forward.socket"
   # Retained as accepted compatibility keys for older config files. Endpoint
   # URLs are derived dynamically from bind and TLS settings by localaictl.
+  # The value is consumed by a sourced or dynamically extracted helper.
+  # shellcheck disable=SC2034
   LOCALAI_WEB_URL=""
+  # The value is consumed by a sourced or dynamically extracted helper.
+  # shellcheck disable=SC2034
   LOCALAI_HTTPS_URL=""
 }
 

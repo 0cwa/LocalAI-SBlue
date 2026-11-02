@@ -100,7 +100,10 @@ mkdir -p "$tmp_dir/systemd"
 printf '[Socket]\nFreeBind=true\n' >"$tmp_dir/systemd/localai-tls-forward.socket"
 
 "$repo_root/bin/localaictl" --dry-run start >"$tmp_dir/dry-run"
-! [[ -s "$tmp_dir/commands" ]]
+if [[ -s "$tmp_dir/commands" ]]; then
+  printf 'Unexpected match in negative assertion\n' >&2
+  exit 1
+fi
 rg -q 'backend_systemctl' "$tmp_dir/dry-run"
 
 "$repo_root/bin/localaictl" status --json >"$tmp_dir/status"
@@ -108,7 +111,10 @@ rg -q 'backend_systemctl' "$tmp_dir/dry-run"
 rg -q -F 'systemctl --no-ask-password --user --machine=localai@.host is-active localai.service' "$tmp_dir/commands"
 rg -q -F 'systemctl --no-ask-password --user --machine=localai-tls@.host is-active localai-tls-compose.service' "$tmp_dir/commands"
 rg -q -F 'systemctl --no-ask-password is-active localai-tls-forward.socket' "$tmp_dir/commands"
-! rg -q -F 'run0 -i' "$tmp_dir/commands"
+if rg -q -F 'run0 -i' "$tmp_dir/commands"; then
+  printf 'Unexpected match in negative assertion\n' >&2
+  exit 1
+fi
 
 if LOCALAI_FAKE_BACKEND_STATE=inactive "$repo_root/bin/localaictl" status --json >"$tmp_dir/inactive-status"; then
   printf 'inactive backend status unexpectedly succeeded\n' >&2
@@ -157,8 +163,14 @@ LOCALAI_CURL_BIN="$tmp_dir/curl" \
 LOCALAI_CURL_ARGS_FILE="$tmp_dir/curl-args" \
 LOCALAI_CURL_STDIN_FILE="$tmp_dir/curl-stdin" \
   "$repo_root/bin/localaictl" doctor >"$tmp_dir/doctor-output"
-! rg -q -F 'token-marker' "$tmp_dir/curl-args"
-! rg -q -F 'token-marker' "$tmp_dir/commands" "$tmp_dir/doctor-output"
+if rg -q -F 'token-marker' "$tmp_dir/curl-args"; then
+  printf 'Unexpected match in negative assertion\n' >&2
+  exit 1
+fi
+if rg -q -F 'token-marker' "$tmp_dir/commands" "$tmp_dir/doctor-output"; then
+  printf 'Unexpected match in negative assertion\n' >&2
+  exit 1
+fi
 rg -q -F -x 'Authorization: Bearer token-marker' "$tmp_dir/curl-stdin"
 rg -q -F -x -- '--header' "$tmp_dir/curl-args"
 rg -q -F -x -- '@-' "$tmp_dir/curl-args"
@@ -172,8 +184,14 @@ rg -q -F "run0 -i --pipe $tmp_dir/journalctl --system -n 120 --no-pager _SYSTEMD
 "$repo_root/bin/localaictl" logs tls >"$tmp_dir/tls-logs"
 [[ "$(<"$tmp_dir/tls-logs")" == 'fake journal output' ]]
 rg -q -F "run0 -i --pipe $tmp_dir/journalctl --system -n 160 --no-pager _SYSTEMD_USER_UNIT=localai-tls-compose.service _SYSTEMD_OWNER_UID=1002" "$tmp_dir/commands"
-! rg -q -F 'journalctl --user' "$tmp_dir/commands"
-! rg -q 'run0 .*--user=localai' "$tmp_dir/commands"
+if rg -q -F 'journalctl --user' "$tmp_dir/commands"; then
+  printf 'Unexpected match in negative assertion\n' >&2
+  exit 1
+fi
+if rg -q 'run0 .*--user=localai' "$tmp_dir/commands"; then
+  printf 'Unexpected match in negative assertion\n' >&2
+  exit 1
+fi
 
 cat >"$tmp_dir/legacy-config" <<'EOF'
 LOCALAI_BIND_HOST=127.0.0.1
@@ -197,7 +215,10 @@ socket_line="$(rg -n -- 'start localai-tls-forward.socket' "$tmp_dir/commands" |
 rg -q -F "run0 -i $tmp_dir/systemctl --no-ask-password --user --machine=localai@.host start localai.service" "$tmp_dir/commands"
 rg -q -F "run0 -i $tmp_dir/systemctl --no-ask-password --user --machine=localai-tls@.host start localai-tls-compose.service" "$tmp_dir/commands"
 rg -q -F "run0 -i $tmp_dir/systemctl --no-ask-password start localai-tls-forward.socket localai-tls-forward.service" "$tmp_dir/commands"
-! rg -q -F 'run0 --pipe --user=localai' "$tmp_dir/commands"
+if rg -q -F 'run0 --pipe --user=localai' "$tmp_dir/commands"; then
+  printf 'Unexpected match in negative assertion\n' >&2
+  exit 1
+fi
 
 stop_socket_line="$(rg -n -- 'stop localai-tls-forward.socket' "$tmp_dir/commands" | head -n1 | cut -d: -f1)"
 stop_tls_line="$(rg -n -- 'stop localai-tls-compose.service' "$tmp_dir/commands" | head -n1 | cut -d: -f1)"
