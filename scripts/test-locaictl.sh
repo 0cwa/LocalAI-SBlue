@@ -96,6 +96,29 @@ export LOCALAI_JOURNALCTL_BIN="$tmp_dir/journalctl"
 export LOCALAI_SYSTEM_UNIT_DIR="$tmp_dir/systemd"
 export HOME="$tmp_dir/home"
 
+# Exercise the elevated-command helpers with both effective privilege states.
+# shellcheck disable=SC1090
+source <(sed -n '/^run_elevated() {$/,/^}/p' "$repo_root/bin/localaictl")
+# shellcheck disable=SC1090
+source <(sed -n '/^run_elevated_pipe() {$/,/^}/p' "$repo_root/bin/localaictl")
+run0_bin="$tmp_dir/run0"
+# The extracted elevation helpers invoke this stub indirectly.
+# shellcheck disable=SC2329
+is_effectively_root() { return 0; }
+: >"$tmp_dir/commands"
+run_elevated "$tmp_dir/systemctl" sample
+run_elevated_pipe "$tmp_dir/journalctl" sample >/dev/null
+if rg -q '^run0' "$tmp_dir/commands"; then
+  printf 'already-root command invoked run0\n' >&2; exit 1
+fi
+# shellcheck disable=SC2329
+is_effectively_root() { return 1; }
+run_elevated "$tmp_dir/systemctl" sample
+run_elevated_pipe "$tmp_dir/journalctl" sample >/dev/null
+rg -q '^run0 -i ' "$tmp_dir/commands"
+rg -q '^run0 -i --pipe ' "$tmp_dir/commands"
+: >"$tmp_dir/commands"
+
 mkdir -p "$tmp_dir/systemd"
 printf '[Socket]\nFreeBind=true\n' >"$tmp_dir/systemd/localai-tls-forward.socket"
 
