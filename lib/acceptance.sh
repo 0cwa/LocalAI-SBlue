@@ -18,3 +18,29 @@ localai_acceptance_step() {
     return 1
   fi
 }
+
+# Refuse existing installations before any destructive host operation. The
+# optional root is used by tests; production callers pass /.
+localai_acceptance_clean_install() {
+  local root="${1:?}" account path status
+  for account in localai localai-tls; do
+    if getent passwd "$account" >/dev/null 2>&1; then
+      printf 'Acceptance requires an isolated install: account %s exists.\n' "$account" >&2
+      return 1
+    else
+      status=$?
+      if [[ "$status" != 2 ]]; then
+        printf 'Could not check acceptance service accounts.\n' >&2
+        return 1
+      fi
+    fi
+  done
+  for path in etc/localai var/lib/localai var/lib/localai-tls \
+    etc/systemd/system/localai-tls-forward.socket \
+    etc/systemd/system/localai-tls-forward.service; do
+    if [[ -e "${root%/}/$path" || -L "${root%/}/$path" ]]; then
+      printf 'Acceptance requires an isolated install: existing LocalAI state.\n' >&2
+      return 1
+    fi
+  done
+}

@@ -23,3 +23,26 @@ if rg -q 'secret-value' "$receipt"; then
   printf 'Command output leaked into receipt\n' >&2; exit 1
 fi
 printf 'Acceptance step tests passed\n'
+
+getent() { return 2; }
+mkdir -p "$work/root/etc"
+localai_acceptance_clean_install "$work/root"
+mkdir -p "$work/root/var/lib/localai"
+if localai_acceptance_clean_install "$work/root" 2>/dev/null; then
+  printf 'Existing LocalAI state was accepted\n' >&2; exit 1
+fi
+rmdir "$work/root/var/lib/localai"
+ln -s missing "$work/root/etc/localai"
+if localai_acceptance_clean_install "$work/root" 2>/dev/null; then
+  printf 'Existing LocalAI symlink was accepted\n' >&2; exit 1
+fi
+rm "$work/root/etc/localai"
+getent() { return 0; }
+if localai_acceptance_clean_install "$work/root" 2>/dev/null; then
+  printf 'Existing service account was accepted\n' >&2; exit 1
+fi
+getent() { return 1; }
+if localai_acceptance_clean_install "$work/root" 2>/dev/null; then
+  printf 'Account lookup error was accepted\n' >&2; exit 1
+fi
+printf 'Acceptance isolation checks passed\n'
