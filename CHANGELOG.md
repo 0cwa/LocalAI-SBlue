@@ -5,6 +5,8 @@ has been runtime-qualified on secureblue or on a GPU.
 
 ## Unreleased
 
+- Establish the public repository as canonical and check for deployment-specific data.
+
 - Use a shared installed configuration and safer loopback, authentication, and
   registration defaults.
 - Reject percent signs in configuration values to prevent systemd specifier
