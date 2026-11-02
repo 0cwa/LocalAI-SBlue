@@ -85,6 +85,11 @@ expect_reject() {
   if "$@" >/dev/null 2>&1; then fail "expected rejection: $description"; fi
 }
 
+# This only examines /etc metadata; no host state is created or modified.
+localai_installer_check_config_parent /etc/localai/localai.conf || fail "canonical config parent was rejected"
+expect_reject noncanonical-config-parent localai_installer_check_config_parent /etc/unrelated/localai.conf
+expect_reject service-data-under-etc localai_installer_validate_managed_path /etc/localai state
+
 expect_reject_with_message() {
   local description="$1" expected_message="$2" output
   shift 2

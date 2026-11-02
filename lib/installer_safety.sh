@@ -340,6 +340,21 @@ localai_installer_validate_config_source() {
   localai_config_validate
 }
 
+# The canonical configuration is deliberately under /etc, which is forbidden
+# for service-owned state. Validate its root-owned parent separately rather
+# than weakening the managed-state path guard.
+localai_installer_check_config_parent() {
+  local destination="$1" etc_owner etc_mode
+  [[ "$destination" == "$LOCALAI_INSTALLER_CONFIG_DEST" && "$destination" == /etc/localai/localai.conf ]] || {
+    localai_installer_error "refusing to create a noncanonical configuration directory"
+    return 1
+  }
+  [[ -d /etc && ! -L /etc ]] || return 1
+  etc_owner="$(/usr/bin/stat -c '%u' -- /etc)" || return 1
+  etc_mode="$(/usr/bin/stat -c '%a' -- /etc)" || return 1
+  (( etc_owner == 0 && (8#$etc_mode & 0022) == 0 ))
+}
+
 localai_installer_prepare_config() {
   local destination="$1" source="$2" format="$3"
   local parent tmp
@@ -368,7 +383,7 @@ localai_installer_prepare_config() {
       return 1
     }
   else
-    localai_installer_check_directory_chain "$parent" "configuration directory" 0 || return 1
+    localai_installer_check_config_parent "$destination" || return 1
     /usr/bin/install -d -o root -g root -m 0755 -- "$parent" || return 1
   fi
   localai_installer_mktemp_at_var tmp "$parent" .localai.conf.XXXXXX || return 1
