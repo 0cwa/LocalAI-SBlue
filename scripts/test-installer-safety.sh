@@ -479,16 +479,24 @@ printf 'User unit directory ownership checks\n'
     eval "localai_${name}_path() { printf '%s\\n' '$scratch/data'; }"
   done
   # The installer calls these two helpers with different names.
+  # shellcheck disable=SC2329
   localai_config_dir() { localai_config_path; }
+  # shellcheck disable=SC2329
   localai_backend_temp_dir() { localai_backend_temp_path; }
+  # shellcheck disable=SC2329
   localai_cache_dir() { localai_cache_path; }
+  # shellcheck disable=SC2329
   localai_log_dir() { localai_log_path; }
   state_dir="$scratch/backend" service_user=test-service service_uid=12345
+  # The extracted installer reads this directory indirectly.
+  # shellcheck disable=SC2034
   script_dir="$repo_root/secureblue-localai-install"
   : >"$scratch/unit-directories"
   install_systemd_service
   [[ "$(<"$scratch/unit-directories")" == $"$scratch/backend/.config/systemd test-service test-service 0700"$'\n'$"$scratch/backend/.config/systemd/user test-service test-service 0700" ]]
   install_service=1 tls_state_dir="$scratch/tls" tls_user=test-tls tls_uid=12346
+  # The extracted TLS installer reads these values indirectly.
+  # shellcheck disable=SC2034
   tls_compose_dir="$scratch/compose" tls_compose_file_name=compose.yaml tls_service_name=tls.service tls_project_name=test
   : >"$scratch/unit-directories"
   write_compose_service
