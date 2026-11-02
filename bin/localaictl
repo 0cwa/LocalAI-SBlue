@@ -3,6 +3,14 @@ set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "$script_dir/.." && pwd)"
+if [[ "${1:-}" == --version ]]; then
+  [[ "$#" == 1 ]] || { printf 'localaictl: --version accepts no arguments\n' >&2; exit 2; }
+  version_file="$script_dir/VERSION"
+  [[ -f "$version_file" ]] || version_file="$repo_root/VERSION"
+  [[ -f "$version_file" ]] || { printf 'localaictl: VERSION file is missing\n' >&2; exit 1; }
+  printf 'localaictl %s\n' "$(<"$version_file")"
+  exit 0
+fi
 # shellcheck source=../lib/config.sh
 config_lib="${LOCALAI_CONFIG_LIB:-$repo_root/lib/config.sh}"
 [[ -f "$config_lib" ]] || config_lib="$script_dir/config.sh"
@@ -309,7 +317,7 @@ doctor() {
 
 usage() {
   cat <<'EOF'
-Usage: localaictl [--dry-run] <start|stop|restart|status [--json] [--elevated]|logs [backend|tls|all]|doctor>
+Usage: localaictl --version | [--dry-run] <start|stop|restart|status [--json] [--elevated]|logs [backend|tls|all]|doctor>
 
 The command controls only the known LocalAI backend, TLS Compose service, and
 TLS forward socket. It does not accept arbitrary systemd or Podman commands.

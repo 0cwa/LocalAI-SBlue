@@ -20,6 +20,7 @@ die() {
 /usr/bin/python3 -c 'import PyQt6' 2>/dev/null || die "PyQt6 is not installed. Install the host PyQt6 package before installing the tray client."
 command -v run0 >/dev/null 2>&1 || die "run0 is required for the SecureBlue service-user boundary."
 command -v systemctl >/dev/null 2>&1 || die "systemctl is required."
+[[ -f "$script_dir/../VERSION" ]] || die "VERSION is missing from the repository."
 [[ -f "$script_dir/../bin/localaictl" ]] || die "localaictl is missing from the repository."
 [[ -f "$script_dir/../lib/config.sh" ]] || die "shared config loader is missing from the repository."
 
@@ -27,6 +28,7 @@ install -d -m 0755 "$install_dir" "$bin_home" "$desktop_dir" "$icon_dir"
 install -m 0644 "$script_dir/localai-tray.py" "$install_dir/localai-tray.py"
 install -m 0644 "$script_dir/adapter.py" "$install_dir/adapter.py"
 install -m 0644 "$script_dir/localai.svg" "$install_dir/localai.svg"
+install -m 0644 "$script_dir/../VERSION" "$install_dir/VERSION"
 install -m 0755 "$script_dir/../bin/localaictl" "$install_dir/localaictl"
 install -m 0644 "$script_dir/../lib/config.sh" "$install_dir/config.sh"
 # The controller reads the shared /etc/localai/localai.conf on each command.

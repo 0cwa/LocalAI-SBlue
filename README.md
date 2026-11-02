@@ -288,10 +288,20 @@ scripts/test-package-relocation.sh
 Create a source archive with:
 
 ```sh
-make package VERSION=0.1.0
+make package
 ```
 
-The release archive uses an explicit public-file manifest. Local deployment
+The `VERSION` file is the source for package names and `bin/localaictl --version`.
+A release tag must match `VERSION` and have a matching changelog section with
+its qualification level. A tag triggers checks, archive creation, SHA-256
+checksums, and a build provenance attestation. Verify downloaded artifacts:
+
+```sh
+sha256sum -c localai-secureblue-0.1.0.tar.gz.sha256
+gh attestation verify localai-secureblue-0.1.0.tar.gz --repo 0cwa/LocalAI-SBlue
+```
+
+Use the filenames for the release being verified. The release archive uses an explicit public-file manifest. Local deployment
 records, private PKI notes, and local certificates are not included. See
 [`SOURCE_PROVENANCE.md`](SOURCE_PROVENANCE.md),
 [`docs/PUBLIC_BOUNDARIES.md`](docs/PUBLIC_BOUNDARIES.md),

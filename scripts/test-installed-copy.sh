@@ -10,9 +10,11 @@ trap 'rm -rf "$tmp_dir"' EXIT
 
 install_dir="$tmp_dir/localai-tray"
 mkdir -p "$install_dir/config"
+cp "$repo_root/VERSION" "$install_dir/VERSION"
 cp "$repo_root/bin/localaictl" "$install_dir/localaictl"
 cp "$repo_root/lib/config.sh" "$install_dir/config.sh"
 chmod 0755 "$install_dir/localaictl"
+[[ "$("$install_dir/localaictl" --version)" == "localaictl $(<"$repo_root/VERSION")" ]]
 
 cat >"$install_dir/config/localai.conf" <<'EOF'
 LOCALAI_TLS_ENABLED=true

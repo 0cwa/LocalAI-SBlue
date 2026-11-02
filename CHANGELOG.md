@@ -5,6 +5,8 @@ has been runtime-qualified on secureblue or on a GPU.
 
 ## Unreleased
 
+- Use one version source for packages and the controller, with attested tag-driven releases.
+
 - Consolidate planning on the public roadmap and document evidence, secrets, and data safety.
 
 - Run ShellCheck and Ruff in CI and when installed for local checks.
@@ -28,3 +30,9 @@ has been runtime-qualified on secureblue or on a GPU.
   per-user install-time snapshot.
 - Add public source packaging, security and contribution guidance, and
   portable repository checks.
+
+## 0.1.0
+
+Qualification: repository checks only; no secureblue host or GPU qualification.
+
+- Initial public source snapshot.

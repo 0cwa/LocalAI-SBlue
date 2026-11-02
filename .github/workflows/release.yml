@@ -1,0 +1,36 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install check dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes ripgrep
+          python3 -m pip install --break-system-packages shellcheck-py==0.11.0.1 ruff==0.15.19
+      - name: Validate tag and prepare release notes
+        run: python3 scripts/release-notes.py "$GITHUB_REF_NAME" > release-notes.txt
+      - name: Build and check archive
+        run: |
+          make package
+          scripts/test-package-relocation.sh
+      - name: Attest archive provenance
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: dist/*.tar.gz
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.tar.gz.sha256 --notes-file release-notes.txt --verify-tag

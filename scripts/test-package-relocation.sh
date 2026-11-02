@@ -12,7 +12,7 @@ build_dir="$work_dir/build"
 extract_dir="$work_dir/extract"
 home_dir="$work_dir/home"
 tmp_dir="$work_dir/tmp"
-version=0.0.0-ci.1
+version="$(<"$repo_root/VERSION")"
 mkdir -p "$build_dir" "$extract_dir" "$home_dir" "$tmp_dir"
 
 if LOCALAI_PACKAGE_DIST_DIR="$output_dir" \
@@ -56,6 +56,7 @@ extract_root = Path(sys.argv[3]).resolve()
 package_name = f"localai-secureblue-{version}"
 required = {
     f"{package_name}/LICENSE",
+    f"{package_name}/VERSION",
     f"{package_name}/README.md",
     f"{package_name}/SOURCE_PROVENANCE.md",
     f"{package_name}/proposals.md",

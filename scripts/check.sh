@@ -60,6 +60,9 @@ python3 -c 'import xml.etree.ElementTree as ET; ET.parse("localai-tray/localai.s
 
 printf 'Caddyfile validation runs inside the Caddy container during install.\n'
 
+printf 'Release version and notes tests\n'
+bash scripts/test-release.sh
+
 printf 'Strict configuration tests\n'
 bash scripts/test-config.sh
 
