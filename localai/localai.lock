@@ -1,0 +1,39 @@
+# shellcheck shell=bash
+#
+# Lock/config file for the LocalAI secureblue rootless workflow.
+# Scripts source this file directly; keep values shell-quoted when needed.
+
+LOCK_SCHEMA=1
+
+# Default target: AMD ROCm/HIP LocalAI image from Docker Hub.
+# Alternatives:
+#   docker.io/localai/localai:latest-gpu-vulkan
+#   docker.io/localai/localai:latest-cpu
+LOCALAI_IMAGE_REF="docker.io/localai/localai:latest-gpu-hipblas"
+
+# Optional digest pin. After a known-good pull, set this to sha256:<digest>.
+# When set, scripts use ${LOCALAI_IMAGE_REF%@*}@${LOCALAI_IMAGE_DIGEST}.
+LOCALAI_IMAGE_DIGEST=""
+
+LOCALAI_CONTAINER_NAME="localai"
+
+SERVICE_BIND_HOST="127.0.0.1"
+SERVICE_BIND_PORT="11455"
+
+LOCALAI_AUTH="true"
+LOCALAI_REGISTRATION_MODE="approval"
+LOCALAI_LOG_LEVEL="info"
+
+LOCALAI_MODELS_PATH="/var/lib/localai/models"
+LOCALAI_BACKENDS_PATH="/var/lib/localai/backends"
+LOCALAI_DOWNLOAD_STAGING_PATH="/var/lib/localai/downloading"
+LOCALAI_BACKEND_TEMP_DIR="/var/lib/localai/tmp"
+LOCALAI_DATA_PATH="/var/lib/localai/data"
+LOCALAI_CONFIG_DIR="/var/lib/localai/config"
+LOCALAI_GENERATED_CONTENT_PATH="/var/lib/localai/generated"
+LOCALAI_UPLOAD_PATH="/var/lib/localai/uploads"
+
+# GPU acceleration hint used by LocalAI's CLI. Model/backend config still
+# controls the actual backend and offload behavior.
+LOCALAI_F16="true"
+

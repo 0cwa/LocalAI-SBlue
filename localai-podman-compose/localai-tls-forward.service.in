@@ -1,0 +1,18 @@
+[Unit]
+Description=LocalAI HTTPS socket proxy
+Documentation=man:systemd-socket-proxyd(8)
+Requires=localai-tls-forward.socket
+Wants=user@@TLS_UID@.service
+After=network-online.target user@@TLS_UID@.service
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=@SOCKET_PROXYD@ @TLS_INTERNAL_HOST@:@TLS_INTERNAL_PORT@
+SELinuxContext=system_u:system_r:systemd_socket_proxyd_t:s0
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+Restart=on-failure
+RestartSec=5

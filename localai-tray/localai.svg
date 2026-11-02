@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">LocalAI</title>
+  <desc id="desc">A turquoise L-shaped circuit mark with an amber intelligence spark on a midnight gradient.</desc>
+  <defs>
+    <linearGradient id="bg" x1="64" y1="32" x2="448" y2="480" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#18233f"/>
+      <stop offset="0.55" stop-color="#312e81"/>
+      <stop offset="1" stop-color="#111827"/>
+    </linearGradient>
+    <linearGradient id="glow" x1="112" y1="92" x2="382" y2="410" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#8af5d1"/>
+      <stop offset="1" stop-color="#32c6d5"/>
+    </linearGradient>
+    <filter id="soft" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="12" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect x="16" y="16" width="480" height="480" rx="112" fill="url(#bg)"/>
+  <path d="M136 114v254h238" fill="none" stroke="#0b1224" stroke-width="68" stroke-linecap="round" stroke-linejoin="round" opacity=".5" filter="url(#soft)"/>
+  <path d="M136 114v254h238" fill="none" stroke="url(#glow)" stroke-width="52" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M136 114l76 76m162 178 44-44" fill="none" stroke="#8af5d1" stroke-width="18" stroke-linecap="round" opacity=".9"/>
+  <circle cx="136" cy="114" r="25" fill="#f7c66b"/>
+  <circle cx="374" cy="368" r="25" fill="#f7c66b"/>
+  <path d="M366 112l10 25 25 10-25 10-10 25-10-25-25-10 25-10 10-25z" fill="#f7c66b"/>
+  <circle cx="212" cy="190" r="12" fill="#d7fff2"/>
+  <circle cx="418" cy="324" r="10" fill="#d7fff2"/>
+</svg>

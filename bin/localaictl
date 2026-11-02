@@ -1,0 +1,368 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd -- "$script_dir/.." && pwd)"
+# shellcheck source=../lib/config.sh
+config_lib="${LOCALAI_CONFIG_LIB:-$repo_root/lib/config.sh}"
+[[ -f "$config_lib" ]] || config_lib="$script_dir/config.sh"
+source "$config_lib"
+
+run0_bin="${LOCALAI_RUN0_BIN:-/usr/bin/run0}"
+systemctl_bin="${LOCALAI_SYSTEMCTL_BIN:-/usr/bin/systemctl}"
+system_unit_dir="${LOCALAI_SYSTEM_UNIT_DIR:-/etc/systemd/system}"
+journalctl_bin="${LOCALAI_JOURNALCTL_BIN:-/usr/bin/journalctl}"
+curl_bin="${LOCALAI_CURL_BIN:-/usr/bin/curl}"
+id_bin="${LOCALAI_ID_BIN:-/usr/bin/id}"
+date_bin="${LOCALAI_DATE_BIN:-/usr/bin/date}"
+sha256_bin="${LOCALAI_SHA256_BIN:-/usr/bin/sha256sum}"
+config_file="${LOCALAI_CONFIG_FILE:-/etc/localai/localai.conf}"
+legacy_config_file="${LOCALAI_LEGACY_CONFIG_FILE:-$repo_root/localai/localai.lock}"
+audit_dir="${LOCALAI_AUDIT_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/localai/audit}"
+dry_run=0
+status_elevated=0
+
+die() { printf 'localaictl: %s\n' "$*" >&2; exit 1; }
+log() { printf '%s\n' "$*"; }
+
+if [[ -z "${LOCALAI_CONFIG_FILE:-}" && ! -e "$config_file" ]]; then
+  # A repository checkout may use its editable config while developing. An
+  # installed tray must use the shared /etc file instead of its old, frozen
+  # per-user config snapshot.
+  if [[ -f /etc/localai.conf ]]; then
+    config_file=/etc/localai.conf
+  elif [[ -f "$repo_root/Makefile" && -f "$repo_root/lib/config.sh" && -f "$repo_root/config/localai.conf" ]]; then
+    config_file="$repo_root/config/localai.conf"
+  fi
+fi
+localai_config_load_compat "$config_file" "$legacy_config_file"
+
+tls_enabled() {
+  # An explicit canonical or environment setting wins over migration
+  # detection. Only legacy configurations that never had a TLS key may infer
+  # Compose TLS from the current forwarding unit.
+  if [[ -n "${LOCALAI_CONFIG_SEEN[LOCALAI_TLS_ENABLED]+x}" ]]; then
+    [[ "$LOCALAI_TLS_ENABLED" == true ]]
+    return
+  fi
+  # During migration, the current forwarding unit is the authoritative signal
+  # when an older config file has no TLS keys yet. Do not infer TLS from the
+  # legacy direct-Caddy unit; that unit must be retired before Compose use.
+  # The service user's home is intentionally not traversable by the desktop
+  # user, so use the root-readable forwarding unit as the migration marker.
+  local socket_unit="$system_unit_dir/$LOCALAI_TLS_FORWARD_SOCKET_NAME"
+  [[ -f "$socket_unit" ]] || return 1
+  grep -qx 'FreeBind=true' "$socket_unit"
+}
+
+service_uid() { "$id_bin" -u "$1"; }
+
+user_manager_systemctl() {
+  local service_user="$1"
+  shift
+  if [[ "${1:-}" == is-active && "$status_elevated" != 1 ]]; then
+    # The tray/status path must never show an elevation prompt. Query the
+    # named local user manager directly and report unknown if access is denied.
+    "$systemctl_bin" --no-ask-password --user --machine="${service_user}@.host" "$@"
+  else
+    # Elevate as the desktop user to root, then select the service manager
+    # explicitly. The service accounts have nologin shells and are never
+    # selected as run0's login-shell user.
+    "$run0_bin" -i "$systemctl_bin" --no-ask-password --user --machine="${service_user}@.host" "$@"
+  fi
+}
+
+backend_systemctl() { user_manager_systemctl "$LOCALAI_SERVICE_USER" "$@"; }
+tls_systemctl() { user_manager_systemctl "$LOCALAI_TLS_USER" "$@"; }
+
+root_systemctl() {
+  if [[ "${1:-}" == is-active && "$status_elevated" != 1 ]]; then
+    "$systemctl_bin" --no-ask-password "$@"
+  else
+    "$run0_bin" -i "$systemctl_bin" --no-ask-password "$@"
+  fi
+}
+
+component_state() {
+  local command="$1" unit="$2" output
+  if output="$($command is-active "$unit" 2>/dev/null)"; then
+    case "$output" in active|inactive|failed|activating|deactivating) printf '%s\n' "$output" ;; *) printf 'unknown\n' ;; esac
+  else
+    case "$output" in active|inactive|failed|activating|deactivating) printf '%s\n' "$output" ;; *) printf 'unknown\n' ;; esac
+  fi
+}
+
+backend_state() { component_state backend_systemctl localai.service; }
+tls_state() { component_state tls_systemctl "$LOCALAI_TLS_SERVICE_NAME"; }
+socket_state() { component_state root_systemctl "$LOCALAI_TLS_FORWARD_SOCKET_NAME"; }
+
+config_hash() {
+  if [[ -f "$config_file" ]]; then
+    "$sha256_bin" "$config_file" | awk '{print $1}'
+  else
+    printf 'defaults\n'
+  fi
+}
+
+audit() {
+  local action="$1" result="$2" actions="$3" timestamp hash file
+  [[ "$dry_run" == 1 ]] && return 0
+  mkdir -p "$audit_dir"
+  timestamp="$($date_bin -Iseconds)"
+  hash="$(config_hash)"
+  file="$audit_dir/$($date_bin +%Y-%m-%d).jsonl"
+  printf '{"timestamp":"%s","action":"%s","config_hash":"%s","result":"%s","actions":"%s"}\n' \
+    "$timestamp" "$action" "$hash" "$result" "$actions" >> "$file"
+}
+
+run_or_dry() {
+  if [[ "$dry_run" == 1 ]]; then
+    printf 'DRY-RUN:'
+    printf ' %q' "$@"
+    printf '\n'
+  else
+    "$@"
+  fi
+}
+
+start_stack() {
+  local result=success actions="backend-start"
+  if ! run_or_dry backend_systemctl start localai.service; then
+    log "start: backend failed; inspect with 'localaictl logs backend'"
+    result=failure
+  fi
+  if tls_enabled; then
+    actions+=",tls-start"
+    if ! run_or_dry tls_systemctl start "$LOCALAI_TLS_SERVICE_NAME"; then
+      log "start: TLS Compose service failed; inspect with 'localaictl logs tls'"
+      result=failure
+    fi
+    if [[ "$LOCALAI_TLS_PUBLIC_SOCKET" == true ]]; then
+      actions+=",socket-start"
+      if ! run_or_dry root_systemctl start "$LOCALAI_TLS_FORWARD_SOCKET_NAME" "$LOCALAI_TLS_FORWARD_SERVICE_NAME"; then
+        log "start: HTTPS socket failed; inspect systemd status and TLS logs"
+        result=failure
+      fi
+    fi
+  fi
+  audit start "$result" "$actions"
+  [[ "$result" == success ]]
+}
+
+stop_stack() {
+  local result=success actions="backend-stop"
+  if tls_enabled && [[ "$LOCALAI_TLS_PUBLIC_SOCKET" == true ]]; then
+    actions="socket-stop,tls-stop,backend-stop"
+    if ! run_or_dry root_systemctl stop "$LOCALAI_TLS_FORWARD_SOCKET_NAME" "$LOCALAI_TLS_FORWARD_SERVICE_NAME"; then
+      log "stop: HTTPS socket failed to stop"
+      result=failure
+    fi
+  fi
+  if tls_enabled; then
+    [[ "$actions" == backend-stop ]] && actions="tls-stop,backend-stop"
+    if ! run_or_dry tls_systemctl stop "$LOCALAI_TLS_SERVICE_NAME"; then
+      log "stop: TLS Compose service failed to stop"
+      result=failure
+    fi
+  fi
+  if ! run_or_dry backend_systemctl stop localai.service; then
+    log "stop: backend failed to stop"
+    result=failure
+  fi
+  audit stop "$result" "$actions"
+  [[ "$result" == success ]]
+}
+
+status_json=0
+endpoint_url() {
+  local scheme host port default_port
+  if tls_enabled; then
+    if [[ "$LOCALAI_TLS_PUBLIC_SOCKET" == true ]]; then
+      scheme=https
+      host="$LOCALAI_TLS_PUBLIC_HOST"
+      port="$LOCALAI_TLS_PUBLIC_PORT"
+      default_port=443
+    else
+      scheme=https
+      host="$LOCALAI_TLS_INTERNAL_HOST"
+      port="$LOCALAI_TLS_INTERNAL_PORT"
+      default_port=443
+    fi
+  else
+    scheme=http
+    host="$LOCALAI_BIND_HOST"
+    port="$LOCALAI_BIND_PORT"
+    default_port=80
+  fi
+  if [[ "$host" == *:* && "$host" != \[*\] ]]; then host="[$host]"; fi
+  if [[ "$port" == "$default_port" ]]; then
+    printf '%s://%s\n' "$scheme" "$host"
+  else
+    printf '%s://%s:%s\n' "$scheme" "$host" "$port"
+  fi
+}
+
+status() {
+  local backend tls socket endpoint tls_configured
+  backend="$(backend_state)"
+  tls="disabled"
+  socket="disabled"
+  if tls_enabled; then
+    tls="$(tls_state)"
+    [[ "$LOCALAI_TLS_PUBLIC_SOCKET" == true ]] && socket="$(socket_state)"
+  fi
+  endpoint="$(endpoint_url)"
+  tls_configured=false
+  tls_enabled && tls_configured=true
+  if [[ "$backend" == unknown || "$tls" == unknown || "$socket" == unknown ]]; then
+    if [[ "$status_elevated" == 1 ]]; then
+      printf 'localaictl: service-manager status is unavailable; unknown does not mean inactive. Check that the configured user manager is running and reachable.\n' >&2
+    else
+      printf 'localaictl: service-manager status is unavailable; unknown does not mean inactive. Try status --elevated from a terminal.\n' >&2
+    fi
+  fi
+  if [[ "$status_json" == 1 ]]; then
+    printf '{"backend":"%s","tls_compose":"%s","https_socket":"%s","tls_enabled":%s,"endpoint":"%s"}\n' \
+      "$backend" "$tls" "$socket" "$tls_configured" "$endpoint"
+  else
+    printf 'backend: %s\ntls-compose: %s\nhttps-socket: %s\nendpoint: %s\n' "$backend" "$tls" "$socket" "$endpoint"
+  fi
+  [[ "$backend" == active && ( "$tls_configured" == false || ( "$tls" == active && ( "$socket" == active || "$socket" == disabled ) ) ) ]]
+}
+
+logs() {
+  local component="${1:-all}"
+  case "$component" in
+    backend) service_logs "$LOCALAI_SERVICE_USER" localai.service 120 ;;
+    tls) service_logs "$LOCALAI_TLS_USER" "$LOCALAI_TLS_SERVICE_NAME" 160 ;;
+    all)
+      logs backend
+      tls_enabled && logs tls
+      ;;
+    *) die "logs component must be backend, tls, or all" ;;
+  esac
+}
+
+service_logs() {
+  local service_user="$1" user_unit="$2" count="$3" uid
+  uid="$(service_uid "$service_user")" || return 1
+  # These system accounts write to the system journal. Filter trusted
+  # user-unit metadata by both unit and owner UID; --pipe preserves the log
+  # stream while run0 elevates through the caller's login shell.
+  "$run0_bin" -i --pipe "$journalctl_bin" --system -n "$count" --no-pager \
+    "_SYSTEMD_USER_UNIT=$user_unit" "_SYSTEMD_OWNER_UID=$uid"
+}
+
+doctor() {
+  local url http_code curl_ok=1
+  local _localai_doctor_token="${LOCALAI_DOCTOR_TOKEN:-}"
+  local -a curl_args=(--silent --show-error --max-time 5 --output /dev/null --write-out '%{http_code}')
+  # Avoid passing the token to service-status subprocesses as well as curl.
+  [[ -n "$_localai_doctor_token" ]] && unset LOCALAI_DOCTOR_TOKEN
+  status || true
+  url="$(endpoint_url)"
+  if [[ "$url" == https://* ]]; then
+    if [[ -n "${LOCALAI_DOCTOR_CACERT:-}" ]]; then
+      curl_args+=(--cacert "$LOCALAI_DOCTOR_CACERT")
+    elif [[ "${LOCALAI_DOCTOR_INSECURE:-false}" == true ]]; then
+      curl_args+=(--insecure)
+    else
+      log "TLS health check uses normal certificate verification; set LOCALAI_DOCTOR_CACERT or LOCALAI_DOCTOR_INSECURE=true for an explicitly chosen local CA policy."
+    fi
+  fi
+  log "health endpoint: $url"
+  if [[ -n "$_localai_doctor_token" ]]; then
+    # Keep credentials out of curl's argument vector and environment. curl
+    # accepts --header @- to read the header line from standard input.
+    if ! http_code="$(printf 'Authorization: Bearer %s\n' "$_localai_doctor_token" | "$curl_bin" "${curl_args[@]}" --header @- "$url/v1/models")"; then
+      curl_ok=0
+    fi
+  elif ! http_code="$("$curl_bin" "${curl_args[@]}" "$url/v1/models")"; then
+    curl_ok=0
+  fi
+  if [[ "$curl_ok" == 0 ]]; then
+    log "health result: transport or TLS validation failed (no HTTP response)"
+    return 1
+  fi
+  log "health result: HTTP $http_code"
+  if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+    return 0
+  elif [[ "$http_code" =~ ^4[0-9][0-9]$ ]]; then
+    log "health note: the endpoint is reachable, but the request was rejected by authentication or client policy"
+  elif [[ "$http_code" =~ ^5[0-9][0-9]$ ]]; then
+    log "health note: the endpoint is reachable, but the service reported a server error"
+  else
+    log "health note: the endpoint returned an unexpected HTTP status"
+  fi
+  return 1
+}
+
+usage() {
+  cat <<'EOF'
+Usage: localaictl [--dry-run] <start|stop|restart|status [--json] [--elevated]|logs [backend|tls|all]|doctor>
+
+The command controls only the known LocalAI backend, TLS Compose service, and
+TLS forward socket. It does not accept arbitrary systemd or Podman commands.
+
+doctor uses normal TLS verification. For the local Caddy CA, set
+LOCALAI_DOCTOR_CACERT=/path/to/root.crt. Use LOCALAI_DOCTOR_TOKEN only for a
+token supplied through a protected environment, and use
+LOCALAI_DOCTOR_INSECURE=true only as an explicit temporary diagnostic choice.
+
+Status reads do not prompt. Use status --elevated from a terminal when a
+service manager does not allow the current user to read its state.
+EOF
+}
+
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    --dry-run) dry_run=1; shift ;;
+    start)
+      shift
+      [[ "$#" == 0 ]] || die "start accepts no arguments"
+      start_stack
+      exit $?
+      ;;
+    stop)
+      shift
+      [[ "$#" == 0 ]] || die "stop accepts no arguments"
+      stop_stack
+      exit $?
+      ;;
+    restart)
+      shift
+      [[ "$#" == 0 ]] || die "restart accepts no arguments"
+      stop_stack && start_stack
+      exit $?
+      ;;
+    status)
+      shift
+      while [[ "$#" -gt 0 ]]; do
+        case "$1" in
+          --json) status_json=1 ;;
+          --elevated) status_elevated=1 ;;
+          *) die "status accepts only --json and --elevated" ;;
+        esac
+        shift
+      done
+      status
+      exit $?
+      ;;
+    logs)
+      shift
+      [[ "$#" -le 1 ]] || die "logs accepts at most one component"
+      logs "${1:-all}"
+      exit $?
+      ;;
+    doctor)
+      shift
+      [[ "$#" == 0 ]] || die "doctor accepts no arguments"
+      doctor
+      exit $?
+      ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; die "unknown command '$1'" ;;
+  esac
+done
+usage >&2
+exit 2

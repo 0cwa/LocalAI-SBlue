@@ -1,0 +1,29 @@
+{
+  "default": [
+    {
+      "type": "reject"
+    }
+  ],
+  "transports": {
+    "containers-storage": {
+      "": [
+        {
+          "type": "insecureAcceptAnything"
+        }
+      ]
+    },
+    "docker": {
+      "docker.io/localai/localai": [
+        {
+          "type": "insecureAcceptAnything"
+        }
+      ],
+      "": [
+        {
+          "type": "reject"
+        }
+      ]
+    }
+  }
+}
+

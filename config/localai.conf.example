@@ -1,0 +1,54 @@
+# LocalAI secureblue configuration (strict KEY=VALUE format).
+# Values are data only: do not quote them, use shell syntax, or include '%'.
+# systemd expands % specifiers in generated Environment= settings.
+# Copy to /etc/localai/localai.conf for an installed system; checkouts may use
+# config/localai.conf. No credentials or private keys belong here.
+
+LOCALAI_IMAGE_REF=docker.io/localai/localai:latest-gpu-hipblas
+# LOCALAI_IMAGE_DIGEST=sha256:...
+LOCALAI_CONTAINER_NAME=localai
+LOCALAI_SERVICE_USER=localai
+LOCALAI_STATE_DIR=/var/lib/localai
+LOCALAI_BIND_HOST=127.0.0.1
+LOCALAI_BIND_PORT=11455
+LOCALAI_AUTH=true
+LOCALAI_REGISTRATION_MODE=approval
+LOCALAI_LOG_LEVEL=info
+LOCALAI_MODELS_PATH=/var/lib/localai/models
+LOCALAI_BACKENDS_PATH=/var/lib/localai/backends
+LOCALAI_DOWNLOAD_STAGING_PATH=/var/lib/localai/downloading
+LOCALAI_BACKEND_TEMP_DIR=/var/lib/localai/tmp
+LOCALAI_DATA_PATH=/var/lib/localai/data
+LOCALAI_CONFIG_DIR=/var/lib/localai/config
+LOCALAI_GENERATED_CONTENT_PATH=/var/lib/localai/generated
+LOCALAI_UPLOAD_PATH=/var/lib/localai/uploads
+LOCALAI_CACHE_DIR=/var/lib/localai/cache
+LOCALAI_LOG_DIR=/var/lib/localai/logs
+LOCALAI_F16=true
+
+LOCALAI_TLS_ENABLED=false
+LOCALAI_TLS_USER=localai-tls
+LOCALAI_TLS_STATE_DIR=/var/lib/localai-tls
+# Empty subpaths derive from LOCALAI_TLS_STATE_DIR.
+LOCALAI_TLS_CONFIG_DIR=
+LOCALAI_TLS_CACHE_DIR=
+LOCALAI_TLS_CERT_DIR=
+LOCALAI_TLS_COMPOSE_DIR=
+LOCALAI_TLS_COMPOSE_FILE_NAME=localai-tls-compose.yaml
+LOCALAI_TLS_COMPOSE_PROJECT_NAME=localai-tls
+LOCALAI_TLS_PUBLIC_SOCKET=true
+LOCALAI_TLS_PUBLIC_HOST=
+LOCALAI_TLS_PUBLIC_PORT=443
+LOCALAI_TLS_INTERNAL_HOST=127.0.0.1
+LOCALAI_TLS_INTERNAL_PORT=8443
+LOCALAI_TLS_HOSTNAMES=localai.internal
+LOCALAI_TLS_IMAGE_REF=docker.io/library/caddy:2-alpine
+# LOCALAI_TLS_IMAGE_DIGEST=sha256:...
+LOCALAI_TLS_CONTAINER_NAME=localai-tls
+LOCALAI_TLS_SERVICE_NAME=localai-tls-compose.service
+LOCALAI_TLS_FORWARD_SERVICE_NAME=localai-tls-forward.service
+LOCALAI_TLS_FORWARD_SOCKET_NAME=localai-tls-forward.socket
+
+# Older config files may still contain LOCALAI_WEB_URL and LOCALAI_HTTPS_URL.
+# They remain accepted for compatibility; localaictl derives its endpoint from
+# the current bind and TLS settings instead.
