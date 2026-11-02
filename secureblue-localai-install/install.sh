@@ -359,7 +359,7 @@ snapshot_existing_service_state() {
     case "$state:$status" in
       active:0) existing_service_active=1; return 0 ;;
       inactive:3|failed:3) existing_service_active=0; return 0 ;;
-      activating:3|deactivating:3|reloading:0) sleep 1 ;;
+      activating:3|deactivating:3|reloading:0|refreshing:0) sleep 1 ;;
       *) die "Cannot upgrade while the existing LocalAI service state is unknown." ;;
     esac
   done

@@ -613,6 +613,11 @@ rg -q 'Failed to restore' "$scratch/failed-upgrade-error" || fail "failed restor
       printf 'activating\n'
       return 3
     fi
+    if [[ ! -e "$scratch/refresh-seen" ]]; then
+      : > "$scratch/refresh-seen"
+      printf 'refreshing\n'
+      return 0
+    fi
     printf 'active\n'
   }
   # shellcheck disable=SC2034
