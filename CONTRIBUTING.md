@@ -7,9 +7,10 @@ local certificates to commits or release archives.
 
 ## Before submitting
 
-The checks require Bash, `make`, Python 3, and `ripgrep`. If
-`desktop-file-validate` is installed, the check script uses it; otherwise it
-checks the required desktop-entry keys directly.
+The checks require Bash, `make`, Python 3, and `ripgrep`. `shellcheck` and
+`ruff` run when available; CI uses `shellcheck-py==0.11.0.1` and
+`ruff==0.15.19`. If `desktop-file-validate` is installed, the check script
+uses it; otherwise it checks the required desktop-entry keys directly.
 
 Run the repository checks and package relocation validation:
 

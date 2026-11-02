@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Small, shared guards for privileged LocalAI installer operations.
 
+# The value is consumed by a sourced or dynamically extracted helper.
+# shellcheck disable=SC2034
 LOCALAI_INSTALLER_CONFIG_DEST=/etc/localai/localai.conf
 LOCALAI_INSTALLER_METADATA_DIR=/var/lib/localai-installer
 LOCALAI_INSTALLER_TEMP_FILES=()
@@ -297,7 +299,11 @@ localai_installer_select_config() {
   if [[ "$candidate" == "$destination" ]]; then
     localai_installer_check_root_config_file "$candidate" || return 1
   fi
+  # The value is consumed by a sourced or dynamically extracted helper.
+  # shellcheck disable=SC2034
   LOCALAI_INSTALLER_CONFIG_SOURCE="$candidate"
+  # The value is consumed by a sourced or dynamically extracted helper.
+  # shellcheck disable=SC2034
   LOCALAI_INSTALLER_CONFIG_FORMAT="$format"
 }
 
@@ -458,6 +464,8 @@ localai_installer_persist_environment_overrides() {
       *) target="$key" ;;
     esac
     localai_config_is_key "$target" || continue
+    # This function declares a local indexed array with the same name as an associative array elsewhere.
+    # shellcheck disable=SC2190
     updates+=("$target" "${LOCALAI_CONFIG_ENV_OVERRIDES[$key]}")
   done
   if [[ "${#updates[@]}" -gt 0 ]]; then

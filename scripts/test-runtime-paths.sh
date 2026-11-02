@@ -3,6 +3,8 @@ set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=./test-support.sh
+# The sourced helper is checked independently.
+# shellcheck disable=SC1091
 source "$repo_root/scripts/test-support.sh"
 test_sanitize_localai_environment
 

@@ -5,6 +5,8 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 lock_file="$script_dir/localai.lock"
 
 # shellcheck source=./localai.lock
+# The sourced helper is checked independently.
+# shellcheck disable=SC1091
 source "$lock_file"
 
 image_ref="${LOCALAI_IMAGE_REF_OVERRIDE:-$LOCALAI_IMAGE_REF}"

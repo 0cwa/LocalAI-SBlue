@@ -3,6 +3,8 @@ set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=../lib/config.sh
+# The sourced helper is checked independently.
+# shellcheck disable=SC1091
 source "$repo_root/lib/config.sh"
 TEST_REPO_ROOT="$repo_root"
 source "$repo_root/scripts/test-support.sh"
@@ -40,16 +42,24 @@ if command -v openssl >/dev/null 2>&1; then
 
 # Static certificate paths must be canonical files inside existing Caddy mounts
 # and readable by the TLS service account before Caddyfile installation.
+# The source path is selected or generated at runtime.
+# shellcheck disable=SC1090
 source <(sed -n '/^tls_compose_mount_dirs() {$/,/^}/p' \
   "$repo_root/localai-podman-compose/install.sh")
+# The source path is selected or generated at runtime.
+# shellcheck disable=SC1090
 source <(sed -n '/^localai_tls_preflight_static_paths() {$/,/^}/p' \
   "$repo_root/localai-podman-compose/install.sh")
 tls_state_dir="$tmp_dir/tls-state"
 tls_config_dir="$tls_state_dir/caddy-config"
 tls_storage_dir="$tls_state_dir/caddy-storage"
 tls_cache_dir="$tls_state_dir/cache"
+# The value is consumed by a sourced or dynamically extracted helper.
+# shellcheck disable=SC2034
 tls_certs_dir="$static_cert_dir"
 tls_app_home_dir="$tls_state_dir/app-home"
+# The value is consumed by a sourced or dynamically extracted helper.
+# shellcheck disable=SC2034
 tls_image_ref=docker.io/library/caddy:2-alpine
 run_pull=1
 mkdir -p "$tls_config_dir" "$tls_storage_dir" "$tls_state_dir/data" \
@@ -76,7 +86,11 @@ run_as_tls() {
 }
 localai_tls_preflight_static_paths \
   "$static_cert_dir/fullchain.crt" "$static_cert_dir/legacy-leaf.key"
+# The value is assigned by a dynamically extracted helper.
+# shellcheck disable=SC2154
 [[ "$tls_preflight_fullchain" == "$(/usr/bin/realpath -e "$static_cert_dir/fullchain.crt")" ]]
+# The value is assigned by a dynamically extracted helper.
+# shellcheck disable=SC2154
 [[ "$tls_preflight_leaf_key" == "$(/usr/bin/realpath -e "$static_cert_dir/legacy-leaf.key")" ]]
 [[ "${#readable_check_paths[@]}" == 2 ]]
 [[ "$mock_tls_container_checks" == 1 ]]
@@ -126,6 +140,8 @@ mock_tls_image_available=1
 localai_tls_preflight_static_paths \
   "$static_cert_dir/fullchain.crt" "$static_cert_dir/legacy-leaf.key"
 [[ "$mock_tls_image_checks" == 2 ]]
+# The value is consumed by a sourced or dynamically extracted helper.
+# shellcheck disable=SC2034
 run_pull=1
 
   openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
@@ -178,6 +194,8 @@ run_pull=1
     [[ "$?" == 1 ]]
     [[ "$resolved_key" == "$no_material_dir/localai.key" ]]
   fi
+  # The source path is selected or generated at runtime.
+  # shellcheck disable=SC1090
   source <(sed -n '/^tls_chain_enabled() {$/,/^}/p' \
     "$repo_root/localai-podman-compose/install.sh")
   if tls_chain_enabled auto "$no_material_dir/fullchain.crt" \
@@ -218,9 +236,18 @@ rg -q '^FreeBind=true$' "$repo_root/localai-podman-compose/localai-tls-forward.s
 rg -q '^Restart=on-failure$' "$repo_root/localai-podman-compose/localai-tls-forward.service.in"
 rg -q '^StartLimitBurst=5$' "$repo_root/localai-podman-compose/localai-tls-forward.service.in"
 rg -q 'podman compose' "$repo_root/localai-podman-compose/localai-tls-compose.service.in"
-! rg -q -- '--remove-orphans' "$repo_root/localai-podman-compose/localai-tls-compose.service.in"
-! rg -q '^Restart=' "$repo_root/localai-podman-compose/localai-tls-compose.service.in"
-! rg -q '^RestartSec=' "$repo_root/localai-podman-compose/localai-tls-compose.service.in"
+if rg -q -- '--remove-orphans' "$repo_root/localai-podman-compose/localai-tls-compose.service.in"; then
+  printf 'Unexpected match in negative assertion\n' >&2
+  exit 1
+fi
+if rg -q '^Restart=' "$repo_root/localai-podman-compose/localai-tls-compose.service.in"; then
+  printf 'Unexpected match in negative assertion\n' >&2
+  exit 1
+fi
+if rg -q '^RestartSec=' "$repo_root/localai-podman-compose/localai-tls-compose.service.in"; then
+  printf 'Unexpected match in negative assertion\n' >&2
+  exit 1
+fi
 rg -q 'SERVICE_BIND_HOST=\"\$LOCALAI_BIND_HOST\"' "$repo_root/secureblue-localai-install/install.sh"
 rg -q 'tls_backend_host=.*LOCALAI_BIND_HOST' "$repo_root/localai-podman-compose/install.sh"
 
@@ -247,8 +274,14 @@ for mount_dir in "$config_dir" "$storage_dir" "$data_home" "$config_home" "$cach
   rg -q -F "target: '$mount_dir'" "$rendered"
 done
 [[ "$(rg -c 'type: bind' "$rendered")" == 7 ]]
-! rg -q -F "source: '$state_dir'" "$rendered"
-! rg -q -F "target: '$state_dir'" "$rendered"
+if rg -q -F "source: '$state_dir'" "$rendered"; then
+  printf 'Unexpected match in negative assertion\n' >&2
+  exit 1
+fi
+if rg -q -F "target: '$state_dir'" "$rendered"; then
+  printf 'Unexpected match in negative assertion\n' >&2
+  exit 1
+fi
 rg -q -F "HOME: '$app_home'" "$rendered"
 rg -q -F "XDG_DATA_HOME: '$data_home'" "$rendered"
 rg -q -F "XDG_CONFIG_HOME: '$config_home'" "$rendered"
@@ -277,7 +310,10 @@ localai_tls_render_compose_service_template \
   "$repo_root/localai-podman-compose/localai-tls-compose.service.in" \
   955 "$state_dir" "$compose_file" localai-tls-test >"$rendered_unit"
 rg -q -x -F "ExecStop=/usr/bin/podman compose -p localai-tls-test -f $compose_file down" "$rendered_unit"
-! rg -q -- '--remove-orphans' "$rendered_unit"
+if rg -q -- '--remove-orphans' "$rendered_unit"; then
+  printf 'Unexpected match in negative assertion\n' >&2
+  exit 1
+fi
 
 # Exercise the actual uninstaller function with a captured argv. This is a
 # fixture-only call: no Podman, systemd, or host services are invoked.
@@ -285,9 +321,17 @@ mkdir -p "$tmp_dir/tls-compose"
 touch "$tmp_dir/tls-compose/localai-tls-compose.yaml"
 tls_compose_dir="$tmp_dir/tls-compose"
 tls_compose_file_name=localai-tls-compose.yaml
+# The value is consumed by a sourced or dynamically extracted helper.
+# shellcheck disable=SC2034
 tls_compose_project_name=localai-tls-test
+# The value is consumed by a sourced or dynamically extracted helper.
+# shellcheck disable=SC2034
 tls_container_name=localai-tls
+# The value is consumed by a sourced or dynamically extracted helper.
+# shellcheck disable=SC2034
 tls_uid=955
+# The source path is selected or generated at runtime.
+# shellcheck disable=SC1090
 source <(sed -n '/^remove_container() {$/,/^}/p' "$repo_root/localai-podman-compose/uninstall.sh")
 log() { :; }
 captured_argv=()
