@@ -4,7 +4,11 @@ set -euo pipefail
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-version="${1:-${VERSION:-0.1.0}}"
+version="$(<VERSION)"
+if [[ "$#" -gt 1 || ( "$#" == 1 && "$1" != "$version" ) ]]; then
+  printf "Package version must match VERSION.\n" >&2
+  exit 2
+fi
 if (( ${#version} > 128 )) || ! [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
   printf 'Invalid release version: %q\n' "$version" >&2
   printf 'Use semantic version syntax, for example 0.1.0 or 0.1.0-rc.1.\n' >&2
@@ -28,6 +32,7 @@ checksum_file="$archive.sha256"
 # being discovered under a broad directory.
 manifest=(
   README.md
+  VERSION
   SOURCE_PROVENANCE.md
   LICENSE
   SECURITY.md
@@ -73,6 +78,8 @@ manifest=(
   scripts/check-public-tree.py
   scripts/test-public-tree.sh
   scripts/package-release.sh
+  scripts/release-notes.py
+  scripts/test-release.sh
   scripts/test-support.sh
   scripts/test-config.sh
   scripts/test-locaictl.sh

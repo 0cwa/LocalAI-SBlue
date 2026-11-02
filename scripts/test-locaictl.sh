@@ -99,6 +99,12 @@ export HOME="$tmp_dir/home"
 mkdir -p "$tmp_dir/systemd"
 printf '[Socket]\nFreeBind=true\n' >"$tmp_dir/systemd/localai-tls-forward.socket"
 
+[[ "$("$repo_root/bin/localaictl" --version)" == "localaictl $(<"$repo_root/VERSION")" ]]
+if "$repo_root/bin/localaictl" --version extra >/dev/null 2>&1; then
+  printf 'version accepted an extra argument\n' >&2
+  exit 1
+fi
+
 "$repo_root/bin/localaictl" --dry-run start >"$tmp_dir/dry-run"
 if [[ -s "$tmp_dir/commands" ]]; then
   printf 'Unexpected match in negative assertion\n' >&2
