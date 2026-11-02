@@ -508,12 +508,18 @@ source_production_function() {
   source_production_function "$repo_root/secureblue-localai-install/install.sh" install_project_files
   # Exercise the refusal to touch a project copy owned by another user.
   project_dir="$scratch/foreign-project"
+  # Read by the extracted production function.
+  # shellcheck disable=SC2034
   asset_dir="$scratch/new-assets"
   service_uid=1234567
   mkdir -p "$project_dir"
   printf 'preserve\n' > "$project_dir/sentinel"
+  # These mocks are called by the extracted production function.
+  # shellcheck disable=SC2329
   localai_installer_check_directory_chain() { :; }
+  # shellcheck disable=SC2329
   log() { printf '%s\n' "$*" >> "$scratch/foreign-project-log"; }
+  # shellcheck disable=SC2329
   die() { fail "$*"; }
   install_project_files
   [[ "$(<"$project_dir/sentinel")" == preserve ]] || fail "foreign project copy changed"
@@ -580,9 +586,14 @@ printf 'User unit directory ownership checks\n'
 printf 'Backend install and upgrade state checks\n'
 (
   source_production_function "$repo_root/secureblue-localai-install/install.sh" localai_install_exit
+  # These mocks and the flag are read by the extracted production function.
+  # shellcheck disable=SC2329
   log() { return 1; }
+  # shellcheck disable=SC2329
   localai_installer_cleanup_temps() { :; }
+  # shellcheck disable=SC2329
   run_as_localai() { printf 'restore attempted\n' > "$scratch/failed-upgrade-restore"; return 1; }
+  # shellcheck disable=SC2034
   existing_service_stopped=1
   localai_install_exit 23
 ) 2>"$scratch/failed-upgrade-error" && fail "failed upgrade lost its exit status" || status=$?
