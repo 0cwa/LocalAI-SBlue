@@ -5,6 +5,8 @@ has been runtime-qualified on secureblue or on a GPU.
 
 ## Unreleased
 
+- Consolidate planning on the public roadmap and document evidence, secrets, and data safety.
+
 - Run ShellCheck and Ruff in CI and when installed for local checks.
 
 - Establish the public repository as canonical and check for deployment-specific data.

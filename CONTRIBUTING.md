@@ -49,3 +49,9 @@ user home paths, certificate or key files and PEM material. The generic
 `localai.internal` and `/home/test-user` fixtures are permitted. Review changes
 for secrets and deployment details too: automated checks cannot find every
 sensitive value.
+
+## Planning and evidence
+
+The [roadmap and milestones](https://github.com/0cwa/LocalAI-SBlue/issues/10)
+track planned work. Follow the [evidence and secrets policy](docs/EVIDENCE_AND_SECRETS.md)
+when reporting results, handling credentials, or changing persisted data.
