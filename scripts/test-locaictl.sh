@@ -101,6 +101,8 @@ export HOME="$tmp_dir/home"
 source <(sed -n '/^run_elevated() {$/,/^}/p' "$repo_root/bin/localaictl")
 # shellcheck disable=SC1090
 source <(sed -n '/^run_elevated_pipe() {$/,/^}/p' "$repo_root/bin/localaictl")
+# Consumed by the extracted elevation helpers.
+# shellcheck disable=SC2034
 run0_bin="$tmp_dir/run0"
 # The extracted elevation helpers invoke this stub indirectly.
 # shellcheck disable=SC2329

@@ -69,6 +69,8 @@ service_uid() { "$id_bin" -u "$1"; }
 
 is_effectively_root() { [[ "$EUID" == 0 ]]; }
 
+# Called through the controller's indirectly selected systemctl helpers.
+# shellcheck disable=SC2329
 run_elevated() {
   if is_effectively_root; then
     "$@"
