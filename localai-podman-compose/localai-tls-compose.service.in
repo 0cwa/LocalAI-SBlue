@@ -1,0 +1,18 @@
+[Unit]
+Description=LocalAI TLS reverse proxy compose stack
+Wants=network-online.target
+After=network-online.target default.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=@TLS_STATE_DIR@
+Environment=HOME=@TLS_STATE_DIR@
+Environment=XDG_RUNTIME_DIR=/run/user/@TLS_UID@
+ExecStart=/usr/bin/podman compose -p @TLS_COMPOSE_PROJECT_NAME@ -f @TLS_COMPOSE_FILE@ up -d
+ExecStop=/usr/bin/podman compose -p @TLS_COMPOSE_PROJECT_NAME@ -f @TLS_COMPOSE_FILE@ down
+TimeoutStartSec=120
+TimeoutStopSec=120
+
+[Install]
+WantedBy=default.target

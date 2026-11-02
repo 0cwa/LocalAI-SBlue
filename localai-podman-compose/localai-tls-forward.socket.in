@@ -1,0 +1,11 @@
+[Unit]
+Description=LocalAI HTTPS socket
+Documentation=man:systemd.socket(5)
+
+[Socket]
+ListenStream=@TLS_PUBLIC_HOST@:@TLS_PUBLIC_PORT@
+FreeBind=true
+NoDelay=true
+
+[Install]
+WantedBy=sockets.target

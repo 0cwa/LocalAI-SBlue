@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=LocalAI
+GenericName=Local AI service
+Comment=Start and control the LocalAI service
+Exec=@EXEC@ --start
+TryExec=@EXEC@
+Icon=localai
+Terminal=false
+Categories=Development;
+Keywords=AI;LocalAI;Models;LLM;
+StartupNotify=true

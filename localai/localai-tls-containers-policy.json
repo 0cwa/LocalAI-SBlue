@@ -1,0 +1,28 @@
+{
+  "default": [
+    {
+      "type": "reject"
+    }
+  ],
+  "transports": {
+    "containers-storage": {
+      "": [
+        {
+          "type": "insecureAcceptAnything"
+        }
+      ]
+    },
+    "docker": {
+      "docker.io/library/caddy": [
+        {
+          "type": "insecureAcceptAnything"
+        }
+      ],
+      "": [
+        {
+          "type": "reject"
+        }
+      ]
+    }
+  }
+}
