@@ -10,7 +10,7 @@ cp "$root/scripts/check-public-tree.py" "$work/scripts/"
 check() { (cd "$work" && python3 scripts/check-public-tree.py >/dev/null 2>&1); }
 printf '%s\n' 'safe example' > "$work/example"
 check
-for value in '10.'"1.2.3" '172.'"16.1.1" '192.'"168.1.1" '169.'"254.1.1" 'machine.'"internal" '/home/'"alice/data" '/var/home/'"alice/data" '-----BEGIN '"CERTIFICATE-----"; do
+for value in '10.'"1.2.3" '172.'"16.1.1" '192.'"168.1.1" '169.'"254.1.1" 'fd'"00::1" 'fe'"80::1" 'machine.'"internal" '/home/'"alice/data" '/var/home/'"alice/data" '-----BEGIN '"CERTIFICATE-----"; do
   printf '%s\n' "$value" > "$work/example"
   if check; then printf 'Accepted forbidden fixture\n' >&2; exit 1; fi
 done

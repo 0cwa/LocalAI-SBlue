@@ -43,7 +43,7 @@ issues and releases connected to the same history. The old private checkout
 is an archive, not a development source. Keep its deployment records and PKI
 material outside this repository.
 
-The public-tree check rejects private IPv4 addresses, internal hostnames,
+The public-tree check rejects private IPv4 and IPv6 addresses, internal hostnames,
 user home paths, certificate or key files and PEM material. The generic
 `localai.internal` and `/home/test-user` fixtures are permitted. Review changes
 for secrets and deployment details too: automated checks cannot find every
