@@ -573,6 +573,16 @@ printf 'User unit directory ownership checks\n'
 
 printf 'Backend install and upgrade state checks\n'
 (
+  source_production_function "$repo_root/secureblue-localai-install/install.sh" localai_install_exit
+  log() { return 1; }
+  localai_installer_cleanup_temps() { :; }
+  run_as_localai() { printf 'restore attempted\n' > "$scratch/failed-upgrade-restore"; return 1; }
+  existing_service_stopped=1
+  localai_install_exit 23
+) 2>"$scratch/failed-upgrade-error" && fail "failed upgrade lost its exit status" || status=$?
+[[ "$status" == 23 && -f "$scratch/failed-upgrade-restore" ]] || fail "failed upgrade did not attempt restoration"
+rg -q 'Failed to restore' "$scratch/failed-upgrade-error" || fail "failed restoration was not reported"
+(
   source_production_function "$repo_root/secureblue-localai-install/install.sh" snapshot_existing_service_state
   source_production_function "$repo_root/secureblue-localai-install/install.sh" stop_existing_managed_service
   source_production_function "$repo_root/secureblue-localai-install/install.sh" restore_existing_service

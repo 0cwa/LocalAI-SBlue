@@ -13,11 +13,23 @@ safety_lib="${LOCALAI_INSTALLER_SAFETY_LIB:-$repo_root/lib/installer_safety.sh}"
 # The source path is selected or generated at runtime.
 # shellcheck disable=SC1090
 source "$safety_lib"
+localai_install_exit() {
+  local status="$1"
+  trap - EXIT
+  if [[ "$status" != 0 && "${existing_service_stopped:-0}" == 1 ]]; then
+    log "Upgrade failed; attempting to restore the previously running localai.service" || :
+    if ! run_as_localai /usr/bin/systemctl --user start localai.service; then
+      printf 'Failed to restore the previously running localai.service; inspect its user service state.\n' >&2 || :
+    fi
+  fi
+  localai_installer_cleanup_temps || :
+  exit "$status"
+}
 canonical_config="$LOCALAI_INSTALLER_CONFIG_DEST"
 requested_config="${LOCALAI_CONFIG_FILE:-}"
 original_args=("$@")
 LOCALAI_INSTALLER_VALIDATED_CONTAINER_IDS=()
-trap localai_installer_cleanup_temps EXIT
+trap 'localai_install_exit "$?"' EXIT
 
 service_user="${LOCALAI_SERVICE_USER:-localai}"
 state_dir="${LOCALAI_STATE_DIR:-/var/lib/localai}"
@@ -32,6 +44,7 @@ enable_container_userns=0
 service_user_created=0
 existing_service_unit=0
 existing_service_active=0
+existing_service_stopped=0
 
 usage() {
   cat <<'EOF'
@@ -351,6 +364,7 @@ snapshot_existing_service_state() {
 stop_existing_managed_service() {
   [[ "$existing_service_unit" == 1 && "$existing_service_active" == 1 && "$install_service" == 1 && "$start_service" == 1 ]] || return 0
   log "Stopping the checked existing LocalAI service for upgrade"
+  existing_service_stopped=1
   run_as_localai /usr/bin/systemctl --user stop localai.service
 }
 
@@ -575,6 +589,7 @@ restore_existing_service() {
   if [[ "$existing_service_active" == 1 && "$start_service" == 1 ]]; then
     log "Restoring the previously running localai.service"
     run_as_localai /usr/bin/systemctl --user start localai.service
+    existing_service_stopped=0
   else
     log "Service installed without starting it; existing boot enablement is unchanged."
   fi
