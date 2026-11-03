@@ -13,11 +13,23 @@ safety_lib="${LOCALAI_INSTALLER_SAFETY_LIB:-$repo_root/lib/installer_safety.sh}"
 # The source path is selected or generated at runtime.
 # shellcheck disable=SC1090
 source "$safety_lib"
+localai_install_exit() {
+  local status="$1"
+  trap - EXIT
+  if [[ "$status" != 0 && "${existing_service_stopped:-0}" == 1 ]]; then
+    log "Upgrade failed; attempting to restore the previously running localai.service" || :
+    if ! run_as_localai /usr/bin/systemctl --user start localai.service; then
+      printf 'Failed to restore the previously running localai.service; inspect its user service state.\n' >&2 || :
+    fi
+  fi
+  localai_installer_cleanup_temps || :
+  exit "$status"
+}
 canonical_config="$LOCALAI_INSTALLER_CONFIG_DEST"
 requested_config="${LOCALAI_CONFIG_FILE:-}"
 original_args=("$@")
 LOCALAI_INSTALLER_VALIDATED_CONTAINER_IDS=()
-trap localai_installer_cleanup_temps EXIT
+trap 'localai_install_exit "$?"' EXIT
 
 service_user="${LOCALAI_SERVICE_USER:-localai}"
 state_dir="${LOCALAI_STATE_DIR:-/var/lib/localai}"
@@ -31,6 +43,8 @@ assume_yes=0
 enable_container_userns=0
 service_user_created=0
 existing_service_unit=0
+existing_service_active=0
+existing_service_stopped=0
 
 usage() {
   cat <<'EOF'
@@ -336,15 +350,31 @@ preflight_existing_backend_state() {
     "$(localai_backends_path)" "$service_uid" "$state_dir" "${container_names[@]}" || die "LocalAI backend state is not safe to stop or replace."
 }
 
+snapshot_existing_service_state() {
+  local status state attempt
+  [[ "$existing_service_unit" == 1 && "$install_service" == 1 ]] || return 0
+  for ((attempt=0; attempt<30; attempt++)); do
+    status=0
+    state="$(run_as_localai /usr/bin/systemctl --user is-active localai.service)" || status=$?
+    case "$state:$status" in
+      active:0) existing_service_active=1; return 0 ;;
+      inactive:3|failed:3) existing_service_active=0; return 0 ;;
+      activating:3|deactivating:3|reloading:0|refreshing:0) sleep 1 ;;
+      *) die "Cannot upgrade while the existing LocalAI service state is unknown." ;;
+    esac
+  done
+  die "Cannot upgrade while the existing LocalAI service state keeps changing."
+}
+
 stop_existing_managed_service() {
-  [[ "$existing_service_unit" == 1 ]] || return 0
-  log "Stopping the checked existing LocalAI service before Podman migration"
-  run_as_localai /usr/bin/systemctl --user daemon-reload
+  [[ "$existing_service_unit" == 1 && "$existing_service_active" == 1 && "$install_service" == 1 && "$start_service" == 1 ]] || return 0
+  log "Stopping the checked existing LocalAI service for upgrade"
+  existing_service_stopped=1
   run_as_localai /usr/bin/systemctl --user stop localai.service
 }
 
 remove_preflighted_existing_container() {
-  [[ "$install_service" == 1 && "$start_service" == 1 ]] || return 0
+  [[ "$existing_service_active" == 1 && "$install_service" == 1 && "$start_service" == 1 ]] || return 0
   local container_id
   for container_id in "${LOCALAI_INSTALLER_VALIDATED_CONTAINER_IDS[@]}"; do
     log "Removing preflight-checked LocalAI container $container_id if it remains after service stop"
@@ -417,12 +447,31 @@ ensure_gpu_groups() {
 }
 
 install_project_files() {
-  local asset_real project_real
+  local asset_real project_real legacy_assets=0 project_owner
   log "Installing LocalAI project files to $project_dir"
   asset_real="$(readlink -f "$asset_dir")"
   project_real="$(readlink -f "$project_dir" 2>/dev/null || true)"
 
-  localai_installer_ensure_service_directory "$project_dir" "LOCALAI_PROJECT_DIR" "$service_user" "$service_user" "$service_uid" 0750 || die "Unsafe LocalAI project path."
+  localai_installer_check_directory_chain "${project_dir%/*}" "LOCALAI_PROJECT_DIR parent" "$service_uid" || die "Unsafe LocalAI project parent."
+  [[ ! -L "$project_dir" ]] || die "Unsafe LocalAI project path."
+  if [[ -d "$project_dir" ]]; then
+    project_owner="$(/usr/bin/stat -c '%u' -- "$project_dir")" || die "Cannot inspect LocalAI project path."
+    if [[ "$project_owner" != 0 && "$project_owner" != "$service_uid" ]]; then
+      log "Warning: leaving the existing project asset copy untouched because it has a different owner; installation uses the supplied asset bundle."
+      return 0
+    fi
+  fi
+  localai_installer_check_directory_chain "$project_dir" "LOCALAI_PROJECT_DIR" "$service_uid" || die "Unsafe LocalAI project path."
+  if [[ -d "$project_dir" && ! -L "$project_dir" ]]; then
+    project_owner="$(/usr/bin/stat -c '%u' -- "$project_dir")" || die "Cannot inspect LocalAI project path."
+    if [[ "$project_owner" == 0 && "$service_uid" != 0 ]] && [[ -n "$(/usr/bin/find -P "$project_dir" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+      localai_installer_check_legacy_assets "$project_dir" "$asset_dir" 0 || die "Refusing unknown contents in root-owned LocalAI project path."
+      legacy_assets=1
+    fi
+  fi
+  if [[ "$legacy_assets" == 0 ]]; then
+    localai_installer_ensure_service_directory "$project_dir" "LOCALAI_PROJECT_DIR" "$service_user" "$service_user" "$service_uid" 0750 || die "Unsafe LocalAI project path."
+  fi
   project_real="$(readlink -f "$project_dir")"
 
   if [[ "$asset_real" == "$project_real" ]]; then
@@ -431,7 +480,7 @@ install_project_files() {
     if [[ -n "$(/usr/bin/find -P "$project_dir" -mindepth 1 -type l -print -quit 2>/dev/null)" ]]; then
       die "Refusing to update project tree with symbolic links: $project_dir"
     fi
-    run0_pipe /usr/bin/cp -a "$asset_dir/." "$project_dir/"
+    localai_installer_copy_project_assets "$asset_dir" "$project_dir" || die "Could not update LocalAI project assets."
   fi
 
   if [[ -x /usr/sbin/restorecon ]]; then
@@ -465,6 +514,11 @@ label_container_state() {
   else
     log "SELinux is not enabled; skipping container volume relabel."
   fi
+}
+
+preflight_user_systemd_parent() {
+  [[ "$install_service" == 1 ]] || return 0
+  localai_installer_check_user_systemd_parent "$state_dir/.config/systemd" "LocalAI systemd configuration directory" "$service_uid" || die "Unsafe LocalAI systemd configuration directory."
 }
 
 ensure_user_manager() {
@@ -531,6 +585,16 @@ pull_image() {
   run_localai_unit /usr/bin/podman pull "$image_ref"
 }
 
+restore_existing_service() {
+  if [[ "$existing_service_active" == 1 && "$start_service" == 1 ]]; then
+    log "Restoring the previously running localai.service"
+    run_as_localai /usr/bin/systemctl --user start localai.service
+    existing_service_stopped=0
+  else
+    log "Service installed without starting it; existing boot enablement is unchanged."
+  fi
+}
+
 install_systemd_service() {
   local tmp_service image_ref bind_host bind_port user_unit_dir
   local container_name models_path data_path config_dir generated_content_path upload_path cache_dir log_dir
@@ -594,6 +658,7 @@ install_systemd_service() {
     -e "s|@GPU_DEVICE_ARGS@|$gpu_device_args|g" \
     "$script_dir/localai.service.in" >>"$tmp_service"
 
+  localai_installer_ensure_user_systemd_parent "$state_dir/.config/systemd" "LocalAI systemd configuration directory" "$service_user" "$service_user" "$service_uid" || die "Unsafe LocalAI systemd configuration directory."
   localai_installer_ensure_service_directory "$user_unit_dir" "LocalAI user-unit directory" "$service_user" "$service_user" "$service_uid" 0700 || die "Unsafe LocalAI user-unit directory."
   if [[ -e "$user_unit_dir/localai.service" || -L "$user_unit_dir/localai.service" ]]; then
     [[ ! -L "$user_unit_dir/localai.service" && -f "$user_unit_dir/localai.service" ]] || die "Refusing to replace a non-regular LocalAI service unit."
@@ -603,12 +668,7 @@ install_systemd_service() {
   rm -f "$tmp_service"
   run_as_localai /usr/bin/systemctl --user daemon-reload
 
-  if [[ "$start_service" == "1" ]]; then
-    log "Enabling and starting localai.service in the $service_user user manager"
-    run_as_localai /usr/bin/systemctl --user enable --now localai.service
-  else
-    log "Service installed but not started (--no-start)."
-  fi
+  restore_existing_service
 }
 
 while [[ "$#" -gt 0 ]]; do
@@ -697,7 +757,9 @@ install_project_files
 install_container_policy
 label_container_state
 preflight_existing_backend_state
+preflight_user_systemd_parent
 ensure_user_manager
+snapshot_existing_service_state
 stop_existing_managed_service
 remove_preflighted_existing_container
 ensure_container_userns

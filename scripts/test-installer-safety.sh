@@ -85,6 +85,36 @@ expect_reject() {
   if "$@" >/dev/null 2>&1; then fail "expected rejection: $description"; fi
 }
 
+# This only examines /etc metadata; no host state is created or modified.
+localai_installer_check_config_parent /etc/localai/localai.conf || fail "canonical config parent was rejected"
+expect_reject noncanonical-config-parent localai_installer_check_config_parent /etc/unrelated/localai.conf
+expect_reject service-data-under-etc localai_installer_validate_managed_path /etc/localai state
+(
+  LOCALAI_INSTALLER_TEMP_FILES=()
+  localai_installer_cleanup_temps
+) || fail "empty temporary-file cleanup returned failure"
+bash -c 'set -e; source "$1/lib/installer_safety.sh"; LOCALAI_INSTALLER_TEMP_FILES=(); trap localai_installer_cleanup_temps EXIT; exit 0' _ "$repo_root" || fail "empty cleanup changed successful EXIT status"
+
+mkdir -p "$scratch/old-assets" "$scratch/new-assets"
+printf 'old\n' > "$scratch/old-assets/localai.lock"
+printf 'new\n' > "$scratch/new-assets/localai.lock"
+localai_installer_check_legacy_assets "$scratch/old-assets" "$scratch/new-assets" "$(id -u)" || fail "known legacy assets rejected"
+printf 'unknown\n' > "$scratch/old-assets/unknown"
+expect_reject unknown-legacy-asset localai_installer_check_legacy_assets "$scratch/old-assets" "$scratch/new-assets" "$(id -u)"
+rm "$scratch/old-assets/unknown"
+chmod 0666 "$scratch/old-assets/localai.lock"
+expect_reject writable-legacy-asset localai_installer_check_legacy_assets "$scratch/old-assets" "$scratch/new-assets" "$(id -u)"
+chmod 0644 "$scratch/old-assets/localai.lock"
+rm "$scratch/old-assets/localai.lock"
+ln -s "$scratch/new-assets/localai.lock" "$scratch/old-assets/localai.lock"
+expect_reject linked-legacy-asset localai_installer_check_legacy_assets "$scratch/old-assets" "$scratch/new-assets" "$(id -u)"
+mkdir -p "$scratch/copy-source" "$scratch/copy-destination"
+printf 'asset\n' > "$scratch/copy-source/tool"
+chmod 0755 "$scratch/copy-source/tool" "$scratch/copy-source"
+chmod 0700 "$scratch/copy-destination"
+localai_installer_copy_project_assets "$scratch/copy-source" "$scratch/copy-destination" || fail "asset copy failed"
+[[ "$(stat -c '%a' "$scratch/copy-destination")" == 700 && -x "$scratch/copy-destination/tool" ]] || fail "asset copy changed destination mode or lost executable mode"
+
 expect_reject_with_message() {
   local description="$1" expected_message="$2" output
   shift 2
@@ -144,13 +174,49 @@ before_mode="$(/usr/bin/stat -c '%a' -- "$scratch/no-op-on-failure")"
   [[ "$(/usr/bin/stat -c '%a' -- "$scratch/no-op-on-failure")" == "$before_mode" ]]
 ) || fail "service-directory helper changed ownership or mode after path rejection"
 
+printf 'Legacy user-unit parent migration checks\n'
+(
+  legacy_parent="$scratch/legacy-systemd"
+  mkdir -p "$legacy_parent/user"
+  chmod 0750 "$legacy_parent"
+  chmod 0700 "$legacy_parent/user"
+  printf 'managed unit\n' >"$legacy_parent/user/localai.service"
+  test_uid="$(id -u)" test_user="$(id -un)" test_group="$(id -gn)"
+  # The fixture is in task scratch; only this exact synthetic path is allowed.
+  # shellcheck disable=SC2329
+  localai_installer_validate_managed_path() {
+    [[ "$1" == "$legacy_parent" || "$1" == "$legacy_parent/user" ]]
+  }
+  # Simulate the legacy root owner while retaining a user-owned scratch fixture.
+  # shellcheck disable=SC2329
+  localai_installer_systemd_stat() {
+    if [[ "$1" == -c && "$2" == %u && "$4" == "$legacy_parent" ]]; then
+      printf '0\n'
+    else
+      /usr/bin/stat "$@"
+    fi
+  }
+  localai_installer_check_user_systemd_parent "$legacy_parent" legacy "$test_uid"
+  localai_installer_ensure_user_systemd_parent "$legacy_parent" legacy "$test_user" "$test_group" "$test_uid"
+  [[ "$(stat -c %a "$legacy_parent")" == 751 ]]
+  [[ "$(<"$legacy_parent/user/localai.service")" == 'managed unit' ]]
+  chmod 0750 "$legacy_parent"
+  : >"$legacy_parent/unknown"
+  expect_reject unknown-legacy-entry localai_installer_check_user_systemd_parent "$legacy_parent" legacy "$test_uid"
+  [[ "$(stat -c %a "$legacy_parent")" == 750 ]]
+  rm "$legacy_parent/unknown"
+  chmod 0755 "$legacy_parent/user"
+  expect_reject public-legacy-user-dir localai_installer_check_user_systemd_parent "$legacy_parent" legacy "$test_uid"
+  [[ "$(stat -c %a "$legacy_parent")" == 750 ]]
+)
+
 printf 'Installer lifecycle guard ordering checks\n'
 assert_call_order "$repo_root/secureblue-localai-install/install.sh" \
-  preflight_existing_backend_state ensure_user_manager stop_existing_managed_service
+  preflight_existing_backend_state preflight_user_systemd_parent stop_existing_managed_service
 assert_call_order "$repo_root/secureblue-localai-install/install.sh" \
   stop_existing_managed_service remove_preflighted_existing_container ensure_container_userns
 assert_call_order "$repo_root/localai-podman-compose/install.sh" \
-  preflight_localai_backend_state ensure_user_manager stop_existing_localai_service
+  preflight_localai_backend_state ensure_user_manager ensure_container_userns
 assert_call_order "$repo_root/localai-podman-compose/install.sh" \
   pull_image label_container_state write_caddyfile
 assert_call_order "$repo_root/localai-podman-compose/install.sh" \
@@ -443,6 +509,216 @@ source_production_function() {
   source <(/usr/bin/sed -n "/^${function_name}() {$/,/^}/p" "$source_file")
 }
 
+(
+  source_production_function "$repo_root/secureblue-localai-install/install.sh" install_project_files
+  # Exercise the refusal to touch a project copy owned by another user.
+  project_dir="$scratch/foreign-project"
+  # Read by the extracted production function.
+  # shellcheck disable=SC2034
+  asset_dir="$scratch/new-assets"
+  service_uid=1234567
+  mkdir -p "$project_dir"
+  printf 'preserve\n' > "$project_dir/sentinel"
+  # These mocks are called by the extracted production function.
+  # shellcheck disable=SC2329
+  localai_installer_check_directory_chain() { :; }
+  # shellcheck disable=SC2329
+  log() { printf '%s\n' "$*" >> "$scratch/foreign-project-log"; }
+  # shellcheck disable=SC2329
+  die() { fail "$*"; }
+  install_project_files
+  [[ "$(<"$project_dir/sentinel")" == preserve ]] || fail "foreign project copy changed"
+  rg -q 'leaving the existing project asset copy untouched' "$scratch/foreign-project-log" || fail "foreign project copy warning missing"
+)
+
+printf 'User unit directory ownership checks\n'
+(
+  source_production_function "$repo_root/secureblue-localai-install/install.sh" install_systemd_service
+  source_production_function "$repo_root/localai-podman-compose/install.sh" write_compose_service
+  # These stubs keep generated files in scratch and record service-owned directories.
+  # shellcheck disable=SC2329
+  localai_installer_mktemp_var() { printf -v "$1" '%s' "$scratch/generated-unit"; }
+  # shellcheck disable=SC2329
+  localai_installer_ensure_service_directory() { printf '%s %s %s %s\n' "$1" "$3" "$4" "$6" >>"$scratch/unit-directories"; }
+  # shellcheck disable=SC2329
+  localai_installer_ensure_user_systemd_parent() { printf '%s %s %s 0700\n' "$1" "$3" "$4" >>"$scratch/unit-directories"; }
+  # shellcheck disable=SC2329
+  localai_installer_check_managed_file() { :; }
+  # shellcheck disable=SC2329
+  localai_tls_render_compose_service_template() { printf '[Service]\n'; }
+  # shellcheck disable=SC2329
+  run0_pipe() { :; }
+  # shellcheck disable=SC2329
+  run_as_localai() { :; }
+  # shellcheck disable=SC2329
+  run_as_tls() { :; }
+  # shellcheck disable=SC2329
+  restore_existing_service() { :; }
+  # shellcheck disable=SC2329
+  log() { :; }
+  # shellcheck disable=SC2329
+  die() { exit 1; }
+  # shellcheck disable=SC2329
+  localai_image_ref() { printf 'example.invalid/image:cpu\n'; }
+  for name in models app_home backends download_staging backend_temp data config generated_content upload cache log; do
+    eval "localai_${name}_path() { printf '%s\\n' '$scratch/data'; }"
+  done
+  # The installer calls these two helpers with different names.
+  # shellcheck disable=SC2329
+  localai_config_dir() { localai_config_path; }
+  # shellcheck disable=SC2329
+  localai_backend_temp_dir() { localai_backend_temp_path; }
+  # shellcheck disable=SC2329
+  localai_cache_dir() { localai_cache_path; }
+  # shellcheck disable=SC2329
+  localai_log_dir() { localai_log_path; }
+  state_dir="$scratch/backend" service_user=test-service service_uid=12345
+  # The extracted installer reads this directory indirectly.
+  # shellcheck disable=SC2034
+  script_dir="$repo_root/secureblue-localai-install"
+  : >"$scratch/unit-directories"
+  install_systemd_service
+  [[ "$(<"$scratch/unit-directories")" == $"$scratch/backend/.config/systemd test-service test-service 0700"$'\n'$"$scratch/backend/.config/systemd/user test-service test-service 0700" ]]
+  install_service=1 tls_state_dir="$scratch/tls" tls_user=test-tls tls_uid=12346
+  # The extracted TLS installer reads these values indirectly.
+  # shellcheck disable=SC2034
+  tls_compose_dir="$scratch/compose" tls_compose_file_name=compose.yaml tls_service_name=tls.service tls_project_name=test
+  : >"$scratch/unit-directories"
+  write_compose_service
+  [[ "$(<"$scratch/unit-directories")" == $"$scratch/tls/.config/systemd test-tls test-tls 0700"$'\n'$"$scratch/tls/.config/systemd/user test-tls test-tls 0700" ]]
+) || fail "generated user units lack service-owned parent directories"
+
+printf 'Backend install and upgrade state checks\n'
+(
+  source_production_function "$repo_root/secureblue-localai-install/install.sh" localai_install_exit
+  # These mocks and the flag are read by the extracted production function.
+  # shellcheck disable=SC2329
+  log() { return 1; }
+  # shellcheck disable=SC2329
+  localai_installer_cleanup_temps() { :; }
+  # shellcheck disable=SC2329
+  run_as_localai() { printf 'restore attempted\n' > "$scratch/failed-upgrade-restore"; return 1; }
+  # shellcheck disable=SC2034
+  existing_service_stopped=1
+  localai_install_exit 23
+) 2>"$scratch/failed-upgrade-error" && fail "failed upgrade lost its exit status" || status=$?
+[[ "$status" == 23 && -f "$scratch/failed-upgrade-restore" ]] || fail "failed upgrade did not attempt restoration"
+rg -q 'Failed to restore' "$scratch/failed-upgrade-error" || fail "failed restoration was not reported"
+(
+  source_production_function "$repo_root/secureblue-localai-install/install.sh" snapshot_existing_service_state
+  # These mocks and settings are used by the extracted function.
+  # shellcheck disable=SC2329
+  sleep() { :; }
+  # shellcheck disable=SC2329
+  die() { return 1; }
+  # shellcheck disable=SC2329
+  run_as_localai() {
+    if [[ ! -e "$scratch/transition-seen" ]]; then
+      : > "$scratch/transition-seen"
+      printf 'activating\n'
+      return 3
+    fi
+    if [[ ! -e "$scratch/refresh-seen" ]]; then
+      : > "$scratch/refresh-seen"
+      printf 'refreshing\n'
+      return 0
+    fi
+    printf 'active\n'
+  }
+  # shellcheck disable=SC2034
+  existing_service_unit=1 install_service=1 existing_service_active=0
+  snapshot_existing_service_state
+  [[ "$existing_service_active" == 1 ]] || fail "transitional service did not settle to active"
+)
+(
+  source_production_function "$repo_root/secureblue-localai-install/install.sh" snapshot_existing_service_state
+  source_production_function "$repo_root/secureblue-localai-install/install.sh" stop_existing_managed_service
+  source_production_function "$repo_root/secureblue-localai-install/install.sh" restore_existing_service
+  # The functions below are called by the production helpers.
+  # shellcheck disable=SC2329
+  log() { :; }
+  # shellcheck disable=SC2329
+  die() { return 1; }
+  # shellcheck disable=SC2329
+  run_as_localai() {
+    case "${*:3}" in
+      'is-active localai.service') printf '%s\n' "$mock_active"; [[ "$mock_active" == active ]] && return 0; return 3 ;;
+      'stop localai.service'|'start localai.service') printf '%s\n' "${*:3}" >>"$scratch/state-calls" ;;
+      *) return 1 ;;
+    esac
+  }
+  install_service=1 start_service=1 existing_service_unit=1
+  for mock_enabled in enabled disabled; do
+    for mock_active in active inactive; do
+      : >"$scratch/state-calls"
+      existing_service_active=0
+      snapshot_existing_service_state
+      stop_existing_managed_service
+      restore_existing_service
+      if [[ "$mock_active" == active ]]; then
+        [[ "$(<"$scratch/state-calls")" == $'stop localai.service\nstart localai.service' ]]
+      else
+        [[ ! -s "$scratch/state-calls" ]]
+      fi
+      [[ "$mock_enabled" == enabled || "$mock_enabled" == disabled ]]
+    done
+  done
+  existing_service_unit=0 existing_service_active=0
+  : >"$scratch/state-calls"
+  snapshot_existing_service_state
+  stop_existing_managed_service
+  restore_existing_service
+  [[ ! -s "$scratch/state-calls" ]]
+  existing_service_unit=1 mock_active=activating
+  if snapshot_existing_service_state; then exit 1; fi
+) || fail "backend fresh or upgrade state changed unexpectedly"
+
+printf 'TLS install and upgrade state checks\n'
+(
+  source_production_function "$repo_root/localai-podman-compose/install.sh" localai_service_lifecycle_requested
+  source_production_function "$repo_root/localai-podman-compose/install.sh" guard_tls_manager_start
+  source_production_function "$repo_root/localai-podman-compose/install.sh" preserve_linked_service_states
+  # These functions are called by the production helpers.
+  # shellcheck disable=SC2329
+  log() { :; }
+  # shellcheck disable=SC2329
+  die() { exit 1; }
+  # shellcheck disable=SC2329
+  run_as_tls() { exit 1; }
+  # shellcheck disable=SC2329
+  run_as_localai() { exit 1; }
+  # shellcheck disable=SC2329
+  run0_pipe() { exit 1; }
+  # shellcheck disable=SC2329
+  localai_installer_user_manager_is_active() { return "$manager_status"; }
+  install_service=1 start_service=1 rebind_localai_loopback=0
+  if localai_service_lifecycle_requested; then exit 1; fi
+  # The production helper consumes this value indirectly.
+  # shellcheck disable=SC2034
+  rebind_localai_loopback=1
+  localai_service_lifecycle_requested
+  for enabled in enabled disabled; do
+    for running in active inactive; do
+      preserve_linked_service_states
+      [[ "$enabled" == enabled || "$enabled" == disabled ]]
+      [[ "$running" == active || "$running" == inactive ]]
+    done
+  done
+  tls_state_dir="$scratch/tls-state" tls_service_name=localai-tls-compose.service legacy_tls_service_name=localai-tls.service tls_uid=955
+  mkdir -p "$tls_state_dir/.config/systemd/user"
+  manager_status=3
+  guard_tls_manager_start
+  : >"$tls_state_dir/.config/systemd/user/$tls_service_name"
+  if (guard_tls_manager_start); then exit 1; fi
+  rm "$tls_state_dir/.config/systemd/user/$tls_service_name"
+  : >"$tls_state_dir/.config/systemd/user/$legacy_tls_service_name"
+  if (guard_tls_manager_start); then exit 1; fi
+  manager_status=0
+  guard_tls_manager_start
+  manager_status=1
+  if (guard_tls_manager_start); then exit 1; fi
+) || fail "TLS fresh or upgrade state changed unexpectedly"
+
 TEST_CONTAINER_STATE_DIR="$synthetic_state_root"
 TEST_CONTAINER_BACKENDS="$synthetic_state_root/backends"
 TEST_CONTAINER_ID="$synthetic_container_id"
@@ -500,6 +776,9 @@ run_install_preflight_sequence() {
     # The value is consumed by a sourced or dynamically extracted helper.
     # shellcheck disable=SC2034
     existing_service_unit=0
+    # Simulate a running managed service after the ownership preflight.
+    # shellcheck disable=SC2034
+    existing_service_active=1
     # The value is consumed by a sourced or dynamically extracted helper.
     # shellcheck disable=SC2034
     install_service=1

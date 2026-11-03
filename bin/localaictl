@@ -67,6 +67,26 @@ tls_enabled() {
 
 service_uid() { "$id_bin" -u "$1"; }
 
+is_effectively_root() { [[ "$EUID" == 0 ]]; }
+
+# Called through the controller's indirectly selected systemctl helpers.
+# shellcheck disable=SC2329
+run_elevated() {
+  if is_effectively_root; then
+    "$@"
+  else
+    "$run0_bin" -i "$@"
+  fi
+}
+
+run_elevated_pipe() {
+  if is_effectively_root; then
+    "$@"
+  else
+    "$run0_bin" -i --pipe "$@"
+  fi
+}
+
 # The function is called indirectly by a helper or test.
 # shellcheck disable=SC2329
 user_manager_systemctl() {
@@ -80,7 +100,7 @@ user_manager_systemctl() {
     # Elevate as the desktop user to root, then select the service manager
     # explicitly. The service accounts have nologin shells and are never
     # selected as run0's login-shell user.
-    "$run0_bin" -i "$systemctl_bin" --no-ask-password --user --machine="${service_user}@.host" "$@"
+    run_elevated "$systemctl_bin" --no-ask-password --user --machine="${service_user}@.host" "$@"
   fi
 }
 
@@ -97,7 +117,7 @@ root_systemctl() {
   if [[ "${1:-}" == is-active && "$status_elevated" != 1 ]]; then
     "$systemctl_bin" --no-ask-password "$@"
   else
-    "$run0_bin" -i "$systemctl_bin" --no-ask-password "$@"
+    run_elevated "$systemctl_bin" --no-ask-password "$@"
   fi
 }
 
@@ -267,7 +287,7 @@ service_logs() {
   # These system accounts write to the system journal. Filter trusted
   # user-unit metadata by both unit and owner UID; --pipe preserves the log
   # stream while run0 elevates through the caller's login shell.
-  "$run0_bin" -i --pipe "$journalctl_bin" --system -n "$count" --no-pager \
+  run_elevated_pipe "$journalctl_bin" --system -n "$count" --no-pager \
     "_SYSTEMD_USER_UNIT=$user_unit" "_SYSTEMD_OWNER_UID=$uid"
 }
 
