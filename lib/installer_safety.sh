@@ -343,8 +343,11 @@ localai_installer_mktemp_at_var() {
 localai_installer_cleanup_temps() {
   local path
   for path in "${LOCALAI_INSTALLER_TEMP_FILES[@]-}"; do
-    [[ -n "$path" ]] && /usr/bin/rm -f -- "$path"
+    if [[ -n "$path" ]] && ! /usr/bin/rm -f -- "$path"; then
+      printf 'Warning: could not remove an installer temporary file.\n' >&2 || :
+    fi
   done
+  return 0
 }
 
 localai_installer_select_config() {

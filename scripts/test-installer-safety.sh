@@ -89,6 +89,11 @@ expect_reject() {
 localai_installer_check_config_parent /etc/localai/localai.conf || fail "canonical config parent was rejected"
 expect_reject noncanonical-config-parent localai_installer_check_config_parent /etc/unrelated/localai.conf
 expect_reject service-data-under-etc localai_installer_validate_managed_path /etc/localai state
+(
+  LOCALAI_INSTALLER_TEMP_FILES=()
+  localai_installer_cleanup_temps
+) || fail "empty temporary-file cleanup returned failure"
+bash -c 'set -e; source "$1/lib/installer_safety.sh"; LOCALAI_INSTALLER_TEMP_FILES=(); trap localai_installer_cleanup_temps EXIT; exit 0' _ "$repo_root" || fail "empty cleanup changed successful EXIT status"
 
 mkdir -p "$scratch/old-assets" "$scratch/new-assets"
 printf 'old\n' > "$scratch/old-assets/localai.lock"
