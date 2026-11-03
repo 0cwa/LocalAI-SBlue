@@ -5,6 +5,7 @@ has been runtime-qualified on secureblue or on a GPU.
 
 ## Unreleased
 
+- Gate public listeners on completion of the first administrator bootstrap.
 - Add bounded host and disposable VM lifecycle acceptance with sanitized receipts.
 - Leave new installations idle and preserve existing backend and TLS service states on upgrades.
 

@@ -31,7 +31,7 @@ else
 fi
 if command -v ruff >/dev/null 2>&1; then
   printf 'Ruff Python checks\n'
-  ruff check --no-cache localai-tray scripts/*.py
+  ruff check --no-cache localai-tray lib/bootstrap_guard.py scripts/*.py
 else
   printf 'Ruff not installed; skipping Python lint.\n'
 fi
@@ -68,6 +68,9 @@ bash scripts/test-release.sh
 
 printf 'Strict configuration tests\n'
 bash scripts/test-config.sh
+
+printf 'Administrator bootstrap guard tests\n'
+bash scripts/test-bootstrap-guard.sh
 
 printf 'Lifecycle facade tests\n'
 bash scripts/test-locaictl.sh

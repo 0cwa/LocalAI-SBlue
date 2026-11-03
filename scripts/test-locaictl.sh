@@ -26,6 +26,9 @@ while [[ "$#" -gt 0 ]]; do
     *) break ;;
   esac
 done
+if [[ "${1:-}" == /usr/bin/python3 && "${2:-}" == /etc/localai/bootstrap-guard.py ]]; then
+  exit 0
+fi
 exec "$@"
 EOF
 chmod 0755 "$tmp_dir/run0"
@@ -125,6 +128,37 @@ mkdir -p "$tmp_dir/systemd"
 printf '[Socket]\nFreeBind=true\n' >"$tmp_dir/systemd/localai-tls-forward.socket"
 
 [[ "$("$repo_root/bin/localaictl" --version)" == "localaictl $(<"$repo_root/VERSION")" ]]
+(
+  # The function and its dependencies are exercised with isolated mocks.
+  # shellcheck disable=SC1090
+  source <(sed -n '/^bootstrap_admin() {$/,/^}/p' "$repo_root/bin/localaictl")
+  # shellcheck disable=SC2329
+  verify_bootstrap_unit() { [[ "${MOCK_UNIT_SAFE:-true}" == true ]]; }
+  # shellcheck disable=SC2329
+  bootstrap_listener_inactive() { [[ "${MOCK_LISTENERS_SAFE:-true}" == true ]]; }
+  # shellcheck disable=SC2329
+  bootstrap_listener_disabled() { [[ "${MOCK_LISTENERS_SAFE:-true}" == true ]]; }
+  # shellcheck disable=SC2329
+  bootstrap_ports_clear() { [[ "${MOCK_LISTENERS_SAFE:-true}" == true ]]; }
+  # shellcheck disable=SC2329
+  bootstrap_tls_containers_absent() { [[ "${MOCK_LISTENERS_SAFE:-true}" == true ]]; }
+  # shellcheck disable=SC2329
+  run_or_dry() { printf '%s\n' "$*" >> "$tmp_dir/bootstrap-actions"; }
+  # shellcheck disable=SC2329
+  log() { :; }
+  # shellcheck disable=SC2329
+  die() { exit 1; }
+  # Values are read indirectly by the extracted function.
+  # shellcheck disable=SC2034
+  LOCALAI_AUTH=true LOCALAI_BIND_HOST=127.0.0.1 LOCALAI_TLS_FORWARD_SOCKET_NAME=localai-tls-forward.socket LOCALAI_TLS_SERVICE_NAME=localai-tls-compose.service LOCALAI_TLS_USER=localai-tls id_bin="$tmp_dir/id"
+  bootstrap_admin
+  [[ "$(<"$tmp_dir/bootstrap-actions")" == 'backend_systemctl start localai.service' ]]
+  if (MOCK_UNIT_SAFE=false; bootstrap_admin); then exit 1; fi
+  if (MOCK_LISTENERS_SAFE=false; bootstrap_admin); then exit 1; fi
+  # The value is read by the extracted production function.
+  # shellcheck disable=SC2034
+  if (LOCALAI_BIND_HOST=0.0.0.0; bootstrap_admin); then exit 1; fi
+)
 if "$repo_root/bin/localaictl" --version extra >/dev/null 2>&1; then
   printf 'version accepted an extra argument\n' >&2
   exit 1

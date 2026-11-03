@@ -3,6 +3,10 @@ Description=LocalAI HTTPS socket
 Documentation=man:systemd.socket(5)
 
 [Socket]
+User=@LOCALAI_SERVICE_USER@
+Environment=XDG_RUNTIME_DIR=/run/user/@LOCALAI_UID@
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/@LOCALAI_UID@/bus
+ExecStartPre=/usr/bin/python3 /etc/localai/bootstrap-guard.py @DATA_PATH@/database.db @BACKEND_PORT@ @STATE_DIR@/.config/systemd/user/localai.service
 ListenStream=@TLS_PUBLIC_HOST@:@TLS_PUBLIC_PORT@
 FreeBind=true
 NoDelay=true

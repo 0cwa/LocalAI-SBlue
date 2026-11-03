@@ -172,6 +172,7 @@ step() {
     inspect-image) description='podman image inspect CPU image digest' ;;
     container-running) description='podman inspect managed container running state' ;;
     doctor) description='localaictl doctor (HTTP 200 or 401)' ;;
+    first-admin-bootstrap) description='VM first administrator and guarded socket ordering' ;;
     create-unrelated-container) description='podman create unrelated test container' ;;
     upgrade-disabled-running|upgrade-enabled-running|upgrade-enabled-stopped|upgrade-disabled-stopped)
       description='backend installer --yes --no-pull' ;;
@@ -353,6 +354,9 @@ else
     [[ "$state" == true ]]
   '
   step doctor 90 "$0" --check-health "$controller"
+  if [[ "$mode" == vm ]]; then
+    step first-admin-bootstrap 120 bash "$repo_root/scripts/acceptance-bootstrap.sh"
+  fi
   if [[ ! -e "$work/config-before" && ! -L "$work/config-before" ]]; then
     cp -- /etc/localai/localai.conf "$work/config-before"
   fi

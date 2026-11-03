@@ -37,20 +37,27 @@ cd LocalAI-SBlue
    cd secureblue-localai-install
    ./install.sh
    ```
-4. Start the service explicitly, then check the service and local endpoint:
+4. Start only the loopback backend for the first administrator setup:
 
    ```sh
    cd ..
-   bin/localaictl start
-   bin/localaictl status
-   bin/localaictl doctor
+   bin/localaictl bootstrap-admin
    ```
 
    With the shipped settings, the endpoint is `http://127.0.0.1:11455`.
-5. Before allowing other people to register, complete the first administrator
-   bootstrap. LocalAI makes the first registered user an administrator and
-   that registration bypasses approval or invite requirements. Keep access
-   restricted until the intended administrator account exists.
+5. Open the local endpoint and register the intended administrator. LocalAI
+   makes the first registered user an administrator, bypassing approval or
+   invite requirements. Complete this step from the local machine before
+   installing the public HTTPS socket. Then use `bin/localaictl doctor` and
+   `bin/localaictl start` to check and start the configured stack.
+
+The public HTTPS socket checks for an active administrator and an authenticated
+loopback backend before binding. The internal Caddy listener must use loopback.
+To expose the backend directly, first complete bootstrap on loopback, then
+update the configuration and rerun the backend installer. An inaccessible or
+unrecognized administrator database causes exposure checks to fail closed.
+The shipped unit uses the SQLite database in `LOCALAI_DATA_PATH`; an external
+authentication database is not supported by this bootstrap check.
 
 The default configuration enables authentication and approval-based
 registration. LocalAI supports `approval` and `invite` registration modes; see
