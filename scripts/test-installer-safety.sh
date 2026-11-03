@@ -513,20 +513,24 @@ source_production_function() {
   source_production_function "$repo_root/localai-podman-compose/install.sh" retire_forward_units
   # These mocks are used by the extracted production function.
   # shellcheck disable=SC2329
-  localai_installer_check_managed_file() { [[ ! -e "$1" ]] || rg -q '^# managed-test$' "$1"; }
+  localai_installer_check_managed_file() { [[ ! -e "$1" ]] || rg -q '^# Managed by LocalAI secureblue TLS installer\.$' "$1"; }
   # shellcheck disable=SC2329
   run0_pipe() { printf '%s\n' "$*" >> "$scratch/retire-calls"; }
   # shellcheck disable=SC2329
   die() { exit 1; }
   mkdir -p "$scratch/forward-units"
-  printf '# managed-test\n' > "$scratch/forward-units/example.socket"
-  printf '# managed-test\n' > "$scratch/forward-units/example.service"
+  printf '# Managed by LocalAI secureblue TLS installer.\n' > "$scratch/forward-units/example.socket"
+  printf '# Managed by LocalAI secureblue TLS installer.\n' > "$scratch/forward-units/example.service"
+  printf '# Managed by LocalAI secureblue TLS installer.\n' > "$scratch/forward-units/previous.socket"
+  printf '# Managed by LocalAI secureblue TLS installer.\n' > "$scratch/forward-units/previous.service"
   # Variables are consumed by the extracted function.
   # shellcheck disable=SC2034
   install_service=1 install_public_socket=0 tls_forward_socket_name=example.socket tls_forward_service_name=example.service
   retire_forward_units "$scratch/forward-units"
   rg -q 'systemctl disable --now example.socket' "$scratch/retire-calls"
   rg -q 'systemctl stop example.service' "$scratch/retire-calls"
+  rg -q 'systemctl disable --now previous.socket' "$scratch/retire-calls"
+  rg -q 'systemctl stop previous.service' "$scratch/retire-calls"
   printf 'unrelated\n' > "$scratch/forward-units/example.socket"
   : > "$scratch/retire-calls"
   if (retire_forward_units "$scratch/forward-units"); then exit 1; fi

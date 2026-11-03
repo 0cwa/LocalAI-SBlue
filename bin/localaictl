@@ -216,7 +216,10 @@ bootstrap_ports_clear() {
 
 bootstrap_tls_containers_absent() {
   local uid state containers
-  uid="$("$id_bin" -u "$LOCALAI_TLS_USER")" || return 0
+  if ! uid="$("$id_bin" -u "$LOCALAI_TLS_USER")"; then
+    run_elevated /usr/bin/test ! -e "$LOCALAI_TLS_STATE_DIR" && run_elevated /usr/bin/test ! -L "$LOCALAI_TLS_STATE_DIR"
+    return $?
+  fi
   state="$(root_systemctl is-active "user@$uid.service" 2>/dev/null)" || :
   if [[ "$state" != active ]]; then
     # Do not start a manager that may revive an old container.
@@ -238,14 +241,13 @@ verify_bootstrap_unit() {
   run_elevated /usr/bin/python3 /etc/localai/bootstrap-guard.py --unit-safe \
     "$LOCALAI_DATA_PATH/database.db" "$LOCALAI_BIND_PORT" "$LOCALAI_STATE_DIR/.config/systemd/user/localai.service" || return 1
   dropins="$(backend_systemctl show localai.service --property=DropInPaths --value 2>/dev/null)" || return 1
-  [[ -z "$dropins" ]] || return 1
+  printf '%s\n' "$dropins" | /usr/bin/python3 /etc/localai/bootstrap-guard.py --dropins-safe || return 1
   backend_systemctl show localai.service --property=Environment --value 2>/dev/null |
     /usr/bin/python3 /etc/localai/bootstrap-guard.py --unit-environment "$LOCALAI_DATA_PATH/database.db" "$LOCALAI_BIND_PORT"
 }
 
-bootstrap_admin() {
-  [[ "$LOCALAI_AUTH" == true && "$LOCALAI_BIND_HOST" == 127.0.0.1 ]] || die "bootstrap requires authentication and a backend bound to 127.0.0.1; update the configuration and reinstall the backend first"
-  verify_bootstrap_unit || die "the installed backend unit is not the current authenticated loopback unit; reinstall the backend first"
+ensure_bootstrap_isolation() {
+  local unit_file unit_name tls_footprint=0
   status_elevated=1
   bootstrap_listener_inactive root_systemctl is-active "$LOCALAI_TLS_FORWARD_SOCKET_NAME" || die "stop the existing public TLS socket before bootstrap"
   bootstrap_listener_disabled root_systemctl is-enabled "$LOCALAI_TLS_FORWARD_SOCKET_NAME" || die "disable the existing public TLS socket before bootstrap"
@@ -253,14 +255,32 @@ bootstrap_admin() {
     bootstrap_listener_inactive root_systemctl is-active localai-tls-forward.socket || die "stop the existing public TLS socket before bootstrap"
     bootstrap_listener_disabled root_systemctl is-enabled localai-tls-forward.socket || die "disable the existing public TLS socket before bootstrap"
   fi
+  for unit_file in "$system_unit_dir"/*.socket; do
+    [[ -f "$unit_file" && ! -L "$unit_file" ]] || continue
+    if grep -Fqx '# Managed by LocalAI secureblue TLS installer.' "$unit_file" || grep -Fqx 'Description=LocalAI HTTPS socket' "$unit_file"; then
+      tls_footprint=1
+      unit_name="${unit_file##*/}"
+      bootstrap_listener_inactive root_systemctl is-active "$unit_name" || die "stop the existing managed TLS socket before bootstrap"
+      bootstrap_listener_disabled root_systemctl is-enabled "$unit_name" || die "disable the existing managed TLS socket before bootstrap"
+    fi
+  done
   if "$id_bin" -u "$LOCALAI_TLS_USER" >/dev/null 2>&1; then
+    tls_footprint=1
     bootstrap_listener_inactive tls_systemctl is-active "$LOCALAI_TLS_SERVICE_NAME" || die "stop the existing TLS service before bootstrap"
     bootstrap_listener_inactive tls_systemctl is-active localai-tls.service || die "stop the legacy TLS service before bootstrap"
     bootstrap_listener_disabled tls_systemctl is-enabled "$LOCALAI_TLS_SERVICE_NAME" || die "disable the existing TLS service before bootstrap"
     bootstrap_listener_disabled tls_systemctl is-enabled localai-tls.service || die "disable the legacy TLS service before bootstrap"
-    bootstrap_tls_containers_absent || die "inspect and stop or remove TLS-account containers before bootstrap"
   fi
-  bootstrap_ports_clear || die "stop listeners on the configured TLS ports before bootstrap"
+  bootstrap_tls_containers_absent || die "inspect TLS-account state and containers before bootstrap"
+  if [[ "$tls_footprint" == 1 ]]; then
+    bootstrap_ports_clear || die "stop listeners on the configured TLS ports before bootstrap"
+  fi
+}
+
+bootstrap_admin() {
+  [[ "$LOCALAI_AUTH" == true && "$LOCALAI_BIND_HOST" == 127.0.0.1 ]] || die "bootstrap requires authentication and a backend bound to 127.0.0.1; update the configuration and reinstall the backend first"
+  verify_bootstrap_unit || die "the installed backend unit is not the current authenticated loopback unit; reinstall the backend first"
+  ensure_bootstrap_isolation
   run_or_dry backend_systemctl start localai.service || die "could not start the loopback backend"
   log "Open the local backend in your browser and register the intended first administrator."
 }
@@ -440,6 +460,12 @@ EOF
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
     --dry-run) dry_run=1; shift ;;
+    __verify-bootstrap-isolation)
+      shift
+      [[ "$#" == 0 && "$EUID" == 0 ]] || die "internal isolation check requires root"
+      ensure_bootstrap_isolation
+      exit $?
+      ;;
     bootstrap-admin)
       shift
       [[ "$#" == 0 ]] || die "bootstrap-admin accepts no arguments"

@@ -42,6 +42,7 @@ fi
 python3 - "$guard" "$scratch/auth.db" "$scratch/backend.service" <<'PY'
 import http.server
 import importlib.util
+import os
 import pathlib
 import sys
 import threading
@@ -72,6 +73,14 @@ try:
     spec = importlib.util.spec_from_file_location('bootstrap_guard', guard_path)
     guard = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(guard)
+    expected = pathlib.Path(unit + '.expected')
+    expected.write_text(pathlib.Path(unit).read_text(encoding='utf-8'), encoding='utf-8')
+    assert guard.unit_matches(database, str(server.server_port), unit, str(expected), os.getuid())
+    with pathlib.Path(unit).open('a', encoding='utf-8') as handle:
+        handle.write('ExecStart=/usr/bin/false\n')
+    assert not guard.unit_matches(database, str(server.server_port), unit, str(expected), os.getuid())
+    pathlib.Path(unit).write_text(expected.read_text(encoding='utf-8'), encoding='utf-8')
+    guard.unit_matches = lambda *args: pathlib.Path(unit).read_text(encoding='utf-8') == expected.read_text(encoding='utf-8')
     guard.effective_unit_matches = lambda *args: True
     sys.argv = [guard_path, database, str(server.server_port), unit]
     assert guard.main() == 0

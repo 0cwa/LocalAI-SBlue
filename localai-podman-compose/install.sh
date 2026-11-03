@@ -925,31 +925,48 @@ write_forward_units() {
 }
 
 preflight_first_admin() {
-  [[ "$install_public_socket" == 1 && "$install_service" == 1 ]] || return 0
-  [[ "$LOCALAI_AUTH" == true && "$LOCALAI_BIND_HOST" == 127.0.0.1 ]] || die "The public TLS socket requires an authenticated backend on 127.0.0.1."
+  [[ "$install_service" == 1 ]] || return 0
+  [[ "$LOCALAI_AUTH" == true && "$LOCALAI_BIND_HOST" == 127.0.0.1 ]] || die "TLS requires an authenticated backend on 127.0.0.1."
   localai_installer_validate_managed_path "$LOCALAI_DATA_PATH" "LocalAI data path" || die "Unsafe LocalAI data path."
-  [[ -f /etc/localai/bootstrap-guard.py && ! -L /etc/localai/bootstrap-guard.py ]] || die "Install the current backend before enabling the public TLS socket."
+  [[ -f /etc/localai/bootstrap-guard.py && ! -L /etc/localai/bootstrap-guard.py ]] || die "Install the current backend before enabling TLS."
   localai_installer_check_managed_file /etc/localai/bootstrap-guard.py "bootstrap guard" 0 '# Managed by LocalAI secureblue installer.' || die "Unsafe bootstrap guard."
-  run_as_localai /usr/bin/python3 /etc/localai/bootstrap-guard.py "$LOCALAI_DATA_PATH/database.db" "$LOCALAI_BIND_PORT" "$LOCALAI_STATE_DIR/.config/systemd/user/localai.service" || die "Create the first administrator on the current loopback backend before installing the public TLS socket."
+  run_as_localai /usr/bin/python3 /etc/localai/bootstrap-guard.py "$LOCALAI_DATA_PATH/database.db" "$LOCALAI_BIND_PORT" "$LOCALAI_STATE_DIR/.config/systemd/user/localai.service" || die "Create the first administrator on the current loopback backend before installing TLS."
 }
 
 retire_forward_units() {
-  local unit_dir="$1" socket service
+  local unit_dir="$1" socket service candidate unit_name peer changed=0
+  local -a managed_sockets=()
   socket="$unit_dir/$tls_forward_socket_name"
   service="$unit_dir/$tls_forward_service_name"
   [[ "$install_service" == 1 && "$install_public_socket" == 0 ]] || return 0
   localai_installer_check_managed_file "$socket" "TLS host socket unit" 0 '# Managed by LocalAI secureblue TLS installer.' 'Description=LocalAI HTTPS socket' || die "Refusing to remove an unrelated socket unit."
   localai_installer_check_managed_file "$service" "TLS host socket-proxy unit" 0 '# Managed by LocalAI secureblue TLS installer.' 'Description=LocalAI HTTPS socket proxy' || die "Refusing to remove an unrelated socket-proxy unit."
-  if [[ -e "$socket" || -e "$service" ]]; then
-    if [[ -e "$socket" ]]; then
-      run0_pipe /usr/bin/systemctl disable --now "$tls_forward_socket_name" || die "Could not disable the existing public TLS socket."
+  for candidate in "$unit_dir"/*.socket; do
+    [[ -f "$candidate" && ! -L "$candidate" ]] || continue
+    if grep -Fqx '# Managed by LocalAI secureblue TLS installer.' "$candidate" || grep -Fqx 'Description=LocalAI HTTPS socket' "$candidate"; then
+      localai_installer_check_managed_file "$candidate" "TLS host socket unit" 0 '# Managed by LocalAI secureblue TLS installer.' 'Description=LocalAI HTTPS socket' || die "Refusing to remove an unrelated socket unit."
+      peer="${candidate%.socket}.service"
+      localai_installer_check_managed_file "$peer" "TLS host socket-proxy unit" 0 '# Managed by LocalAI secureblue TLS installer.' 'Description=LocalAI HTTPS socket proxy' || die "Refusing to remove an unrelated socket-proxy unit."
+      managed_sockets+=("$candidate")
     fi
-    if [[ -e "$service" ]]; then
-      run0_pipe /usr/bin/systemctl stop "$tls_forward_service_name" || die "Could not stop the existing TLS socket proxy."
-    fi
-    run0_pipe /usr/bin/rm -f -- "$socket" "$service"
-    run0_pipe /usr/bin/systemctl daemon-reload
+  done
+  for candidate in "${managed_sockets[@]}"; do
+      unit_name="${candidate##*/}"
+      peer="${candidate%.socket}.service"
+      run0_pipe /usr/bin/systemctl disable --now "$unit_name" || die "Could not disable an existing public TLS socket."
+      if [[ -e "$peer" ]]; then
+        run0_pipe /usr/bin/systemctl stop "${peer##*/}" || die "Could not stop an existing TLS socket proxy."
+        run0_pipe /usr/bin/rm -f -- "$peer"
+      fi
+      run0_pipe /usr/bin/rm -f -- "$candidate"
+      changed=1
+  done
+  if [[ -e "$service" ]]; then
+    run0_pipe /usr/bin/systemctl stop "$tls_forward_service_name" || die "Could not stop the existing TLS socket proxy."
+    run0_pipe /usr/bin/rm -f -- "$service"
+    changed=1
   fi
+  [[ "$changed" == 0 ]] || run0_pipe /usr/bin/systemctl daemon-reload
 }
 
 selinux_port_state_file() {

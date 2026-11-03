@@ -680,6 +680,8 @@ install_systemd_service() {
     [[ ! -L "$user_unit_dir/localai.service" && -f "$user_unit_dir/localai.service" ]] || die "Refusing to replace a non-regular LocalAI service unit."
     grep -Fqx '# Managed by LocalAI secureblue installer.' "$user_unit_dir/localai.service" || grep -Fqx 'Description=LocalAI OpenAI-compatible API and web UI container' "$user_unit_dir/localai.service" || die "Refusing to replace an unrelated user service unit: $user_unit_dir/localai.service"
   fi
+  localai_installer_check_managed_file /etc/localai/backend-unit.expected "expected backend unit" 0 '# Managed by LocalAI secureblue installer.' || die "Refusing to replace an unrelated expected backend unit."
+  run0_pipe /usr/bin/install -o root -g root -m 0644 "$tmp_service" /etc/localai/backend-unit.expected
   run0_pipe /usr/bin/install -o "$service_user" -g "$service_user" -m 0644 "$tmp_service" "$user_unit_dir/localai.service"
   rm -f "$tmp_service"
   run_as_localai /usr/bin/systemctl --user daemon-reload
@@ -765,6 +767,10 @@ while IFS= read -r path; do
 done < <(localai_app_data_dirs)
 require_cmd run0
 
+if ! /usr/bin/python3 "$repo_root/lib/bootstrap_guard.py" "$LOCALAI_DATA_PATH/database.db"; then
+  /usr/bin/env -u LOCALAI_SYSTEM_UNIT_DIR -u LOCALAI_SYSTEMCTL_BIN -u LOCALAI_RUN0_BIN -u LOCALAI_ID_BIN \
+    LOCALAI_CONFIG_FILE=/etc/localai/localai.conf /usr/bin/bash "$repo_root/bin/localaictl" __verify-bootstrap-isolation || die "Stop and disable existing TLS listeners before first administrator bootstrap."
+fi
 if [[ "$LOCALAI_BIND_HOST" != 127.0.0.1 && "$LOCALAI_BIND_HOST" != ::1 ]]; then
   [[ "$LOCALAI_AUTH" == true ]] || die "A non-loopback backend requires authentication."
   /usr/bin/python3 "$repo_root/lib/bootstrap_guard.py" "$LOCALAI_DATA_PATH/database.db" || die "Complete the first administrator bootstrap on loopback before configuring a public backend."

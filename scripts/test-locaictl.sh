@@ -143,6 +143,8 @@ printf '[Socket]\nFreeBind=true\n' >"$tmp_dir/systemd/localai-tls-forward.socket
   # shellcheck disable=SC2329
   bootstrap_tls_containers_absent() { [[ "${MOCK_LISTENERS_SAFE:-true}" == true ]]; }
   # shellcheck disable=SC2329
+  ensure_bootstrap_isolation() { [[ "${MOCK_LISTENERS_SAFE:-true}" == true ]] || exit 1; }
+  # shellcheck disable=SC2329
   run_or_dry() { printf '%s\n' "$*" >> "$tmp_dir/bootstrap-actions"; }
   # shellcheck disable=SC2329
   log() { :; }
