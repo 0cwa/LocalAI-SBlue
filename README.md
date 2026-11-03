@@ -48,7 +48,7 @@ cd LocalAI-SBlue
 5. Open the local endpoint and register the intended administrator. LocalAI
    makes the first registered user an administrator, bypassing approval or
    invite requirements. Complete this step from the local machine before
-   installing the public HTTPS socket. Then use `bin/localaictl doctor` and
+   installing TLS. Then use `bin/localaictl doctor` and
    `bin/localaictl start` to check and start the configured stack.
 
 The public HTTPS socket checks for an active administrator and an authenticated
@@ -58,6 +58,10 @@ update the configuration and rerun the backend installer. An inaccessible or
 unrecognized administrator database causes exposure checks to fail closed.
 The shipped unit uses the SQLite database in `LOCALAI_DATA_PATH`; an external
 authentication database is not supported by this bootstrap check.
+If an older installation already has a public TLS listener or TLS-account
+containers, inspect and stop them before bootstrap. The installer refuses to
+start the backend while those existing resources cannot be verified; it does
+not automatically stop an already-running legacy deployment.
 
 The default configuration enables authentication and approval-based
 registration. LocalAI supports `approval` and `invite` registration modes; see

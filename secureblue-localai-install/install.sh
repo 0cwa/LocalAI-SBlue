@@ -745,7 +745,13 @@ while IFS= read -r path; do
   done
 done < <(localai_app_data_dirs)
 elevate_once
+bootstrap_isolation_command=__verify-bootstrap-isolation-if-needed
+if [[ "$LOCALAI_AUTH" != true ]] || ! /usr/bin/python3 "$repo_root/lib/bootstrap_guard.py" "$LOCALAI_DATA_PATH/database.db"; then
+  bootstrap_isolation_command=__verify-bootstrap-isolation
+fi
 localai_installer_prepare_config "$canonical_config" "$LOCALAI_INSTALLER_CONFIG_SOURCE" "$LOCALAI_INSTALLER_CONFIG_FORMAT" || die "Could not safely persist the shared LocalAI configuration."
+/usr/bin/env -i HOME=/root PATH=/usr/bin:/bin LOCALAI_CONFIG_FILE=/etc/localai/localai.conf \
+  /usr/bin/bash "$repo_root/bin/localaictl" "$bootstrap_isolation_command" || die "Stop and disable existing TLS listeners before first administrator bootstrap."
 localai_installer_persist_environment_overrides "$canonical_config" || die "Could not safely persist explicit configuration overrides."
 localai_installer_load_config "$canonical_config" canonical || die "Invalid persisted LocalAI configuration."
 service_user="$LOCALAI_SERVICE_USER"
@@ -767,7 +773,7 @@ while IFS= read -r path; do
 done < <(localai_app_data_dirs)
 require_cmd run0
 
-if ! /usr/bin/python3 "$repo_root/lib/bootstrap_guard.py" "$LOCALAI_DATA_PATH/database.db"; then
+if [[ "$LOCALAI_AUTH" != true ]] || ! /usr/bin/python3 "$repo_root/lib/bootstrap_guard.py" "$LOCALAI_DATA_PATH/database.db"; then
   /usr/bin/env -u LOCALAI_SYSTEM_UNIT_DIR -u LOCALAI_SYSTEMCTL_BIN -u LOCALAI_RUN0_BIN -u LOCALAI_ID_BIN \
     LOCALAI_CONFIG_FILE=/etc/localai/localai.conf /usr/bin/bash "$repo_root/bin/localaictl" __verify-bootstrap-isolation || die "Stop and disable existing TLS listeners before first administrator bootstrap."
 fi

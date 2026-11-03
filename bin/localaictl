@@ -202,6 +202,8 @@ bootstrap_listener_disabled() {
   output="$("$@" 2>/dev/null)" || :
   if [[ -z "$output" && "$#" == 3 ]]; then
     output="$("$1" show "$3" --property=LoadState --value 2>/dev/null)" || :
+  elif [[ -z "$output" && "$#" == 4 ]]; then
+    output="$("$1" "$2" show "$4" --property=LoadState --value 2>/dev/null)" || :
   fi
   case "$output" in disabled|masked|not-found) return 0 ;; *) return 1 ;; esac
 }
@@ -215,25 +217,52 @@ bootstrap_ports_clear() {
 }
 
 bootstrap_tls_containers_absent() {
-  local uid state containers
-  if ! uid="$("$id_bin" -u "$LOCALAI_TLS_USER")"; then
-    run_elevated /usr/bin/test ! -e "$LOCALAI_TLS_STATE_DIR" && run_elevated /usr/bin/test ! -L "$LOCALAI_TLS_STATE_DIR"
+  local account="$1" home="$2" uid state containers
+  if ! uid="$("$id_bin" -u "$account")"; then
+    run_elevated /usr/bin/test ! -e "$home" && run_elevated /usr/bin/test ! -L "$home"
     return $?
   fi
   state="$(root_systemctl is-active "user@$uid.service" 2>/dev/null)" || :
   if [[ "$state" != active ]]; then
     # Do not start a manager that may revive an old container.
-    run_elevated /usr/bin/test ! -e "$LOCALAI_TLS_STATE_DIR/.local/share/containers/storage" &&
-      run_elevated /usr/bin/test ! -L "$LOCALAI_TLS_STATE_DIR/.local/share/containers/storage" &&
-      run_elevated /usr/bin/test ! -e "$LOCALAI_TLS_STATE_DIR/.config/containers/storage.conf" &&
-      run_elevated /usr/bin/test ! -L "$LOCALAI_TLS_STATE_DIR/.config/containers/storage.conf"
+    run_elevated /usr/bin/test ! -e "$home/.local/share/containers/storage" &&
+      run_elevated /usr/bin/test ! -L "$home/.local/share/containers/storage" &&
+      run_elevated /usr/bin/test ! -e "$home/.config/containers/storage.conf" &&
+      run_elevated /usr/bin/test ! -L "$home/.config/containers/storage.conf"
     return $?
   fi
-  containers="$(run_elevated /usr/bin/systemd-run --user --machine="${LOCALAI_TLS_USER}@.host" --wait --pipe --collect \
-    --setenv="HOME=$LOCALAI_TLS_STATE_DIR" --setenv="XDG_RUNTIME_DIR=/run/user/$uid" \
+  containers="$(run_elevated /usr/bin/systemd-run --user --machine="${account}@.host" --wait --pipe --collect \
+    --setenv="HOME=$home" --setenv="XDG_RUNTIME_DIR=/run/user/$uid" \
     --setenv="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" --setenv=PATH=/usr/bin:/bin \
     -- /usr/bin/podman ps --all --format '{{.ID}}' 2>/dev/null)" || return 1
   [[ -z "$containers" ]]
+}
+
+bootstrap_tls_identity_safe() {
+  local account="$1" home="$2" unit unit_dir units
+  if "$id_bin" -u "$account" >/dev/null 2>&1; then
+    tls_footprint=1
+    for unit in "$LOCALAI_TLS_SERVICE_NAME" localai-tls-compose.service localai-tls.service; do
+      bootstrap_listener_inactive user_manager_systemctl "$account" is-active "$unit" || die "stop the existing TLS service before bootstrap"
+      bootstrap_listener_disabled user_manager_systemctl "$account" is-enabled "$unit" || die "disable the existing TLS service before bootstrap"
+    done
+    unit_dir="$home/.config/systemd/user"
+    [[ "$(run_elevated /usr/bin/realpath -m -- "$unit_dir")" == "$unit_dir" ]] || die "cannot inspect a non-canonical TLS user unit directory"
+    run_elevated /usr/bin/test ! -L "$unit_dir" || die "cannot inspect a linked TLS user unit directory"
+    if run_elevated /usr/bin/test -d "$unit_dir"; then
+      [[ -z "$(run_elevated /usr/bin/find -P "$unit_dir" -mindepth 1 -maxdepth 1 -type l -name '*.wants' -print -quit)" ]] || die "cannot inspect a linked TLS wants directory"
+      units="$(run_elevated /usr/bin/find -P "$unit_dir" -mindepth 1 -maxdepth 2 -name '*.service' -printf '%f\n')" || die "cannot inspect TLS user units before bootstrap"
+      while IFS= read -r unit; do
+        [[ -n "$unit" ]] || continue
+        [[ "$unit" =~ ^[A-Za-z0-9_.@-]+\.service$ ]] || die "cannot inspect an unexpected TLS user unit name"
+        bootstrap_listener_inactive user_manager_systemctl "$account" is-active "$unit" || die "stop TLS user units before bootstrap"
+        bootstrap_listener_disabled user_manager_systemctl "$account" is-enabled "$unit" || die "disable TLS user units before bootstrap"
+      done <<< "$units"
+    elif ! run_elevated /usr/bin/test ! -e "$unit_dir" || ! run_elevated /usr/bin/test ! -L "$unit_dir"; then
+      die "cannot inspect the TLS user unit directory"
+    fi
+  fi
+  bootstrap_tls_containers_absent "$account" "$home" || die "inspect TLS-account state and containers before bootstrap"
 }
 
 verify_bootstrap_unit() {
@@ -255,7 +284,7 @@ ensure_bootstrap_isolation() {
     bootstrap_listener_inactive root_systemctl is-active localai-tls-forward.socket || die "stop the existing public TLS socket before bootstrap"
     bootstrap_listener_disabled root_systemctl is-enabled localai-tls-forward.socket || die "disable the existing public TLS socket before bootstrap"
   fi
-  for unit_file in "$system_unit_dir"/*.socket; do
+  for unit_file in /etc/systemd/system/*.socket; do
     [[ -f "$unit_file" && ! -L "$unit_file" ]] || continue
     if grep -Fqx '# Managed by LocalAI secureblue TLS installer.' "$unit_file" || grep -Fqx 'Description=LocalAI HTTPS socket' "$unit_file"; then
       tls_footprint=1
@@ -264,14 +293,10 @@ ensure_bootstrap_isolation() {
       bootstrap_listener_disabled root_systemctl is-enabled "$unit_name" || die "disable the existing managed TLS socket before bootstrap"
     fi
   done
-  if "$id_bin" -u "$LOCALAI_TLS_USER" >/dev/null 2>&1; then
-    tls_footprint=1
-    bootstrap_listener_inactive tls_systemctl is-active "$LOCALAI_TLS_SERVICE_NAME" || die "stop the existing TLS service before bootstrap"
-    bootstrap_listener_inactive tls_systemctl is-active localai-tls.service || die "stop the legacy TLS service before bootstrap"
-    bootstrap_listener_disabled tls_systemctl is-enabled "$LOCALAI_TLS_SERVICE_NAME" || die "disable the existing TLS service before bootstrap"
-    bootstrap_listener_disabled tls_systemctl is-enabled localai-tls.service || die "disable the legacy TLS service before bootstrap"
+  bootstrap_tls_identity_safe "$LOCALAI_TLS_USER" "$LOCALAI_TLS_STATE_DIR"
+  if [[ "$LOCALAI_TLS_USER" != localai-tls || "$LOCALAI_TLS_STATE_DIR" != /var/lib/localai-tls ]]; then
+    bootstrap_tls_identity_safe localai-tls /var/lib/localai-tls
   fi
-  bootstrap_tls_containers_absent || die "inspect TLS-account state and containers before bootstrap"
   if [[ "$tls_footprint" == 1 ]]; then
     bootstrap_ports_clear || die "stop listeners on the configured TLS ports before bootstrap"
   fi
@@ -464,6 +489,14 @@ while [[ "$#" -gt 0 ]]; do
       shift
       [[ "$#" == 0 && "$EUID" == 0 ]] || die "internal isolation check requires root"
       ensure_bootstrap_isolation
+      exit $?
+      ;;
+    __verify-bootstrap-isolation-if-needed)
+      shift
+      [[ "$#" == 0 && "$EUID" == 0 ]] || die "internal isolation check requires root"
+      if [[ "$LOCALAI_AUTH" != true ]] || ! /usr/bin/python3 "$repo_root/lib/bootstrap_guard.py" "$LOCALAI_DATA_PATH/database.db"; then
+        ensure_bootstrap_isolation
+      fi
       exit $?
       ;;
     bootstrap-admin)

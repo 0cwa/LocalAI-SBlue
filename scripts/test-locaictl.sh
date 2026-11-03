@@ -161,6 +161,34 @@ printf '[Socket]\nFreeBind=true\n' >"$tmp_dir/systemd/localai-tls-forward.socket
   # shellcheck disable=SC2034
   if (LOCALAI_BIND_HOST=0.0.0.0; bootstrap_admin); then exit 1; fi
 )
+(
+  # shellcheck disable=SC1090
+  source <(sed -n '/^bootstrap_tls_identity_safe() {$/,/^}/p' "$repo_root/bin/localaictl")
+  # These mocks are used by the extracted function.
+  # shellcheck disable=SC2329
+  run_elevated() { "$@"; }
+  # shellcheck disable=SC2329
+  bootstrap_listener_inactive() { return 0; }
+  # shellcheck disable=SC2329
+  bootstrap_listener_disabled() { [[ "${*: -1}" != custom-legacy.service ]]; }
+  # shellcheck disable=SC2329
+  bootstrap_tls_containers_absent() { return 0; }
+  # shellcheck disable=SC2329
+  die() { exit 1; }
+  # shellcheck disable=SC2034
+  id_bin="$tmp_dir/id" LOCALAI_TLS_SERVICE_NAME=localai-tls-compose.service tls_footprint=0
+  mkdir -p "$tmp_dir/tls/.config/systemd/user"
+  : > "$tmp_dir/tls/.config/systemd/user/custom-legacy.service"
+  if (bootstrap_tls_identity_safe localai-tls "$tmp_dir/tls"); then
+    printf 'enabled custom legacy service was accepted\n' >&2; exit 1
+  fi
+  rm "$tmp_dir/tls/.config/systemd/user/custom-legacy.service"
+  mkdir -p "$tmp_dir/tls/.config/systemd/user/default.target.wants"
+  ln -s /dev/null "$tmp_dir/tls/.config/systemd/user/default.target.wants/custom-legacy.service"
+  if (bootstrap_tls_identity_safe localai-tls "$tmp_dir/tls"); then
+    printf 'enabled linked legacy service was accepted\n' >&2; exit 1
+  fi
+)
 if "$repo_root/bin/localaictl" --version extra >/dev/null 2>&1; then
   printf 'version accepted an extra argument\n' >&2
   exit 1
