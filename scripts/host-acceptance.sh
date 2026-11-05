@@ -185,7 +185,7 @@ if ! timeout 7200s ssh "${ssh_args[@]}" root@127.0.0.1 "bash $worker verify"; th
   if (( diagnostic_pause_seconds > 0 )); then
     printf 'diagnostic-recheck: started\n'
     # The guest emits only allowlisted backup failure categories from this
-    # read-only-in-purpose backup retry; the disposable overlay remains alive.
+    # bounded diagnostic retry; the disposable overlay remains alive.
     timeout 1800s ssh "${ssh_args[@]}" root@127.0.0.1 "bash $worker diagnose-backup" || :
     printf 'diagnostic-recheck: complete\n'
     bounded_vm_diagnostic_pause "$scratch" "$diagnostic_pause_seconds"
