@@ -30,6 +30,26 @@ localai_installer_validate_identifier() {
   fi
 }
 
+localai_installer_podman_publish_host() {
+  /usr/bin/python3 - "$1" <<'PY'
+import ipaddress
+import sys
+
+try:
+    address = ipaddress.ip_address(sys.argv[1])
+except ValueError:
+    print(
+        "LOCALAI_BIND_HOST must be a numeric IPv4 or IPv6 address for the "
+        "private Podman network; hostnames such as localhost are not supported. "
+        "Use 127.0.0.1 or ::1 for loopback.",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+print(f"[{address}]" if address.version == 6 else address)
+PY
+}
+
 localai_installer_validate_managed_path() {
   local path="$1" label="$2" normalized protected var_lib_root
   if [[ -z "$path" || "$path" != /* || ! "$path" =~ ^/[A-Za-z0-9._/-]*$ ]]; then
