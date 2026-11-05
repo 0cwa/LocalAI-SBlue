@@ -28,7 +28,13 @@ while [[ "$#" -gt 0 ]]; do
 done
 if [[ "${1:-}" == /usr/bin/flock ]]; then
   shift
-  [[ "${1:-}" == -n ]] && shift
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      -n) shift ;;
+      -E) shift 2 ;;
+      *) break ;;
+    esac
+  done
   shift # replace the production lock path with a private fixture path
   exec /usr/bin/flock -n "${LOCALAI_FAKE_LOCK_FILE:?}" "$@"
 fi
@@ -432,6 +438,40 @@ if "$repo_root/bin/localaictl" restore "$backup_archive" >/dev/null 2>&1; then
   printf 'restore overwrote non-empty state without confirmation\n' >&2
   exit 1
 fi
+python3 - "$repo_root/bin/localaictl" "$backup_archive" <<'PY'
+import errno, os, pty, select, sys, time
+pid, terminal = pty.fork()
+if pid == 0:
+    os.execv(sys.argv[1], [sys.argv[1], 'restore', sys.argv[2]])
+output = bytearray()
+sent = False
+deadline = time.monotonic() + 45
+status = None
+while time.monotonic() < deadline:
+    ready, _, _ = select.select([terminal], [], [], 0.1)
+    if ready:
+        try:
+            chunk = os.read(terminal, 4096)
+        except OSError as error:
+            if error.errno != errno.EIO:
+                raise
+            chunk = b''
+        output.extend(chunk)
+        if not sent and b'Continue? [y/N]' in output:
+            os.write(terminal, b'y\n')
+            sent = True
+    finished, child_status = os.waitpid(pid, os.WNOHANG)
+    if finished:
+        status = child_status
+        break
+if status is None:
+    os.kill(pid, 15)
+    os.waitpid(pid, 0)
+    raise SystemExit('interactive restore timed out')
+if not sent or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+    raise SystemExit('interactive restore did not accept the explicit y response')
+PY
+[[ "$(<"$tmp_dir/backup-state/database.db")" == 'state fixture' ]]
 printf 'damaged state\n' >"$tmp_dir/backup-state/database.db"
 "$repo_root/bin/localaictl" restore --yes "$backup_archive" >"$tmp_dir/restore-output"
 [[ "$(<"$tmp_dir/backup-state/database.db")" == 'state fixture' ]]
@@ -452,6 +492,49 @@ if rg -q '^restorecon ' "$tmp_dir/commands"; then
 fi
 rg -q 'start localai.service' "$tmp_dir/commands"
 [[ "$(<"$tmp_dir/backup-state/unrelated.txt")" == 'preserve this' ]]
+[[ "$(<"$LOCALAI_FAKE_STATE_DIR/backend")" == active ]]
+
+# Send TERM immediately after the first state directory copy. The EXIT cleanup
+# must roll back the snapshot before restarting services.
+printf 'before signal\n' >"$tmp_dir/backup-state/database.db"
+cat >"$tmp_dir/cp-then-term" <<'EOF'
+#!/usr/bin/env bash
+/usr/bin/cp "$@"
+if [[ "${LOCALAI_FAKE_TERM_AFTER_COPY:-false}" == true && " $* " == *"backup-state/. "* ]]; then
+  kill -TERM "$PPID"
+fi
+EOF
+chmod 0755 "$tmp_dir/cp-then-term"
+export LOCALAI_CP_BIN="$tmp_dir/cp-then-term"
+export LOCALAI_FAKE_TERM_AFTER_COPY=true
+python3 - "$repo_root/bin/localaictl" "$backup_archive" <<'PY'
+import errno, os, pty, select, sys, time
+pid, terminal = pty.fork()
+if pid == 0:
+    os.execv(sys.argv[1], [sys.argv[1], 'restore', '--yes', sys.argv[2]])
+status = None
+deadline = time.monotonic() + 45
+while time.monotonic() < deadline:
+    ready, _, _ = select.select([terminal], [], [], 0.1)
+    if ready:
+        try:
+            os.read(terminal, 4096)
+        except OSError as error:
+            if error.errno != errno.EIO:
+                raise
+    finished, child_status = os.waitpid(pid, os.WNOHANG)
+    if finished:
+        status = child_status
+        break
+if status is None:
+    os.kill(pid, 15)
+    os.waitpid(pid, 0)
+    raise SystemExit('restore signal test timed out')
+if not os.WIFEXITED(status) or os.WEXITSTATUS(status) == 0:
+    raise SystemExit('restore unexpectedly succeeded after TERM')
+PY
+unset LOCALAI_CP_BIN LOCALAI_FAKE_TERM_AFTER_COPY
+[[ "$(<"$tmp_dir/backup-state/database.db")" == 'before signal' ]]
 [[ "$(<"$LOCALAI_FAKE_STATE_DIR/backend")" == active ]]
 
 printf 'before rollback\n' >"$tmp_dir/backup-state/database.db"

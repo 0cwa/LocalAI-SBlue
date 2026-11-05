@@ -28,6 +28,7 @@ date_bin="${LOCALAI_DATE_BIN:-/usr/bin/date}"
 sha256_bin="${LOCALAI_SHA256_BIN:-/usr/bin/sha256sum}"
 tar_bin="${LOCALAI_TAR_BIN:-/usr/bin/tar}"
 matchpathcon_bin="${LOCALAI_MATCHPATHCON_BIN:-/usr/sbin/matchpathcon}"
+cp_bin="${LOCALAI_CP_BIN:-/usr/bin/cp}"
 config_file="${LOCALAI_CONFIG_FILE:-/etc/localai/localai.conf}"
 legacy_config_file="${LOCALAI_LEGACY_CONFIG_FILE:-$repo_root/localai/localai.lock}"
 audit_dir="${LOCALAI_AUDIT_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/localai/audit}"
@@ -528,7 +529,7 @@ backup_stop_services() {
 }
 
 backup() {
-  local exclude_models=0 destination path lock_file destination_parent tmp
+  local exclude_models=0 destination path lock_file destination_parent tmp status
   while [[ "$#" -gt 0 ]]; do
     case "$1" in
       --exclude-models) [[ "$exclude_models" == 0 ]] || die "backup accepts --exclude-models once"; exclude_models=1; shift ;;
@@ -553,9 +554,13 @@ backup() {
   chmod 0600 "$tmp"
   local -a args=(--archive-file "$tmp")
   [[ "$exclude_models" == 0 ]] || args=(--exclude-models "${args[@]}")
-  if ! run_elevated_pipe /usr/bin/flock -n "$lock_file" "$script_dir/localaictl" __backup "${args[@]}" >"$tmp"; then
+  if run_elevated_pipe /usr/bin/flock -n -E 75 "$lock_file" "$script_dir/localaictl" __backup "${args[@]}" >"$tmp"; then
+    :
+  else
+    status=$?
     rm -f -- "$tmp"
-    die "backup is already running or could not start"
+    [[ "$status" != 75 ]] || die "backup or restore is already running"
+    return "$status"
   fi
   if ! ln -- "$tmp" "$destination"; then
     rm -f -- "$tmp"
@@ -579,6 +584,9 @@ backup_locked() {
   backup_tmp=""
   backup_metadata_dir=""
   trap 'backup_exit_cleanup' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   backup_stop_services
   metadata_dir="$(mktemp -d "$runtime_dir/localai-backup.XXXXXX")"
   backup_metadata_dir="$metadata_dir"
@@ -599,8 +607,8 @@ backup_locked() {
   run_elevated /usr/bin/python3 "$repo_root/lib/backup_archive.py" validate "$archive_file" "$config_file" "$LOCALAI_STATE_DIR" "$LOCALAI_TLS_STATE_DIR" || die "backup contains unsupported or unsafe filesystem entries"
   rm -rf -- "$metadata_dir"
   backup_metadata_dir=""
-  trap - EXIT
   restore_backup_service_state || die "backup completed but one or more previously active services could not be restarted"
+  trap - EXIT HUP INT TERM
 }
 
 # Called indirectly by the backup EXIT trap.
@@ -612,17 +620,24 @@ backup_exit_cleanup() {
 }
 
 restore_archive() {
-  local source="$1" lock_file
+  local source="$1" lock_file status
   [[ -f "$source" && ! -L "$source" ]] || die "restore source must be a regular, non-linked archive file"
   source="$(realpath -e -- "$source")"
   lock_file=/run/lock/localai-backup.lock
   local -a args=("$source")
   [[ "${restore_confirmed:-0}" == 0 ]] || args=(--yes "$source")
-  run_elevated_pipe /usr/bin/flock -n "$lock_file" "$script_dir/localaictl" __restore "${args[@]}" || die "restore is already running or could not start"
+  if run_elevated_pipe /usr/bin/flock -n -E 75 "$lock_file" "$script_dir/localaictl" __restore "${args[@]}"; then
+    :
+  else
+    status=$?
+    [[ "$status" != 75 ]] || die "backup or restore is already running"
+    return "$status"
+  fi
 }
 
 restore_locked() {
   local source="$1" stage source_copy members collisions snapshot skip_links target answer item had_target=0 runtime_dir needs_confirmation=0
+  local restore_mutation_started=0 restore_completed=0
   local helper="$repo_root/lib/backup_archive.py"
   runtime_dir="$(backup_runtime_dir)"
   [[ -f "$source" && ! -L "$source" ]] || die "restore source must be a regular, non-linked archive file"
@@ -632,6 +647,9 @@ restore_locked() {
   RESTORE_ROLLBACK_FAILED=0
   RESTORE_SERVICES_STOPPED=0
   trap 'restore_exit_cleanup' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   chmod 0700 "$stage"
   members="$stage/members0"
   collisions="$stage/collisions0"
@@ -655,6 +673,7 @@ restore_locked() {
     printf 'This overlays LocalAI configuration and state, including the TLS CA key and authentication database. Continue? [y/N] ' >&2
     read -r answer
     [[ "$answer" == y || "$answer" == Y ]] || die "restore cancelled"
+    restore_confirmed=1
   fi
   RESTORE_SERVICES_STOPPED=1
   backup_stop_services
@@ -676,28 +695,32 @@ restore_locked() {
   local -a links_to_keep=()
   mapfile -d '' -t links_to_keep <"$skip_links"
   for item in "${links_to_keep[@]}"; do rm -f -- "$stage/$item"; done
+  restore_mutation_started=1
   for target in "$LOCALAI_STATE_DIR" "$LOCALAI_TLS_STATE_DIR"; do
     if [[ -d "$stage/${target#/}" ]]; then mkdir -p -- "$target"; fi
   done
   if [[ -e "$stage/${config_file#/}" ]]; then mkdir -p -- "${config_file%/*}"; fi
   for target in "$LOCALAI_STATE_DIR" "$LOCALAI_TLS_STATE_DIR"; do
     if [[ -d "$stage/${target#/}" && ! -L "$stage/${target#/}" ]]; then
-      run_elevated cp -a -- "$stage/${target#/}/." "$target/" || { restore_rollback "$members" "$collisions" "$snapshot" "$had_target" || RESTORE_ROLLBACK_FAILED=1; die "restore failed; rollback was attempted"; }
+      run_elevated "$cp_bin" -a -- "$stage/${target#/}/." "$target/" || die "restore failed; rollback will run before services restart"
     fi
   done
   if [[ -e "$stage/${config_file#/}" ]]; then
-    run_elevated cp -a -- "$stage/${config_file#/}" "$config_file" || { restore_rollback "$members" "$collisions" "$snapshot" "$had_target" || RESTORE_ROLLBACK_FAILED=1; die "restore failed; rollback was attempted"; }
+    run_elevated "$cp_bin" -a -- "$stage/${config_file#/}" "$config_file" || die "restore failed; rollback will run before services restart"
   fi
   for target in "$LOCALAI_STATE_DIR" "$LOCALAI_TLS_STATE_DIR" "${config_file%/*}"; do
     [[ -e "$target" ]] || continue
-    run_elevated "$matchpathcon_bin" -V "$target" || { restore_rollback "$members" "$collisions" "$snapshot" "$had_target" || RESTORE_ROLLBACK_FAILED=1; die "SELinux label verification failed; rollback was attempted"; }
+    run_elevated "$matchpathcon_bin" -V "$target" || die "SELinux label verification failed; rollback will run before services restart"
   done
+  restore_completed=1
   rm -rf -- "$stage"
-  trap - EXIT
   restore_backup_service_state || die "restore completed but one or more previously active services could not be restarted"
+  trap - EXIT HUP INT TERM
   log "Backup restored. State was overlaid, unrelated files were preserved, and configured root labels were verified."
 }
 
+# Called indirectly by the restore EXIT trap.
+# shellcheck disable=SC2329
 restore_rollback() {
   local members="$1" collisions="$2" snapshot="$3" had_target="$4"
   local status=0
@@ -711,13 +734,22 @@ restore_rollback() {
 # Called indirectly by the restore EXIT trap.
 # shellcheck disable=SC2329
 restore_exit_cleanup() {
+  local exit_status=$?
+  trap - EXIT HUP INT TERM
+  trap '' HUP INT TERM
+  if [[ "${restore_mutation_started:-0}" == 1 && "${restore_completed:-0}" != 1 ]]; then
+    restore_rollback "$members" "$collisions" "$snapshot" "$had_target" || RESTORE_ROLLBACK_FAILED=1
+  fi
   rm -rf -- "${stage:-}"
   if [[ "${RESTORE_ROLLBACK_FAILED:-0}" == 1 ]]; then
-    log "warning: rollback was incomplete; previously active services remain stopped for manual recovery"
-    return 0
+    printf 'localaictl: warning: rollback was incomplete; previously active services remain stopped for manual recovery\n' >&2
+    [[ "$exit_status" != 0 ]] || exit 1
+    exit "$exit_status"
   fi
-  [[ "${RESTORE_SERVICES_STOPPED:-0}" == 1 ]] || return 0
-  restore_backup_service_state || :
+  if [[ "${RESTORE_SERVICES_STOPPED:-0}" == 1 ]]; then
+    restore_backup_service_state || exit 1
+  fi
+  exit "$exit_status"
 }
 
 usage() {
