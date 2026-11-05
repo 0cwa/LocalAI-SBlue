@@ -5,6 +5,10 @@ has been runtime-qualified on secureblue or on a GPU.
 
 ## Unreleased
 
+## 0.2.0
+
+Qualification: repository checks for this release; a preceding 0.1.0 source snapshot passed disposable secureblue CPU VM lifecycle and first-admin checks. Physical host, GPU, and full Caddy TLS remain unverified.
+
 - Record a disposable secureblue VM lifecycle acceptance run.
 
 - Gate public listeners on completion of the first administrator bootstrap.
