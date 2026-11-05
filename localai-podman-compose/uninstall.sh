@@ -336,22 +336,25 @@ selinux_port_state_file() {
 }
 
 tcp_port_type() {
-  local port="$1"
-  semanage port -l | awk -v port="$port" '
+  local port="$1" listing
+  listing="$(semanage port -l)" || return 1
+  printf '%s\n' "$listing" | awk -v port="$port" '
     $2 == "tcp" {
       for (i = 3; i <= NF; i++) {
-        item = $i
-        gsub(",", "", item)
-        split(item, range, "-")
-        if (range[2] == "" && range[1] == port) {
-          print $1
-          exit
-        }
-        if (range[2] != "" && port >= range[1] && port <= range[2]) {
-          print $1
-          exit
+        item_count = split($i, items, ",")
+        for (j = 1; j <= item_count; j++) {
+          count = split(items[j], bounds, "-")
+          if (count == 1 && bounds[1] == port) {
+            exact = $1
+          } else if (count == 2 && bounds[1] <= port && port <= bounds[2] && range == "") {
+            range = $1
+          }
         }
       }
+    }
+    END {
+      if (exact != "") print exact
+      else if (range != "") print range
     }
   '
 }
@@ -365,7 +368,7 @@ restore_one_selinux_port_label() {
 
   state="$(localai_installer_read_selinux_port_state "$state_file")" || die "Refusing untrusted SELinux rollback metadata."
   IFS='|' read -r action port previous_type new_type <<< "$state"
-  current_type="$(tcp_port_type "$port")"
+  current_type="$(tcp_port_type "$port")" || die "Could not resolve SELinux type for TCP port $port."
   if [[ "$current_type" == "$new_type" && "$action" == add ]]; then
     log "Removing SELinux TCP port label for $port"
     run0_pipe semanage port -d -p tcp "$port" || die "Could not remove tracked SELinux port label $port."

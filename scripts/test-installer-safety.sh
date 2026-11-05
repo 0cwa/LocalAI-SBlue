@@ -664,6 +664,42 @@ printf 'SELinux port rollback preserves local override state checks\n'
   rg -q '^semanage port -m -t admin_port_t -p tcp 18444$' "$scratch/selinux-port-rollback-calls"
 ) || fail "SELinux port rollback did not restore the original local override state"
 
+printf 'Uninstall rollback prefers exact SELinux entries over ranges checks\n'
+(
+  source_production_function "$repo_root/localai-podman-compose/uninstall.sh" tcp_port_type
+  source_production_function "$repo_root/localai-podman-compose/uninstall.sh" restore_one_selinux_port_label
+  mock_state_file="$scratch/uninstall-selinux-port-state"
+  mock_base_listing='unreserved_port_t tcp 1024-65535'
+  mock_listing=$'unreserved_port_t tcp 1024-65535\nsystemd_socket_proxyd_port_t tcp 8443'
+  touch "$mock_state_file"
+  # shellcheck disable=SC2329
+  selinux_port_state_file() { printf '%s\n' "$mock_state_file"; }
+  # shellcheck disable=SC2329
+  localai_installer_read_selinux_port_state() { printf 'add|8443||systemd_socket_proxyd_port_t\n'; }
+  # shellcheck disable=SC2329
+  localai_installer_remove_selinux_port_state() { : > "$scratch/uninstall-selinux-port-removed"; }
+  # shellcheck disable=SC2329
+  semanage() {
+    [[ "$1" == port && "$2" == -l ]] || return 90
+    printf '%s\n' "$mock_listing"
+  }
+  # shellcheck disable=SC2329
+  run0_pipe() {
+    printf '%s\n' "$*" >> "$scratch/uninstall-selinux-port-calls"
+    [[ "$*" == 'semanage port -d -p tcp 8443' ]] || return 91
+    mock_listing="$mock_base_listing"
+  }
+  # shellcheck disable=SC2329
+  log() { :; }
+  # shellcheck disable=SC2329
+  die() { fail "$*"; }
+  [[ "$(tcp_port_type 8443)" == systemd_socket_proxyd_port_t ]]
+  restore_one_selinux_port_label internal
+  [[ "$mock_listing" == "$mock_base_listing" ]]
+  rg -q '^semanage port -d -p tcp 8443$' "$scratch/uninstall-selinux-port-calls"
+  [[ -e "$scratch/uninstall-selinux-port-removed" ]]
+) || fail "uninstall rollback removed metadata while leaving a local exact port override"
+
 printf 'TLS Podman parent directory ownership checks\n'
 (
   source_production_function "$repo_root/localai-podman-compose/install.sh" install_dirs

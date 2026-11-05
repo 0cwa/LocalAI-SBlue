@@ -7,7 +7,7 @@ has been runtime-qualified on secureblue or on a GPU.
 
 - Add tray endpoint diagnostics, safe endpoint copying, and warning-gated terminal log access that stays open for review while keeping backend and TLS states independent.
 - Probe all configured writable LocalAI paths inside the existing container and document which paths hold persistent data or scratch files.
-- Prepare TLS Podman's rootless home parents and relabel the generated Caddyfile before validation; nonempty root-owned legacy paths remain a manual review point.
+- Prepare TLS Podman's rootless home parents, relabel the generated Caddyfile before validation, and restore exact SELinux port overrides on uninstall; nonempty root-owned legacy paths remain a manual review point.
 
 - Add protected `localaictl backup` and explicitly confirmed overlay restore,
   covering configured persistent paths and preserving validated ownership,
