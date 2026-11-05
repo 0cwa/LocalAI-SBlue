@@ -218,9 +218,9 @@ assert_call_order "$repo_root/secureblue-localai-install/install.sh" \
 assert_call_order "$repo_root/localai-podman-compose/install.sh" \
   preflight_localai_backend_state ensure_user_manager ensure_container_userns
 assert_call_order "$repo_root/localai-podman-compose/install.sh" \
-  pull_image label_container_state write_caddyfile
+  pull_image write_caddyfile label_container_state
 assert_call_order "$repo_root/localai-podman-compose/install.sh" \
-  label_container_state write_caddyfile validate_caddyfile
+  write_caddyfile label_container_state validate_caddyfile
 assert_call_order "$repo_root/secureblue-localai-install/uninstall.sh" \
   preflight_backend_state stop_service remove_container
 assert_call_order "$repo_root/secureblue-localai-install/uninstall.sh" \
@@ -579,6 +579,39 @@ printf 'Private rootless Podman storage ancestry checks\n'
   done
   [[ "$(<"$state_dir/.local/share/containers/marker")" == preserved ]] || fail "rootless storage hardening removed existing data"
 )
+
+printf 'SELinux TCP port override classification checks\n'
+(
+  source_production_function "$repo_root/localai-podman-compose/install.sh" tcp_port_match_from_listing
+  source_production_function "$repo_root/localai-podman-compose/install.sh" tcp_port_local_override
+  source_production_function "$repo_root/localai-podman-compose/install.sh" tcp_port_type
+  source_production_function "$repo_root/localai-podman-compose/install.sh" selinux_port_change_action
+  # shellcheck disable=SC2329
+  semanage() {
+    [[ "$1" == port && "$2" == -l ]] || return 90
+    if [[ "${3:-}" == -C ]]; then printf '%s\n' "$mock_local_ports"; else printf '%s\n' "$mock_base_ports"; fi
+  }
+  mock_base_ports=$'unreserved_port_t tcp 1024-65535\nhttp_port_t tcp 80, 443'
+  mock_local_ports=''
+  [[ "$(tcp_port_match_from_listing "$mock_base_ports" 18444)" == 'range|unreserved_port_t' ]]
+  [[ -z "$(tcp_port_local_override 18444)" ]]
+  [[ "$(tcp_port_type 18444)" == unreserved_port_t ]]
+  [[ "$(selinux_port_change_action "$(tcp_port_local_override 18444)")" == add ]]
+
+  mock_local_ports=$'custom_port_t tcp 18444\nadmin_range_t tcp 20000-21000'
+  [[ "$(tcp_port_local_override 18444)" == 'exact|custom_port_t' ]]
+  [[ "$(tcp_port_type 18444)" == custom_port_t ]]
+  [[ "$(selinux_port_change_action "$(tcp_port_local_override 18444)")" == modify ]]
+  [[ "$(tcp_port_local_override 20444)" == 'range|admin_range_t' ]]
+  if selinux_port_change_action "$(tcp_port_local_override 20444)"; then
+    fail "administrator-defined SELinux port range was marked safe to modify"
+  else
+    [[ "$?" == 2 ]] || fail "administrator-defined SELinux port range returned an unexpected classification"
+  fi
+
+  mock_local_ports='local_range_t tcp 18000-19000,18444'
+  [[ "$(tcp_port_local_override 18444)" == 'exact|local_range_t' ]]
+) || fail "SELinux TCP port override classification failed"
 
 printf 'TLS Podman parent directory ownership checks\n'
 (
