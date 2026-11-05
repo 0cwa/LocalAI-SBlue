@@ -513,8 +513,14 @@ ensure_subids() {
 install_dirs() {
   log "Creating LocalAI TLS state directories"
   local dir
+  # Podman uses tls_state_dir as HOME and creates its default graphroot below
+  # .local/share. Create and transfer ownership of each parent explicitly;
+  # the helper refuses non-empty root-owned or otherwise unexpected paths.
+  localai_installer_ensure_service_directory "$tls_state_dir" "TLS state directory" "$tls_user" "$tls_user" "$tls_uid" 0750 || die "Unsafe TLS state directory."
+  localai_installer_ensure_service_directory "$tls_state_dir/.local" "TLS Podman home directory" "$tls_user" "$tls_user" "$tls_uid" 0750 || die "Unsafe TLS Podman home directory."
+  localai_installer_ensure_service_directory "$tls_state_dir/.local/share" "TLS Podman share directory" "$tls_user" "$tls_user" "$tls_uid" 0750 || die "Unsafe TLS Podman share directory."
   for dir in \
-    "$tls_state_dir" "$tls_state_dir/data" "$tls_state_dir/config" \
+    "$tls_state_dir/data" "$tls_state_dir/config" \
     "$tls_app_home_dir" "$tls_storage_dir" "$tls_config_dir" \
     "$tls_cache_dir" "$tls_certs_dir" "$tls_compose_dir"; do
     localai_installer_ensure_service_directory "$dir" "TLS managed directory" "$tls_user" "$tls_user" "$tls_uid" 0750 || die "Unsafe TLS managed directory: $dir"

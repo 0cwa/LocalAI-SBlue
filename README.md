@@ -164,6 +164,13 @@ cd localai-podman-compose
 ./install.sh
 ```
 
+The TLS installer prepares `/var/lib/localai-tls/.local` and
+`/var/lib/localai-tls/.local/share` for the TLS account's rootless Podman
+storage. If either path already exists as a nonempty root-owned directory,
+installation stops for manual review. Back up and inspect existing contents
+before correcting ownership; the installer does not recursively change
+ownership of existing data.
+
 To bind the backend's direct HTTP listener to loopback while serving clients
 through the proxy:
 

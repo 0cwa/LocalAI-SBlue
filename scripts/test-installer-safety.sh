@@ -580,6 +580,56 @@ printf 'Private rootless Podman storage ancestry checks\n'
   [[ "$(<"$state_dir/.local/share/containers/marker")" == preserved ]] || fail "rootless storage hardening removed existing data"
 )
 
+printf 'TLS Podman parent directory ownership checks\n'
+(
+  source_production_function "$repo_root/localai-podman-compose/install.sh" install_dirs
+  tls_user=localai-tls tls_uid=955 tls_state_dir="$scratch/tls-state"
+  tls_app_home_dir="$scratch/tls-state/app-home" tls_storage_dir="$scratch/tls-state/storage"
+  tls_config_dir="$scratch/tls-state/config" tls_cache_dir="$scratch/tls-state/cache"
+  tls_certs_dir="$scratch/tls-state/certs" tls_compose_dir="$scratch/tls-state/.local/share/localai-tls-compose"
+  # shellcheck disable=SC2329
+  localai_installer_ensure_service_directory() {
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" "$6" >>"$scratch/tls-parent-calls"
+  }
+  # shellcheck disable=SC2329
+  log() { :; }
+  # shellcheck disable=SC2329
+  die() { exit 75; }
+  install_dirs
+  expected="$(printf '%s\t%s\t%s\t%s\t%s\t%s\n%s\t%s\t%s\t%s\t%s\t%s\n%s\t%s\t%s\t%s\t%s\t%s' \
+    "$tls_state_dir" 'TLS state directory' localai-tls localai-tls 955 0750 \
+    "$tls_state_dir/.local" 'TLS Podman home directory' localai-tls localai-tls 955 0750 \
+    "$tls_state_dir/.local/share" 'TLS Podman share directory' localai-tls localai-tls 955 0750)"
+  [[ "$(head -n 3 "$scratch/tls-parent-calls")" == "$expected" ]]
+  [[ "$(wc -l <"$scratch/tls-parent-calls")" -gt 3 ]]
+) || fail "TLS Podman parents were not created as service-owned directories first"
+rm -f -- "$scratch/tls-parent-calls"
+if (
+  source_production_function "$repo_root/localai-podman-compose/install.sh" install_dirs
+  tls_user=localai-tls tls_uid=955 tls_state_dir="$scratch/tls-state-fail"
+  # shellcheck disable=SC2034
+  tls_app_home_dir="$scratch/tls-state-fail/app-home" tls_storage_dir="$scratch/tls-state-fail/storage"
+  # shellcheck disable=SC2034
+  tls_config_dir="$scratch/tls-state-fail/config" tls_cache_dir="$scratch/tls-state-fail/cache"
+  # shellcheck disable=SC2034
+  tls_certs_dir="$scratch/tls-state-fail/certs" tls_compose_dir="$scratch/tls-state-fail/.local/share/localai-tls-compose"
+  # shellcheck disable=SC2329
+  localai_installer_ensure_service_directory() {
+    printf '%s\n' "$1" >>"$scratch/tls-parent-failure-calls"
+    [[ "$1" != "$tls_state_dir/.local/share" ]]
+  }
+  # shellcheck disable=SC2329
+  log() { :; }
+  # shellcheck disable=SC2329
+  die() { exit 75; }
+  install_dirs
+); then
+  fail "TLS directory setup continued after parent-directory refusal"
+else
+  [[ "$?" == 75 ]] || fail "TLS directory setup returned an unexpected refusal status"
+  [[ "$(wc -l <"$scratch/tls-parent-failure-calls")" == 3 ]] || fail "TLS directory setup continued after a parent refusal"
+fi
+
 (
   source_production_function "$repo_root/localai-podman-compose/install.sh" retire_forward_units
   # These mocks are used by the extracted production function.
