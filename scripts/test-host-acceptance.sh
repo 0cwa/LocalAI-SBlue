@@ -460,6 +460,18 @@ chmod 0700 "$diagnostic_scratch"
 proc_fixture="$vm_mock_dir/proc-fixture"
 fake_qemu_pid=43210
 fake_qemu_start=987654
+# CI runners do not necessarily install QEMU. The process-identity tests use
+# a fixed executable fixture and a synthetic /proc tree, so provide the
+# executable they expect instead of depending on the host package set.
+fake_qemu_bin="$work/fake-qemu-bin"
+mkdir -m 0700 "$fake_qemu_bin"
+cat >"$fake_qemu_bin/qemu-system-x86_64" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod 0755 "$fake_qemu_bin/qemu-system-x86_64"
+PATH="$fake_qemu_bin:$PATH"
+export PATH
 fake_qemu_exe="$(realpath -e -- "$(type -P qemu-system-x86_64)")"
 mkdir -p "$proc_fixture/$fake_qemu_pid"
 fake_stat_fields=(S)
