@@ -12,7 +12,23 @@ source "$repo_root/lib/acceptance.sh"
 
 host_receipt_ready=0
 rootless_poc_dir=''
+record_early_failure_category() {
+  local category='' receipt_path="${LOCALAI_ACCEPTANCE_RECEIPT:-}"
+  [[ "${LOCALAI_ACCEPTANCE_MODE:-vm}" == host && "$receipt_path" == /var/lib/localai-acceptance-run/receipt &&
+     -f "$receipt_path" && ! -L "$receipt_path" && "$(stat -c '%u:%a' "$receipt_path" 2>/dev/null)" == 0:600 ]] || return 0
+  case "$*" in
+    'acceptance worker requires root.') category=not-root ;;
+    'host worker requires a prepared isolated run.') category=host-state-missing ;;
+    'host run state is not root-owned and private.') category=host-state-permissions ;;
+    'SELinux must be enforcing.') category=selinux-not-enforcing ;;
+    'debug shell must be inactive during acceptance.') category=debug-shell-active ;;
+    'host receipt is not root-owned and private.') category='receipt-private' ;;
+    *) return 0 ;;
+  esac
+  printf 'diagnostic guest-worker-prerequisite: %s\n' "$category" >>"$receipt_path"
+}
 fail() {
+  record_early_failure_category "$*"
   printf 'acceptance: %s\n' "$*" >&2
   if [[ "${host_receipt_ready:-0}" == 1 ]]; then printf 'acceptance: %s\n' "$*" >>"$receipt"; fi
   exit 1
@@ -113,6 +129,21 @@ rootless_poc_failure_category() {
     *'poc: python-TypeError'*) printf 'python-type-error' ;;
     *'poc: python-KeyError'*) printf 'python-key-error' ;;
     *'poc: python-RuntimeError'*) printf 'python-runtime-error' ;;
+    *'poc: python-FileExistsError'*) printf 'python-file-exists' ;;
+    *'poc: python-NotADirectoryError'*) printf 'python-not-directory' ;;
+    *'poc: python-IsADirectoryError'*) printf 'python-is-directory' ;;
+    *'poc: python-BlockingIOError'*) printf 'python-blocking-io' ;;
+    *'poc: python-InterruptedError'*) printf 'python-interrupted' ;;
+    *'poc: python-CalledProcessError'*) printf 'python-child-process' ;;
+    *'poc: python-SubprocessError'*) printf 'python-subprocess' ;;
+    *'poc: python-UnicodeDecodeError'*) printf 'python-unicode-decode' ;;
+    *'poc: python-UnicodeEncodeError'*) printf 'python-unicode-encode' ;;
+    *'poc: python-IndexError'*) printf 'python-index' ;;
+    *'poc: python-AssertionError'*) printf 'python-assertion' ;;
+    *'poc: python-NameError'*) printf 'python-name' ;;
+    *'poc: python-ImportError'*) printf 'python-import' ;;
+    *'poc: python-ModuleNotFoundError'*) printf 'python-module-missing' ;;
+    *'poc: python-MemoryError'*) printf 'python-memory' ;;
     *'poc: python-other'*) printf 'python-other' ;;
     *) printf 'no-poc-result' ;;
   esac
@@ -473,6 +504,14 @@ backup_acceptance_step() {
       *"configured persistent path must be archived as a directory"*) reason=persistent-root-type ;;
       *"backup metadata is missing"*) reason=missing-metadata ;;
       *"cannot read backup archive"*) reason=archive-read ;;
+      *"cannot read configured TLS Compose tree from backup"*) reason=compose-archive-read ;;
+      *"backup TLS Compose tree root differs from the installed tree"*) reason=compose-root-mismatch ;;
+      *"backup TLS Compose tree entries differ from the installed tree"*) reason=compose-entry-mismatch ;;
+      *"backup TLS Compose tree metadata differs from the installed tree"*) reason=compose-metadata-mismatch ;;
+      *"backup TLS Compose file differs from the installed tree"*) reason=compose-file-mismatch ;;
+      *"backup TLS Compose tree xattrs differ from the installed tree"*) reason=compose-xattrs-mismatch ;;
+      *"staged TLS Compose tree xattrs differ from the installed tree"*) reason=compose-staged-xattrs-mismatch ;;
+      *"configured TLS Compose tree path is invalid"*) reason=compose-path-invalid ;;
       *"backup weakens metadata on an installed persistent root"*) reason=persistent-root-metadata ;;
       *"backup unit path is outside configured persistent roots"*) reason=unit-path-outside-roots ;;
       *"backup omits directory metadata for the installed user service unit tree"*) reason=unit-ancestor-metadata-missing ;;
@@ -497,7 +536,7 @@ backup_acceptance_step() {
       *"subordinate ID"*|*"user namespace mapping"*|*"rootless namespace"*) reason=rootless-mapping ;;
       *"rootless archive"*|*"rootless graphroot archive"*|*"rootless graphroot extraction"*) reason=rootless-archive ;;
       *"backup metadata"*) reason=archive-metadata ;;
-      *"Traceback"*|*"TypeError"*|*"ValueError"*|*"PermissionError"*|*"AttributeError"*) reason=helper-exception ;;
+      *"Traceback"*|*"TypeError"*|*"ValueError"*|*"PermissionError"*|*"AttributeError"*|*"FileNotFoundError"*|*"FileExistsError"*|*"NotADirectoryError"*|*"IsADirectoryError"*|*"OverflowError"*|*"UnicodeDecodeError"*|*"KeyError"*|*"IndexError"*|*"RuntimeError"*|*"MemoryError"*|*"AssertionError"*|*"ImportError"*|*"ModuleNotFoundError"*) reason=helper-exception ;;
       *"unsupported or unsafe filesystem entries"*|*"backup contains an unsafe"*|*"backup contains unsupported"*|*"symbolic link"*|*"file capability"*|*"setuid or setgid"*) reason=helper-validation ;;
       "") reason=helper-no-diagnostic ;;
       *) reason=helper-unclassified ;;

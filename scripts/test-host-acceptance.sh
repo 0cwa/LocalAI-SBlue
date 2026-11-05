@@ -368,6 +368,7 @@ ssh() {
     *'--rootless-archive-roundtrip'*)
       printf 'diagnostic graphroot-unshare-poc-run: pass\n'
       printf 'diagnostic graphroot-unshare-poc-reason: user-xattr-failed\n'
+      printf 'diagnostic guest-worker-prerequisite: debug-shell-active\n'
       printf 'diagnostic graphroot-unshare-owner-mode: fail\n'
       printf 'diagnostic graphroot-unshare-xattr: fail\n'
       printf 'diagnostic graphroot-unshare-selinux: fail\n'
@@ -532,13 +533,13 @@ if result="$(HOME="$vm_mock_dir/test-home-alias" diagnose_vm_backup_with_proc_ro
 fi
 [[ -e "$vm_mock_dir/diagnose-command-seen" ]] || { printf 'valid mocked QEMU identity did not reach diagnostic SSH\n' >&2; exit 1; }
 [[ -e "$vm_mock_dir/diagnostic-worker-refreshed" ]] || { printf 'diagnostic worker refresh did not run after QEMU identity verification\n' >&2; exit 1; }
-if [[ "$result" != $'diagnostic-worker: refreshed\ndiagnostic graphroot-unshare-poc-run: pass\ndiagnostic graphroot-unshare-poc-reason: user-xattr-failed\ndiagnostic graphroot-unshare-owner-mode: fail\ndiagnostic graphroot-unshare-xattr: fail\ndiagnostic graphroot-unshare-selinux: fail\ndiagnostic graphroot-unshare-host-mapping: fail\nstep backup-restore-backup: fail\ndiagnostic backup-restore-backup-reason: system-manager-tree' ]]; then
+if [[ "$result" != $'diagnostic-worker: refreshed\ndiagnostic graphroot-unshare-poc-run: pass\ndiagnostic graphroot-unshare-poc-reason: user-xattr-failed\ndiagnostic guest-worker-prerequisite: debug-shell-active\ndiagnostic graphroot-unshare-owner-mode: fail\ndiagnostic graphroot-unshare-xattr: fail\ndiagnostic graphroot-unshare-selinux: fail\ndiagnostic graphroot-unshare-host-mapping: fail\nstep backup-restore-backup: fail\ndiagnostic backup-restore-backup-reason: system-manager-tree' ]]; then
   printf 'VM diagnostic control did not sanitize its fixed mock response\n' >&2; exit 1
 fi
 if result="$(MOCK_BACKUP_REASON=unit-ancestor-metadata-weakened HOME="$vm_mock_dir/test-home-alias" diagnose_vm_backup_with_proc_root "$vm_mock_dir/key" "$proc_fixture" 2>/dev/null)"; then
   printf 'VM diagnostic accepted a failed ancestor metadata probe\n' >&2; exit 1
 fi
-[[ "$result" == $'diagnostic-worker: refreshed\ndiagnostic graphroot-unshare-poc-run: pass\ndiagnostic graphroot-unshare-poc-reason: user-xattr-failed\ndiagnostic graphroot-unshare-owner-mode: fail\ndiagnostic graphroot-unshare-xattr: fail\ndiagnostic graphroot-unshare-selinux: fail\ndiagnostic graphroot-unshare-host-mapping: fail\nstep backup-restore-backup: fail\ndiagnostic backup-restore-backup-reason: unit-ancestor-metadata-weakened' ]] || {
+[[ "$result" == $'diagnostic-worker: refreshed\ndiagnostic graphroot-unshare-poc-run: pass\ndiagnostic graphroot-unshare-poc-reason: user-xattr-failed\ndiagnostic guest-worker-prerequisite: debug-shell-active\ndiagnostic graphroot-unshare-owner-mode: fail\ndiagnostic graphroot-unshare-xattr: fail\ndiagnostic graphroot-unshare-selinux: fail\ndiagnostic graphroot-unshare-host-mapping: fail\nstep backup-restore-backup: fail\ndiagnostic backup-restore-backup-reason: unit-ancestor-metadata-weakened' ]] || {
   printf 'VM diagnostic did not preserve a fixed detailed failure category\n' >&2; exit 1;
 }
 result="$(HOME="$vm_mock_dir/test-home-alias" main --release-vm-diagnostic-pause)" || { printf 'diagnostic pause release mock failed\n' >&2; exit 1; }
