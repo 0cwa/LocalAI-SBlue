@@ -1,13 +1,13 @@
 # Issue 19 container hardening VM acceptance
 
 Date: 2026-11-05. Result: **pass** in a disposable secureblue VM using the
-CPU image. This receipt covers the final backend hardening controls, TLS
-forwarding and cleanup, and the post-reboot application lifecycle. It does not
-qualify a physical host, a GPU, or model inference.
+CPU image. This receipt covers the backend hardening controls, TLS forwarding
+and cleanup, manager-safe uninstall behavior, and the post-reboot application
+lifecycle. It does not qualify a physical host, a GPU, or model inference.
 
-- Tested source commit: `0e1445709cb0825486b25a80289e5369977d4ed2`.
+- Tested source commit: `9e267a8bcbd7bf41d4473605ca6eb1baa4cacd3d`.
 - Project version: `0.2.0`; source archive SHA-256:
-  `a67b79fba116e142eeb5e3deba2ee45251f8d7d8f183dc7852544e47eac8b2c4`.
+  `8e76598a4d658ad03bedad89eafc85be75938dc01112bf50a88f5477b97b7a8e`.
 - OS: secureblue 44 kinoite-main-hardened; deployment
   `a21fc280bc53cfbb3c80622ec36cac9a1f574899623dadb731314c5c79efa817`.
 - Kernel `6.19.14-300.fc44.x86_64`, Podman `5.8.2`, systemd `259`; SELinux
@@ -17,10 +17,10 @@ qualify a physical host, a GPU, or model inference.
 - Caddy image digest `sha256:84202bd39c87ddba4611c3c85e7cb9c96d529bd536acf96a6d66cee4057fe8a3`.
 
 The first TLS installer attempt found no `podman compose` provider in the base
-guest. The bounded diagnostic installed Fedora's `podman-compose` package inside
-the disposable overlay, then reran the hardening and TLS checks in that same
-overlay. The base image was unchanged. The retry and the complete runner exited
-successfully with status `0`.
+guest and stopped at that preflight. The bounded diagnostic installed Fedora's
+`podman-compose` package inside the disposable overlay, then reran the
+hardening and TLS checks in that same overlay. The base image was unchanged.
+The retry and the complete runner exited successfully with status `0`.
 
 The backend started with `--network=pasta` and its configured loopback host
 publication passed inspection and API health checks. The backend outbound
@@ -42,12 +42,15 @@ choose one.
 Post-reboot lifecycle checks passed explicit start and health, first-admin
 bootstrap ordering and registration, all four enabled/disabled and
 running/stopped upgrade combinations, configuration and data preservation,
-and conservative uninstall while preserving an unrelated container. TLS test
-uninstall removed its test account through the production cleanup path without
-a test-only removal fallback.
+and conservative uninstall while preserving an unrelated container. The TLS
+test account was absent after uninstall through the production cleanup path;
+no test-only removal fallback was used. The process check now identifies the
+user manager by its reported main PID, executable, UID and init cgroup instead
+of trusting process arguments, and uninstall removes only its owned,
+exact-target enablement links.
 
 The run used a pinned SSH host key and a throwaway overlay. Its sanitized output
 was saved as
-`issue-19-vm-receipt-0e14457-20261105-run3.txt` in task scratch (SHA-256
-`c8b401ddce75aa5ec30d3937308983d707434c356718fc865a0968d81d76f285`); no keys,
-credentials, raw logs, or VM overlays are part of this repository.
+`issue-19-vm-receipt-9e267a8-20261105-run1.txt` in task scratch (SHA-256
+`9c79f98756b0b637e8cfc33a046266232fc88af5bcaf0ea29c8dcf57cf644bf5`); no
+keys, credentials, raw logs, or VM overlays are part of this repository.
