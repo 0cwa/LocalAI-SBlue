@@ -597,6 +597,37 @@ if "$repo_root/bin/localaictl" restore --yes "$omitted_units_archive" >/dev/null
 fi
 stop_count_after="$(rg -c ' stop localai.service$' "$tmp_dir/commands" || true)"
 [[ "$stop_count_before" == "$stop_count_after" ]]
+for unsafe_ancestor in persistent-root config-parent systemd-parent directory-xattr directory-acl; do
+  unsafe_ancestor_archive="$tmp_dir/unsafe-ancestor-$unsafe_ancestor.tar.gz"
+  python3 - "$backup_archive" "$unsafe_ancestor_archive" "$tmp_dir" "$unsafe_ancestor" <<'PY'
+import io, sys, tarfile
+source_path, target_path, base, kind = sys.argv[1:]
+target = {
+    'persistent-root': f'{base}/backup-state',
+    'config-parent': f'{base}/backup-state/.config',
+    'systemd-parent': f'{base}/backup-state/.config/systemd',
+    'directory-xattr': f'{base}/backup-state/.config',
+    'directory-acl': f'{base}/backup-state/.config',
+}[kind].lstrip('/')
+with tarfile.open(source_path, 'r:gz') as source, tarfile.open(target_path, 'w:gz', format=tarfile.PAX_FORMAT) as target_archive:
+    for member in source:
+        if member.name.rstrip('/') == target:
+            if kind == 'directory-xattr':
+                member.pax_headers['SCHILY.xattr.user.localai-ancestor-test'] = 'tampered'
+            elif kind == 'directory-acl':
+                member.pax_headers['SCHILY.acl.default'] = 'user::rwx\ngroup::rwx\nother::rwx\n'
+            else:
+                member.mode = 0o777
+        target_archive.addfile(member, source.extractfile(member) if member.isfile() else None)
+PY
+  stop_count_before="$(rg -c ' stop localai.service$' "$tmp_dir/commands" || true)"
+  if "$repo_root/bin/localaictl" restore --yes "$unsafe_ancestor_archive" >/dev/null 2>&1; then
+    printf 'restore accepted weakened unit ancestor metadata (%s)\n' "$unsafe_ancestor" >&2
+    exit 1
+  fi
+  stop_count_after="$(rg -c ' stop localai.service$' "$tmp_dir/commands" || true)"
+  [[ "$stop_count_before" == "$stop_count_after" ]]
+done
 for entry_type in directory symlink; do
   invalid_config_archive="$tmp_dir/invalid-config-$entry_type.tar.gz"
   python3 - "$invalid_config_archive" "$tmp_dir/backup-config-dir/localai.conf" "$entry_type" <<'PY'
@@ -843,8 +874,14 @@ with tarfile.open(archive_path, 'w:gz') as archive:
     config.size = len(config_data)
     archive.addfile(config, io.BytesIO(config_data))
     with tarfile.open(source_path, 'r:gz') as source:
+        unit_roots = set()
         for member in source:
-            if '/systemd/user' in member.name:
+            parts = member.name.rstrip('/').split('/')
+            for index in range(len(parts) - 1):
+                if parts[index:index + 2] == ['systemd', 'user']:
+                    unit_roots.add('/'.join(parts[:index - 1]))
+        for member in source:
+            if any(member.name.rstrip('/') == root or member.name.startswith(root + '/') for root in unit_roots):
                 archive.addfile(member, source.extractfile(member) if member.isfile() else None)
 PY
 cat >"$tmp_dir/cp-config-test" <<'EOF'

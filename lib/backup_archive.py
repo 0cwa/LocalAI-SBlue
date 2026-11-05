@@ -154,6 +154,28 @@ def same_file_bytes(left: str, right: str) -> bool:
         os.close(right_fd)
 
 
+def directory_metadata_not_weaker(staged: str, installed: str) -> bool:
+    staged_info = os.lstat(staged)
+    installed_info = os.lstat(installed)
+    if not stat.S_ISDIR(staged_info.st_mode) or not stat.S_ISDIR(installed_info.st_mode):
+        return False
+    if (staged_info.st_uid, staged_info.st_gid) != (installed_info.st_uid, installed_info.st_gid):
+        return False
+    staged_mode = stat.S_IMODE(staged_info.st_mode)
+    installed_mode = stat.S_IMODE(installed_info.st_mode)
+    if staged_mode & ~installed_mode:
+        return False
+    staged_xattrs = {
+        name: os.getxattr(staged, name, follow_symlinks=False)
+        for name in os.listxattr(staged, follow_symlinks=False)
+    }
+    installed_xattrs = {
+        name: os.getxattr(installed, name, follow_symlinks=False)
+        for name in os.listxattr(installed, follow_symlinks=False)
+    }
+    return staged_xattrs == installed_xattrs
+
+
 def unit_trees(
     archive_path: str, stage: str, config: str, roots: list[str], expected_roots: list[str]
 ) -> list[str]:
@@ -168,6 +190,13 @@ def unit_trees(
     try:
         with tarfile.open(archive_path, "r:gz") as archive:
             archive_members = {clean_member_name(info.name): info for info in archive}
+        for root in roots:
+            root_name = os.path.abspath(root).lstrip("/").rstrip("/")
+            if root_name in archive_members and os.path.isdir(os.path.join("/", root_name)):
+                if not archive_members[root_name].isdir() or not directory_metadata_not_weaker(
+                    os.path.join(stage, root_name), os.path.join("/", root_name)
+                ):
+                    fail("backup weakens metadata on an installed persistent root")
         for name in names:
             prefix = systemd_tree_prefix(name, "user")
             if prefix is None:
@@ -176,6 +205,20 @@ def unit_trees(
             info = archive_members[name]
             source = os.path.join(stage, name)
             target = os.path.join("/", name)
+            root_name = member_root(name, [root.lstrip("/").rstrip("/") for root in roots])
+            if root_name is None:
+                fail("backup unit path is outside configured persistent roots")
+            ancestor = posixpath.dirname(name)
+            while ancestor == root_name or ancestor.startswith(root_name + "/"):
+                staged_ancestor = os.path.join(stage, ancestor)
+                installed_ancestor = os.path.join("/", ancestor)
+                if ancestor not in archive_members or not archive_members[ancestor].isdir():
+                    fail("backup omits directory metadata for the installed user service unit tree")
+                if not directory_metadata_not_weaker(staged_ancestor, installed_ancestor):
+                    fail("backup weakens metadata on an installed user service unit ancestor")
+                if ancestor == root_name:
+                    break
+                ancestor = posixpath.dirname(ancestor)
             try:
                 target_mode = os.lstat(target).st_mode
             except FileNotFoundError:
@@ -237,6 +280,8 @@ def space_check(
     stage: str,
     collision_file: str | None = None,
     destinations: list[str] | None = None,
+    *,
+    staged: bool = False,
 ) -> None:
     archive_size = os.stat(archive_path, follow_symlinks=False).st_size
     expanded = 0
@@ -300,8 +345,14 @@ def space_check(
 
     stage_key = filesystem_key(stage_path)
     stage_usage = usage_by_filesystem[stage_key]
-    stage_usage["bytes"] = int(stage_usage["bytes"]) + archive_size + expanded + rollback
-    stage_usage["inodes"] = int(stage_usage["inodes"]) + extracted_entries + collision_entries
+    if staged:
+        # The archive copy and extracted tree already consume staging space.
+        # Only the rollback snapshot remains to be written in this phase.
+        stage_usage["bytes"] = int(stage_usage["bytes"]) + rollback
+        stage_usage["inodes"] = int(stage_usage["inodes"]) + int(collision_entries > 0)
+    else:
+        stage_usage["bytes"] = int(stage_usage["bytes"]) + archive_size + expanded + rollback
+        stage_usage["inodes"] = int(stage_usage["inodes"]) + extracted_entries + collision_entries
 
     if destinations:
         configured = [os.path.abspath(path).lstrip("/").rstrip("/") for path in destinations]
@@ -479,6 +530,9 @@ def main() -> None:
         if len(sys.argv) < 4:
             raise SystemExit(2)
         rest = sys.argv[4:]
+        staged = "--staged" in rest
+        if staged:
+            rest.remove("--staged")
         collision_file = rest[0] if rest and rest[0] != "--destinations" else None
         if collision_file:
             rest = rest[1:]
@@ -487,7 +541,7 @@ def main() -> None:
             if rest[0] != "--destinations" or len(rest) == 1:
                 raise SystemExit(2)
             destinations = rest[1:]
-        space_check(sys.argv[2], sys.argv[3], collision_file, destinations)
+        space_check(sys.argv[2], sys.argv[3], collision_file, destinations, staged=staged)
         return
     if len(sys.argv) < 4 or sys.argv[1] not in {"validate", "validate-created", "members0", "collisions0", "destinations", "skip-links0", "unit-trees0", "rollback-new", "copy-source"}:
         raise SystemExit(2)

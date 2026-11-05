@@ -52,6 +52,7 @@ def run_case(
     nested_mount: bool = False,
     free_nested: int = 512 * 1024 * 1024,
     shared_stage_a: bool = False,
+    staged: bool = False,
 ) -> str:
     with tempfile.TemporaryDirectory(prefix="backup-space-test-") as temp:
         base = Path(temp)
@@ -128,6 +129,7 @@ def run_case(
                     str(stage),
                     str(collision_file) if collision_file else None,
                     [str(root_a), str(root_b)],
+                    staged=staged,
                 )
         except SystemExit:
             return error_output.getvalue()
@@ -173,6 +175,26 @@ def main() -> None:
         shared_stage_a=True,
     )
     assert not shared_enough, shared_enough
+    # The second phase runs after the stage already contains the copied archive
+    # and expanded files. On a shared filesystem, it must reserve only the
+    # remaining destination and rollback writes, not count staged data twice.
+    shared_staged_enough = run_case(
+        free_a=64 * 1024 * 1024 + 400 * 1024,
+        free_b=512 * 1024 * 1024,
+        inodes_b=1000,
+        shared_stage_a=True,
+        staged=True,
+    )
+    assert not shared_staged_enough, shared_staged_enough
+    shared_staged_rollback_too_small = run_case(
+        free_a=64 * 1024 * 1024 + 400 * 1024,
+        free_b=512 * 1024 * 1024,
+        inodes_b=1000,
+        include_collision=True,
+        shared_stage_a=True,
+        staged=True,
+    )
+    assert "insufficient free disk space for restore and rollback on a filesystem" in shared_staged_rollback_too_small
 
     print("backup archive destination capacity tests passed")
 

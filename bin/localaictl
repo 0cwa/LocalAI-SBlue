@@ -820,7 +820,7 @@ restore_locked() {
     die "restore targets changed before restore; rerun with --yes after reviewing the overwrite"
   fi
   [[ ! -s "$collisions" ]] || had_target=1
-  run_elevated /usr/bin/python3 "$helper" space-check "$source" "$stage" "$collisions" --destinations "$config_file" "${backup_roots[@]}" || die "insufficient disk space for the restore and rollback snapshot"
+  run_elevated /usr/bin/python3 "$helper" space-check "$source" "$stage" --staged "$collisions" --destinations "$config_file" "${backup_roots[@]}" || die "insufficient disk space for the restore and rollback snapshot"
   if [[ "$had_target" == 1 ]]; then
     run_elevated "$tar_bin" --create --file "$snapshot" --xattrs --acls --selinux --numeric-owner --no-recursion --directory / --null --files-from="$collisions" || die "could not prepare rollback snapshot"
   fi
