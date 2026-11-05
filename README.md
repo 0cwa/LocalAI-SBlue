@@ -119,6 +119,33 @@ for the current environment-variable names. Empty TLS config, cache, cert, and
 Compose directory settings derive from `LOCALAI_TLS_STATE_DIR`; set a full
 absolute path to keep one of those directories elsewhere.
 
+The backend path probe first verifies the selected container's LocalAI
+ownership labels and checks that each configured persistent path is mounted
+from its exact host source to the same container destination. It also verifies
+the managed volume mounted at `/backends`. The probe then runs inside that
+existing container, using the service's rootless Podman storage, rendered
+mounts, and container user. It checks create, write, read, and remove access
+for each configured directory; missing or mis-mounted paths fail before any
+write. The `LOCALAI_BACKENDS_PATH` bind is checked separately from the
+image-provided `/backends` directory and the image's
+`/var/lib/local-ai/backends` fallback.
+
+| Path | Purpose and persistence expectation |
+| --- | --- |
+| `LOCALAI_MODELS_PATH`, `LOCALAI_BACKENDS_PATH` | Managed host bind mounts. Model and downloaded backend files persist across container restarts and upgrades; back them up if they matter. |
+| `/backends` | Image-provided backend directory backed by a managed named volume. It is separate from `LOCALAI_BACKENDS_PATH`; inspect and preserve its contents during lifecycle changes. |
+| `LOCALAI_DOWNLOAD_STAGING_PATH` | Managed bind mount for in-progress downloads. It survives container replacement, though incomplete staging files may be removed by LocalAI. |
+| `LOCALAI_DATA_PATH` and `LOCALAI_AUTH_DATABASE_URL` | The data bind stores the authentication database by default. Preserve and back up the database with the data directory. |
+| `LOCALAI_CONFIG_DIR`, `LOCALAI_GENERATED_CONTENT_PATH`, `LOCALAI_UPLOAD_PATH` | Managed bind mounts for configuration, generated content, and uploads. These survive container replacement and should be backed up when needed. |
+| `LOCALAI_CACHE_DIR`, `LOCALAI_LOG_DIR` | Managed bind mounts. Cache files can be regenerated; logs persist at the configured path until rotated or removed. |
+| `LOCALAI_BACKEND_TEMP_DIR` | Managed writable scratch bind. The directory remains mounted, but its temporary contents are not application state and may be cleared. |
+| `/tmp` | Container scratch space. It is checked independently and is not persistent application storage. |
+| Application `HOME` | A dedicated managed bind for application-local files. Keep required application state there; the service account's full host home is not mounted. |
+
+The `/var/lib/local-ai/backends` image fallback is not the managed
+`LOCALAI_BACKENDS_PATH` bind or the `/backends` image directory. The probe
+reports it separately and does not write to it.
+
 `LOCALAI_WEB_URL` and `LOCALAI_HTTPS_URL` are retained as accepted compatibility
 keys. The controller derives its current endpoint from bind and TLS settings
 instead of using those duplicate values.

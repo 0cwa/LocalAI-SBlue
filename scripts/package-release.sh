@@ -98,6 +98,7 @@ manifest=(
   scripts/test-uninstall-config.sh
   scripts/test-installer-safety.sh
   scripts/test-runtime-paths.sh
+  scripts/test-runtime-writable-probe.sh
   scripts/test-package-relocation.sh
   docs/PUBLIC_BOUNDARIES.md
   docs/EVIDENCE_AND_SECRETS.md
