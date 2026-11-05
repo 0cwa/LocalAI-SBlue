@@ -736,6 +736,7 @@ printf 'TLS uninstall stops managed units before removing them checks\n'
 (
   source_production_function "$repo_root/localai-podman-compose/uninstall.sh" stop_service
   source_production_function "$repo_root/localai-podman-compose/uninstall.sh" stop_tls_user_unit_if_present
+  source_production_function "$repo_root/localai-podman-compose/uninstall.sh" remove_tls_user_unit_enablement
   # shellcheck disable=SC2329
   tls_host_unit_path() { printf '%s/%s\n' "$scratch/system-units" "$1"; }
   tls_forward_socket_name=localai-tls-forward.socket
@@ -772,7 +773,9 @@ printf 'TLS uninstall stops managed units before removing them checks\n'
 
   mkdir -p "$tls_state_dir/.config/systemd/user"
   : > "$tls_state_dir/.config/systemd/user/$tls_service_name"
-  tls_uid=956
+  mkdir -p "$tls_state_dir/.config/systemd/user/default.target.wants"
+  ln -s "../$tls_service_name" "$tls_state_dir/.config/systemd/user/default.target.wants/$tls_service_name"
+  tls_uid="$(id -u)"
   mock_manager_status=3
   # shellcheck disable=SC2329
   localai_installer_user_manager_is_active() { return "$mock_manager_status"; }
@@ -781,8 +784,17 @@ printf 'TLS uninstall stops managed units before removing them checks\n'
     printf '%s\n' "$*" >> "$scratch/tls-user-stop-calls"
     [[ "${TEST_FAIL_USER_STOP:-0}" != 1 ]]
   }
+  # shellcheck disable=SC2329
+  localai_installer_check_directory_chain() { :; }
+  # shellcheck disable=SC2329
+  run0_pipe() {
+    printf '%s\n' "$*" >> "$scratch/tls-stop-calls"
+    if [[ "${1:-}" == /usr/bin/rm ]]; then "$@"; fi
+  }
   stop_service
   [[ ! -e "$scratch/tls-user-stop-calls" ]] || fail "inactive user manager was treated as an unhandled stop failure"
+  remove_tls_user_unit_enablement
+  [[ ! -e "$tls_state_dir/.config/systemd/user/default.target.wants/$tls_service_name" ]] || fail "inactive-manager uninstall left the service enabled for reinstall"
   mock_manager_status=0
   stop_service
   [[ "$(wc -l < "$scratch/tls-user-stop-calls")" -eq 1 ]] || fail "active user manager did not receive a managed-unit stop"
@@ -814,16 +826,67 @@ printf 'TLS state purge requires service-account quiescence checks\n'
   [[ ! -e "$scratch/purge-commands" ]] || fail "state purge removed files before checking TLS account quiescence"
 ) || fail "TLS state purge did not fail closed while service processes remained"
 
-printf 'TLS purge ignores only the exact user-manager process checks\n'
+printf 'TLS purge manager classification requires trusted process identity checks\n'
 (
-  source_production_function "$repo_root/localai-podman-compose/uninstall.sh" tls_user_process_listing_has_workloads
-  if tls_user_process_listing_has_workloads $'42 /usr/lib/systemd/systemd --user'; then
-    fail "linger user manager was classified as a workload"
+  source_production_function "$repo_root/localai-podman-compose/uninstall.sh" tls_user_pid_is_manager
+  proc_root="$scratch/proc-fixture"
+  mkdir -p "$proc_root/42" "$proc_root/43" "$proc_root/44"
+  printf 'Uid:\t956\t956\t956\t956\n' > "$proc_root/42/status"
+  printf '0::/user.slice/user-956.slice/user@956.service/init.scope\n' > "$proc_root/42/cgroup"
+  printf '/usr/lib/systemd/systemd\0--user\0' > "$proc_root/42/cmdline"
+  ln -s /usr/lib/systemd/systemd "$proc_root/42/exe"
+  [[ -e "$proc_root/42/exe" ]]
+  tls_user_pid_is_manager 42 956 42 /user.slice/user-956.slice/user@956.service "$proc_root" || fail "trusted user manager was not recognized"
+
+  # A workload may copy the manager's argv; its executable still identifies it as a workload.
+  printf 'Uid:\t956\t956\t956\t956\n' > "$proc_root/43/status"
+  printf '0::/user.slice/user-956.slice/user@956.service/app.slice/workload.service\n' > "$proc_root/43/cgroup"
+  printf '/usr/lib/systemd/systemd\0--user\0' > "$proc_root/43/cmdline"
+  ln -s /usr/bin/bash "$proc_root/43/exe"
+  if tls_user_pid_is_manager 43 956 42 /user.slice/user-956.slice/user@956.service "$proc_root"; then
+    fail "spoofed systemd argv was accepted as the manager"
   fi
-  if ! tls_user_process_listing_has_workloads $'42 /usr/lib/systemd/systemd --user\n43 podman compose up'; then
-    fail "non-manager service-account process was ignored"
+
+  # Even the systemd executable is not trusted outside the system manager's init scope.
+  printf 'Uid:\t956\t956\t956\t956\n' > "$proc_root/44/status"
+  printf '0::/user.slice/user-956.slice/user@956.service/app.slice/workload.service\n' > "$proc_root/44/cgroup"
+  printf '/usr/lib/systemd/systemd\0--user\0' > "$proc_root/44/cmdline"
+  ln -s /usr/lib/systemd/systemd "$proc_root/44/exe"
+  if tls_user_pid_is_manager 44 956 44 /user.slice/user-956.slice/user@956.service "$proc_root"; then
+    fail "systemd process outside init.scope was accepted as the manager"
   fi
-) || fail "TLS process classification did not distinguish user manager from workloads"
+) || fail "TLS process manager identity checks accepted a spoofed workload"
+
+printf 'TLS uninstall removes only managed user-unit enablement links checks\n'
+(
+  source_production_function "$repo_root/localai-podman-compose/uninstall.sh" remove_tls_user_unit_enablement
+  tls_state_dir="$scratch/unit-enablement-state"
+  tls_service_name=localai-tls-compose.service
+  legacy_tls_service_name=localai-tls.service
+  tls_uid="$(id -u)"
+  unit_dir="$tls_state_dir/.config/systemd/user"
+  wants_dir="$unit_dir/default.target.wants"
+  mkdir -p "$wants_dir"
+  : > "$unit_dir/$tls_service_name"
+  : > "$unit_dir/$legacy_tls_service_name"
+  : > "$scratch/unrelated-unit.service"
+  ln -s "../$tls_service_name" "$wants_dir/$tls_service_name"
+  ln -s "../$legacy_tls_service_name" "$wants_dir/$legacy_tls_service_name"
+  ln -s "$scratch/unrelated-unit.service" "$wants_dir/unrelated.service"
+  # shellcheck disable=SC2329
+  log() { :; }
+  # The path-check behavior is covered elsewhere; this fixture isolates exact link-target cleanup.
+  # shellcheck disable=SC2329
+  localai_installer_check_directory_chain() { :; }
+  # shellcheck disable=SC2329
+  die() { exit 76; }
+  # shellcheck disable=SC2329
+  run0_pipe() { "$@"; }
+  remove_tls_user_unit_enablement
+  [[ ! -e "$wants_dir/$tls_service_name" && ! -L "$wants_dir/$tls_service_name" ]] || fail "managed enablement link survived uninstall"
+  [[ ! -e "$wants_dir/$legacy_tls_service_name" && ! -L "$wants_dir/$legacy_tls_service_name" ]] || fail "legacy enablement link survived uninstall"
+  [[ -L "$wants_dir/unrelated.service" ]] || fail "unrelated enablement link was removed"
+) || fail "TLS uninstall did not safely clean its user-unit enablement links"
 
 printf 'TLS Podman parent directory ownership checks\n'
 (

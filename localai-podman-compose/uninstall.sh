@@ -317,6 +317,7 @@ remove_unit_and_config() {
   local user_unit="$tls_state_dir/.config/systemd/user/$tls_service_name"
   local compose_file="$tls_compose_dir/$tls_compose_file_name"
   log "Removing TLS proxy unit and compose artifacts"
+  remove_tls_user_unit_enablement
   if [[ -e "$user_unit" ]]; then
     localai_installer_check_managed_file "$user_unit" "TLS user unit" "${tls_uid:-0}" \
       '# Managed by LocalAI secureblue TLS installer.' 'Description=LocalAI TLS reverse proxy compose stack' || die "Refusing to remove an unrelated TLS unit."
@@ -355,6 +356,31 @@ remove_unit_and_config() {
     run0_pipe /usr/bin/rm -f -- "$(tls_host_unit_path "$tls_forward_socket_name")"
   fi
   run0_pipe /usr/bin/systemctl daemon-reload
+}
+
+remove_tls_user_unit_enablement() {
+  local expected_uid="${tls_uid:-0}" unit_dir="$tls_state_dir/.config/systemd/user"
+  local wants_dir="$tls_state_dir/.config/systemd/user/default.target.wants"
+  local unit link target resolved_target expected_target owner
+  local -a units=("$tls_service_name")
+  [[ "$legacy_tls_service_name" == "$tls_service_name" ]] || units+=("$legacy_tls_service_name")
+
+  if [[ ! -e "$wants_dir" && ! -L "$wants_dir" ]]; then return 0; fi
+  localai_installer_check_directory_chain "$wants_dir" "TLS unit enablement directory" "$expected_uid" || die "Refusing unsafe TLS unit enablement directory."
+
+  for unit in "${units[@]}"; do
+    link="$wants_dir/$unit"
+    [[ -e "$link" || -L "$link" ]] || continue
+    [[ -L "$link" ]] || die "Refusing to remove an unexpected non-symlink TLS enablement entry."
+    owner="$(/usr/bin/stat -c '%u' -- "$link")" || die "Could not inspect TLS unit enablement ownership."
+    [[ "$owner" == "$expected_uid" ]] || die "Refusing to remove TLS unit enablement not owned by the service account."
+    target="$(/usr/bin/readlink -- "$link")" || die "Could not inspect TLS unit enablement target."
+    resolved_target="$(/usr/bin/realpath -m -- "$wants_dir/$target")" || die "Could not resolve TLS unit enablement target."
+    expected_target="$(/usr/bin/realpath -m -- "$unit_dir/$unit")" || die "Could not resolve managed TLS unit path."
+    [[ "$resolved_target" == "$expected_target" ]] || die "Refusing to remove a TLS enablement link with an unexpected target."
+    log "Removing stale TLS user-unit enablement link for $unit"
+    run0_pipe /usr/bin/rm -f -- "$link"
+  done
 }
 
 selinux_port_state_file() {
@@ -514,26 +540,56 @@ tcp_port_local_override() {
 }
 
 tls_user_processes_running() {
-  local uid="$1" status=0 pid command
-  local listing
-  listing="$(/usr/bin/pgrep -u "$uid" -a 2>/dev/null)" || status=$?
+  local uid="$1" status=0 pid manager_status=0 manager_pid=0 manager_cgroup=""
+  local pids
+  pids="$(/usr/bin/pgrep -u "$uid" 2>/dev/null)" || status=$?
   case "$status" in
-    0) tls_user_process_listing_has_workloads "$listing" ;;
+    0) ;;
     1) return 1 ;;
     *) return 2 ;;
   esac
-}
 
-tls_user_process_listing_has_workloads() {
-  local listing="$1" pid command
-  while read -r pid command; do
-    [[ -n "$pid" && -n "$command" ]] || continue
-    if [[ "$command" =~ ^(/usr/lib/systemd/systemd|systemd)[[:space:]]+--user([[:space:]]|$) ]]; then
-      continue
+  localai_installer_user_manager_is_active "$uid" || manager_status=$?
+  case "$manager_status" in
+    0)
+      manager_pid="$(/usr/bin/systemctl show --property=MainPID --value "user@$uid.service" 2>/dev/null)" || return 2
+      manager_cgroup="$(/usr/bin/systemctl show --property=ControlGroup --value "user@$uid.service" 2>/dev/null)" || return 2
+      [[ "$manager_pid" =~ ^[0-9]+$ && "$manager_pid" -gt 1 && "$manager_cgroup" =~ ^/[A-Za-z0-9_./@-]+$ ]] || return 2
+      ;;
+    3) ;;
+    *) return 2 ;;
+  esac
+
+  while IFS= read -r pid; do
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 2
+    if [[ "$pid" == "$manager_pid" ]]; then
+      local pid_status=0
+      tls_user_pid_is_manager "$pid" "$uid" "$manager_pid" "$manager_cgroup" || pid_status=$?
+      case "$pid_status" in
+        0|3) continue ;;
+        1) return 0 ;;
+        *) return 2 ;;
+      esac
     fi
     return 0
-  done <<< "$listing"
+  done <<< "$pids"
   return 1
+}
+
+tls_user_pid_is_manager() {
+  local pid="$1" uid="$2" manager_pid="$3" manager_cgroup="$4" proc_root="${5:-/proc}"
+  local process_dir="$proc_root/$pid" executable real_uid effective_uid cgroup_path
+  local -a cmdline=()
+  [[ "$pid" == "$manager_pid" ]] || return 1
+  [[ -d "$process_dir" ]] || return 3
+  executable="$(/usr/bin/readlink -f -- "$process_dir/exe")" || return 2
+  [[ "$executable" == /usr/lib/systemd/systemd ]] || return 1
+  mapfile -d '' -t cmdline <"$process_dir/cmdline" || return 2
+  [[ "${cmdline[1]:-}" == --user ]] || return 1
+  read -r real_uid effective_uid < <(/usr/bin/awk '$1 == "Uid:" { print $2, $3; found = 1; exit } END { if (!found) exit 1 }' "$process_dir/status") || return 2
+  [[ "$real_uid" == "$uid" && "$effective_uid" == "$uid" ]] || return 1
+  cgroup_path="$(/usr/bin/awk -F: '$1 == "0" && $2 == "" { print $3; found = 1; exit } END { if (!found) exit 1 }' "$process_dir/cgroup")" || return 2
+  [[ "$cgroup_path" == "$manager_cgroup/init.scope" ]]
 }
 
 wait_for_tls_user_processes() {

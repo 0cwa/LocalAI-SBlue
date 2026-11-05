@@ -8,7 +8,7 @@ has been runtime-qualified on secureblue or on a GPU.
 - Add tray endpoint diagnostics, safe endpoint copying, and warning-gated terminal log access that stays open for review while keeping backend and TLS states independent.
 - Probe all configured writable LocalAI paths inside the existing container and document which paths hold persistent data or scratch files.
 - Prepare TLS Podman's rootless home parents, relabel the generated Caddyfile before validation, and restore exact SELinux port overrides on uninstall; nonempty root-owned legacy paths remain a manual review point.
-- Stop managed TLS units before removing their files, wait for service-account processes before account removal or state purge, and fail clearly when they remain active.
+- Stop managed TLS units before removing their files, remove only matching user-unit enablement links, wait for service-account workloads before account removal or state purge, and fail clearly when they remain active.
 - Retry TLS service-account removal briefly when a process is still exiting, and fail clearly if an explicitly requested removal remains blocked.
 
 - Add protected `localaictl backup` and explicitly confirmed overlay restore,
