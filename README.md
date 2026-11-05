@@ -242,7 +242,7 @@ the launcher with `localai-tray/uninstall.sh`.
 A clean host or disposable VM can run the bounded lifecycle checks and produce
 an allowlisted receipt. Host mode reboots automatically and refuses an
 existing LocalAI installation. See [lifecycle acceptance](docs/ACCEPTANCE.md)
-for setup, limitations, and resume instructions.
+for setup, limitations, and resume instructions. The [VM acceptance receipt](docs/acceptance-issue-3-vm.md) records one CPU-only run; it does not qualify a physical host or GPU.
 
 ## Troubleshooting
 
