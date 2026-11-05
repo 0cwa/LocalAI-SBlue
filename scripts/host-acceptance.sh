@@ -119,7 +119,7 @@ diagnose_vm_backup_with_proc_root() {
       'diagnostic backup-restore-backup-reason: '*)
         reason="${line#diagnostic backup-restore-backup-reason: }"
         case "$reason" in
-          service-stop|unit-ownership|capacity|unsafe-name|traversal-path|duplicate-member|link-cross-root|link-escape|hardlink|system-manager-tree|path-outside-roots|special-member|nested-member|privileged-mode|file-capability|config-member|persistent-root-type|missing-metadata|archive-read|unit-tree-validation|symlink|archive-validation|tar|lock-contention|config-guard|other)
+          service-stop|unit-ownership|capacity|configured-paths|archive-file-type|unsafe-name|traversal-path|duplicate-member|link-cross-root|link-escape|hardlink|system-manager-tree|path-outside-roots|special-member|nested-member|privileged-mode|file-capability|config-member|persistent-root-type|missing-metadata|archive-read|persistent-root-metadata|unit-path-outside-roots|unit-ancestor-metadata-missing|unit-ancestor-metadata-weakened|unit-tree-omitted|unit-tree-extra-entry|unit-tree-type-mismatch|unit-tree-file-mismatch|unit-tree-link-mismatch|unit-tree-unsupported-link|unit-tree-unexpected|unit-tree-entries-differ|unit-tree-check-exception|unit-tree-validation|symlink|archive-validation|helper-invocation|helper-validation|helper-exception|helper-no-diagnostic|helper-unclassified|tar|lock-contention|config-guard|other)
             printf 'diagnostic backup-restore-backup-reason: %s\n' "$reason" ;;
           *) printf 'diagnostic backup-restore-backup-reason: unknown\n' ;;
         esac ;;

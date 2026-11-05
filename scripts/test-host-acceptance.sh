@@ -135,7 +135,10 @@ fi
 #!/usr/bin/env bash
 case "$1" in
   backup)
-    if [[ "${TEST_BACKUP_FAIL:-0}" == 1 ]]; then printf 'localaictl: backup contains system manager unit configuration\n' >&2; exit 1; fi
+    if [[ "${TEST_BACKUP_FAIL:-0}" == 1 ]]; then
+      if [[ "${TEST_BACKUP_SILENT:-0}" != 1 ]]; then printf 'localaictl: %s\n' "${TEST_BACKUP_MESSAGE:-backup contains system manager unit configuration}" >&2; fi
+      exit 1
+    fi
     cp -- "$TEST_CONFIG" "$TEST_WORK/saved-config"
     cp -- "$TEST_MARKER" "$TEST_WORK/saved-marker"
     cp -- "$TEST_GRAPH_MARKER" "$TEST_WORK/saved-graph-marker"
@@ -194,6 +197,22 @@ EOF
     printf 'failed backup diagnostic fixture was accepted\n' >&2; exit 1
   fi
   rg -q '^diagnostic backup-restore-backup-reason: system-manager-tree$' "$receipt" || { printf 'backup failure was not reduced to an allowlisted category\n' >&2; exit 1; }
+  if TEST_BACKUP_FAIL=1 TEST_BACKUP_MESSAGE='backup weakens metadata on an installed user service unit ancestor' backup_acceptance_step "$test_work/unsafe-ancestor.tar.gz"; then
+    printf 'unsafe unit ancestor diagnostic fixture was accepted\n' >&2; exit 1
+  fi
+  rg -q '^diagnostic backup-restore-backup-reason: unit-ancestor-metadata-weakened$' "$receipt" || { printf 'unit ancestor validation failure was not classified\n' >&2; exit 1; }
+  if TEST_BACKUP_FAIL=1 TEST_BACKUP_MESSAGE='Traceback (most recent call last): ValueError: secret-path' backup_acceptance_step "$test_work/helper-exception.tar.gz"; then
+    printf 'helper exception diagnostic fixture was accepted\n' >&2; exit 1
+  fi
+  rg -q '^diagnostic backup-restore-backup-reason: helper-exception$' "$receipt" || { printf 'helper exception was not classified\n' >&2; exit 1; }
+  if TEST_BACKUP_FAIL=1 TEST_BACKUP_MESSAGE='shared backup archive helper is missing' backup_acceptance_step "$test_work/missing-helper.tar.gz"; then
+    printf 'missing helper diagnostic fixture was accepted\n' >&2; exit 1
+  fi
+  rg -q '^diagnostic backup-restore-backup-reason: helper-invocation$' "$receipt" || { printf 'helper invocation failure was not classified\n' >&2; exit 1; }
+  if TEST_BACKUP_FAIL=1 TEST_BACKUP_SILENT=1 backup_acceptance_step "$test_work/silent-failure.tar.gz"; then
+    printf 'silent helper failure fixture was accepted\n' >&2; exit 1
+  fi
+  rg -q '^diagnostic backup-restore-backup-reason: helper-no-diagnostic$' "$receipt" || { printf 'silent helper failure was not distinguished\n' >&2; exit 1; }
   ! rg -q 'system manager unit configuration|suppressed fixture output|/var/home|secret' "$receipt" "$test_work/step-output" || { printf 'raw backup diagnostic escaped into acceptance output\n' >&2; exit 1; }
   ! rg -q 'suppressed fixture output|/var/home|secret' "$receipt" "$test_work/step-output" || { printf 'acceptance output leaked fixture data\n' >&2; exit 1; }
 )
@@ -325,7 +344,7 @@ ssh() {
         printf 'step install: fail\n'; return 1
       fi
       printf 'step install: pass\n' ;;
-    *' diagnose-backup') : >"$vm_mock_dir/diagnose-command-seen"; printf 'step backup-restore-backup: fail\ndiagnostic backup-restore-backup-reason: system-manager-tree\n'; return 1 ;;
+    *' diagnose-backup') : >"$vm_mock_dir/diagnose-command-seen"; printf 'step backup-restore-backup: fail\ndiagnostic backup-restore-backup-reason: %s\n' "${MOCK_BACKUP_REASON:-system-manager-tree}"; return 1 ;;
     *' verify')
       if [[ "${MOCK_VERIFY_FAIL:-0}" == 1 ]]; then : >"$vm_mock_dir/verify-failure-seen"; printf 'step verify: fail\n'; return 1; fi
       printf 'step verify: pass\n' ;;
@@ -442,6 +461,12 @@ fi
 if [[ "$result" != $'step backup-restore-backup: fail\ndiagnostic backup-restore-backup-reason: system-manager-tree' ]]; then
   printf 'VM diagnostic control did not sanitize its fixed mock response\n' >&2; exit 1
 fi
+if result="$(MOCK_BACKUP_REASON=unit-ancestor-metadata-weakened HOME="$vm_mock_dir/test-home-alias" diagnose_vm_backup_with_proc_root "$vm_mock_dir/key" "$proc_fixture" 2>/dev/null)"; then
+  printf 'VM diagnostic accepted a failed ancestor metadata probe\n' >&2; exit 1
+fi
+[[ "$result" == $'step backup-restore-backup: fail\ndiagnostic backup-restore-backup-reason: unit-ancestor-metadata-weakened' ]] || {
+  printf 'VM diagnostic did not preserve a fixed detailed failure category\n' >&2; exit 1;
+}
 result="$(HOME="$vm_mock_dir/test-home-alias" main --release-vm-diagnostic-pause)" || { printf 'diagnostic pause release mock failed\n' >&2; exit 1; }
 [[ "$result" == 'diagnostic-pause: release-requested' && -f "$diagnostic_scratch/diagnostic-release" && ! -L "$diagnostic_scratch/diagnostic-release" ]] || {
   printf 'diagnostic pause release state did not match expected\n' >&2; exit 1;

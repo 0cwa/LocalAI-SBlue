@@ -251,6 +251,8 @@ backup_acceptance_step() {
       *"could not stop "*|*"could not verify that "*|*"cannot determine a stable "*" service state"*) reason=service-stop ;;
       *"not verifiably managed"*|*"unit is not owned"*|*"unit owner"*|*"service unit is not"*) reason=unit-ownership ;;
       *"insufficient free disk space"*|*"No space left on device"*|*"quota exceeded"*) reason=capacity ;;
+      *"configured backup paths must be distinct absolute paths"*) reason=configured-paths ;;
+      *"backup must be a regular non-linked file"*) reason=archive-file-type ;;
       *"backup contains an unsafe member name"*) reason=unsafe-name ;;
       *"backup contains a traversal path"*) reason=traversal-path ;;
       *"backup contains duplicate member names"*) reason=duplicate-member ;;
@@ -267,12 +269,29 @@ backup_acceptance_step() {
       *"configured persistent path must be archived as a directory"*) reason=persistent-root-type ;;
       *"backup metadata is missing"*) reason=missing-metadata ;;
       *"cannot read backup archive"*) reason=archive-read ;;
-      *"backup omits an installed user service unit tree"*|*"backup weakens metadata on an installed user service unit ancestor"*|*"backup user unit tree entries differ"*|*"backup contains unsafe or changed systemd unit configuration"*) reason=unit-tree-validation ;;
+      *"backup weakens metadata on an installed persistent root"*) reason=persistent-root-metadata ;;
+      *"backup unit path is outside configured persistent roots"*) reason=unit-path-outside-roots ;;
+      *"backup omits directory metadata for the installed user service unit tree"*) reason=unit-ancestor-metadata-missing ;;
+      *"backup weakens metadata on an installed user service unit ancestor"*) reason=unit-ancestor-metadata-weakened ;;
+      *"backup omits an installed user service unit tree"*) reason=unit-tree-omitted ;;
+      *"backup has a user unit absent from the installed tree"*) reason=unit-tree-extra-entry ;;
+      *"backup user unit entry type differs from the installed tree"*) reason=unit-tree-type-mismatch ;;
+      *"backup user unit file differs from the installed tree"*) reason=unit-tree-file-mismatch ;;
+      *"backup user unit link differs from the installed tree"*) reason=unit-tree-link-mismatch ;;
+      *"backup contains an unsupported user service unit link"*) reason=unit-tree-unsupported-link ;;
+      *"backup user unit tree is absent from the installed tree"*) reason=unit-tree-unexpected ;;
+      *"backup user unit tree entries differ"*) reason=unit-tree-entries-differ ;;
+      *"cannot verify the installed user service unit tree ("*) reason=unit-tree-check-exception ;;
+      *"backup contains unsafe or changed systemd unit configuration"*) reason=unit-tree-validation ;;
       *"backup contains an unsafe symbolic link"*) reason=symlink ;;
-      *"unsupported or unsafe filesystem entries"*|*"backup contains an unsafe"*|*"backup contains unsupported"*|*"symbolic link"*|*"file capability"*|*"setuid or setgid"*) reason=archive-validation ;;
       *"archive creation failed"*|*"tar: "*|*"Unexpected EOF"*|*"Write error"*) reason=tar ;;
       *"already running"*) reason=lock-contention ;;
       *"configuration file must"*) reason=config-guard ;;
+      *"shared backup archive helper is missing"*|*"command not found"*|*"No such file or directory"*|*"could not invoke"*) reason=helper-invocation ;;
+      *"Traceback"*|*"TypeError"*|*"ValueError"*|*"PermissionError"*|*"AttributeError"*) reason=helper-exception ;;
+      *"unsupported or unsafe filesystem entries"*|*"backup contains an unsafe"*|*"backup contains unsupported"*|*"symbolic link"*|*"file capability"*|*"setuid or setgid"*) reason=helper-validation ;;
+      "") reason=helper-no-diagnostic ;;
+      *) reason=helper-unclassified ;;
     esac
     printf 'step backup-restore-backup: %s\n' "$([[ "$status" == 124 ]] && printf timeout || printf fail)" >>"$receipt"
     printf 'diagnostic backup-restore-backup-reason: %s\n' "$reason" >>"$receipt"
