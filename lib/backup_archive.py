@@ -428,8 +428,16 @@ def validate_graphroot_path(
                                info.st_mode & 0o7000 != 0)
                 if (info.st_uid != service_uid or info.st_gid != service_gid or unsafe_mode):
                     fail("configured rootless graphroot service home is public or has unexpected ownership")
-            elif info.st_uid != service_uid or mode & 0o077 or info.st_mode & 0o7000:
-                fail("configured rootless graphroot service-home ancestry is public")
+            elif info.st_uid != service_uid:
+                fail("configured rootless graphroot service-home ancestry has unexpected ownership")
+            elif mode & 0o077:
+                if os.environ.get("LOCALAI_ACCEPTANCE_DIAGNOSTIC") == "1":
+                    relative = os.path.relpath(path, service_home)
+                    depth = relative.count(os.sep) + 1
+                    print(f"localaictl: diagnostic-graphroot-ancestor-mode:depth-{depth}:mode-{mode:04o}", file=sys.stderr)
+                fail("configured rootless graphroot service-home ancestry is publicly traversable")
+            elif info.st_mode & 0o7000:
+                fail("configured rootless graphroot service-home ancestry has special permission bits")
         elif path != "/" and info.st_uid != 0:
             fail("configured rootless graphroot ancestry has an unexpected owner")
     if graphroot_exists:

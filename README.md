@@ -361,6 +361,10 @@ is included as its own persistent root. GraphRoot mountpoints, nested mounts,
 unsafe ancestry, or overlap with host user service-unit trees cause backup or
 restore to stop before changing state. `--exclude-models` is refused if the
 configured models path overlaps GraphRoot.
+The installer keeps the default `$HOME/.local/share/containers` ancestors
+service-owned, mode `0700`, and free of ACLs so other local users cannot
+traverse toward the store. External GraphRoots must meet the same private
+ancestry checks; backup and restore refuse to change a store that does not.
 
 Backups contain the TLS CA private key and the LocalAI authentication database.
 Store them as sensitive data. Restore into matching configured paths. It

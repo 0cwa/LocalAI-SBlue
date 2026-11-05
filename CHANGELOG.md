@@ -27,6 +27,8 @@ has been runtime-qualified on secureblue or on a GPU.
   or subordinate UID/GID mappings differ from the archive.
 - Allow the installer's private 0750 service home while keeping GraphRoot
   descendants private, and require writable non-special GraphRoot root modes.
+- Keep default rootless Podman GraphRoot ancestors private and ACL-free during
+  installation so local users cannot traverse toward the store.
 - Use the configured service account for rootless Podman inspection and add a
   durable restore marker that blocks backend startup after uncertain rollback.
 - Bound archive member, path, pax metadata, and expanded-size processing; reject

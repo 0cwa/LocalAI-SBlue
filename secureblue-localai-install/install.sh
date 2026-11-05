@@ -300,6 +300,42 @@ ensure_service_user() {
   done
 }
 
+ensure_private_rootless_storage_ancestry() {
+  local path
+  local -a paths=(
+    "$state_dir/.local"
+    "$state_dir/.local/share"
+    "$state_dir/.local/share/containers"
+  )
+  # Podman normally creates these ancestors with mode 0755. That lets other
+  # local users traverse the service home toward GraphRoot even though the
+  # store itself is private. Make each service-owned ancestor private before
+  # rootless Podman creates or inspects storage; never follow links or adopt
+  # an ACL-bearing directory.
+  for path in "$state_dir" "${paths[@]}"; do
+    localai_installer_check_directory_chain "$path" "LocalAI rootless storage path" "$service_uid" ||
+      die "Unsafe LocalAI rootless storage ancestry."
+    if [[ -d "$path" && ! -L "$path" ]] && ! /usr/bin/python3 - "$path" <<'PY'
+import os
+import sys
+
+try:
+    names = os.listxattr(sys.argv[1], follow_symlinks=False)
+except OSError:
+    raise SystemExit(1)
+raise SystemExit(1 if any(name in {"system.posix_acl_access", "system.posix_acl_default"} for name in names) else 0)
+PY
+    then
+      die "LocalAI rootless storage ancestry has an unverifiable ACL."
+    fi
+  done
+  for path in "${paths[@]}"; do
+    localai_installer_ensure_service_directory "$path" "LocalAI rootless storage ancestry" \
+      "$service_user" "$service_user" "$service_uid" 0700 ||
+      die "Could not make LocalAI rootless storage ancestry private."
+  done
+}
+
 preflight_existing_backend_state() {
   local service_unit="$state_dir/.config/systemd/user/localai.service"
   local manager_active=0 manager_status=0 old_name
@@ -785,6 +821,7 @@ fi
 
 log "Installing from LocalAI assets: $asset_dir"
 ensure_service_user
+ensure_private_rootless_storage_ancestry
 ensure_subids
 ensure_gpu_groups
 install_project_files

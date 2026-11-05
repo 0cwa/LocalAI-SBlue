@@ -381,7 +381,15 @@ ssh() {
         printf 'step install: fail\n'; return 1
       fi
       printf 'step install: pass\n' ;;
-    *' diagnose-backup') : >"$vm_mock_dir/diagnose-command-seen"; printf 'step backup-restore-backup: fail\ndiagnostic backup-restore-backup-reason: %s\n' "${MOCK_BACKUP_REASON:-system-manager-tree}"; return 1 ;;
+    *' diagnose-backup')
+      : >"$vm_mock_dir/diagnose-command-seen"
+      printf 'step backup-restore-backup: fail\ndiagnostic backup-restore-backup-reason: %s\n' "${MOCK_BACKUP_REASON:-system-manager-tree}"
+      if [[ "${MOCK_BACKUP_REASON:-}" == graphroot-ancestor-mode ]]; then
+        printf 'diagnostic backup-restore-controller-site: 267\n'
+        printf 'diagnostic backup-restore-helper-site: 438\n'
+        printf 'diagnostic backup-restore-graphroot-ancestor-mode: depth-1 mode-0755\n'
+      fi
+      return 1 ;;
     *' verify')
       if [[ "${MOCK_VERIFY_FAIL:-0}" == 1 ]]; then : >"$vm_mock_dir/verify-failure-seen"; printf 'step verify: fail\n'; return 1; fi
       printf 'step verify: pass\n' ;;
@@ -545,6 +553,12 @@ if result="$(MOCK_BACKUP_REASON=unit-ancestor-metadata-weakened HOME="$vm_mock_d
 fi
 [[ "$result" == $'diagnostic-worker: refreshed\ndiagnostic graphroot-unshare-poc-run: pass\ndiagnostic graphroot-unshare-poc-reason: user-xattr-failed\ndiagnostic guest-worker-prerequisite: debug-shell-active\ndiagnostic graphroot-unshare-owner-mode: fail\ndiagnostic graphroot-unshare-xattr: fail\ndiagnostic graphroot-unshare-selinux: fail\ndiagnostic graphroot-unshare-host-mapping: fail\nstep backup-restore-backup: fail\ndiagnostic backup-restore-backup-reason: unit-ancestor-metadata-weakened' ]] || {
   printf 'VM diagnostic did not preserve a fixed detailed failure category\n' >&2; exit 1;
+}
+if result="$(MOCK_BACKUP_REASON=graphroot-ancestor-mode HOME="$vm_mock_dir/test-home-alias" diagnose_vm_backup_with_proc_root "$vm_mock_dir/key" "$proc_fixture" 2>/dev/null)"; then
+  printf 'VM diagnostic accepted a public rootless storage ancestor\n' >&2; exit 1
+fi
+[[ "$result" == $'diagnostic-worker: refreshed\ndiagnostic graphroot-unshare-poc-run: pass\ndiagnostic graphroot-unshare-poc-reason: user-xattr-failed\ndiagnostic guest-worker-prerequisite: debug-shell-active\ndiagnostic graphroot-unshare-owner-mode: fail\ndiagnostic graphroot-unshare-xattr: fail\ndiagnostic graphroot-unshare-selinux: fail\ndiagnostic graphroot-unshare-host-mapping: fail\nstep backup-restore-backup: fail\ndiagnostic backup-restore-backup-reason: graphroot-ancestor-mode\ndiagnostic backup-restore-controller-site: 267\ndiagnostic backup-restore-helper-site: 438\ndiagnostic backup-restore-graphroot-ancestor-mode: depth-1 mode-0755' ]] || {
+  printf 'VM diagnostic did not preserve fixed graphroot ancestor details\n' >&2; exit 1;
 }
 result="$(HOME="$vm_mock_dir/test-home-alias" main --release-vm-diagnostic-pause)" || { printf 'diagnostic pause release mock failed\n' >&2; exit 1; }
 [[ "$result" == 'diagnostic-pause: release-requested' && -f "$diagnostic_scratch/diagnostic-release" && ! -L "$diagnostic_scratch/diagnostic-release" ]] || {

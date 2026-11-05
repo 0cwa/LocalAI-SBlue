@@ -140,7 +140,7 @@ report_qemu_exit() {
 
 diagnose_vm_backup_with_proc_root() {
   local key_arg="$1" proc_root="$2"
-  local scratch canonical_scratch active connection port key known_hosts known_hosts_dir run_name canonical_known_hosts qemu_pid qemu_start expected_exe worker controller helper source_target source_file target_file target_dir mode output line status=0 reason
+  local scratch canonical_scratch active connection port key known_hosts known_hosts_dir run_name canonical_known_hosts qemu_pid qemu_start expected_exe worker controller helper source_target source_file target_file target_dir mode output line site_name site_line status=0 reason
   local -a connection_fields=() ssh_args=()
   [[ "$key_arg" == /* ]] || { usage >&2; exit 2; }
   key="$(realpath -e -- "$key_arg")" || fail 'VM diagnostic identity is unavailable.'
@@ -189,7 +189,7 @@ diagnose_vm_backup_with_proc_root() {
     mode=0644
     [[ "$target_file" == */bin/localaictl ]] && mode=0755
     if ! timeout 30s ssh "${ssh_args[@]}" root@127.0.0.1 \
-      "test -d $target_dir && test ! -L $target_dir && install -o root -g root -m $mode /dev/stdin $target_file" \
+      "test -d $target_dir && test ! -L $target_dir && test ! -L $target_file && install -o root -g root -m $mode /dev/stdin $target_file" \
       <"$source_file" >/dev/null 2>&1; then
       fail 'could not refresh a fixed VM diagnostic component.'
     fi
@@ -230,6 +230,11 @@ diagnose_vm_backup_with_proc_root() {
   fi
   while IFS= read -r line; do
     case "$line" in
+      'diagnostic backup-restore-backup-reason: graphroot-ancestor-owner'|'diagnostic backup-restore-backup-reason: graphroot-ancestor-mode'|'diagnostic backup-restore-backup-reason: graphroot-ancestor-special')
+        printf '%s\n' "$line"
+        continue ;;
+    esac
+    case "$line" in
       'command backup-restore-backup: localaictl backup with root-owned config and persistent marker'|'waiting backup-restore-backup: timeout 1800s'|'step backup-restore-backup: pass'|'step backup-restore-backup: fail'|'step backup-restore-backup: timeout')
         printf '%s\n' "$line" ;;
       'diagnostic backup-restore-backup-reason: '*)
@@ -242,7 +247,14 @@ diagnose_vm_backup_with_proc_root() {
       'diagnostic backup-restore-controller-site: '*|'diagnostic backup-restore-helper-site: '*)
         site_line="${line##*: }"
         if [[ "$site_line" =~ ^[0-9]{1,6}$ ]]; then
-          printf 'diagnostic %s: %s\n' "${line%%:*}" "$site_line"
+          site_name="${line#diagnostic }"
+          site_name="${site_name%%:*}"
+          printf 'diagnostic %s: %s\n' "$site_name" "$site_line"
+        fi ;;
+      'diagnostic backup-restore-graphroot-ancestor-mode: '*)
+        if [[ "$line" =~ ^diagnostic\ backup-restore-graphroot-ancestor-mode:\ depth-([0-9]{1,2})\ mode-([0-7]{4})$ ]]; then
+          printf 'diagnostic backup-restore-graphroot-ancestor-mode: depth-%s mode-%s\n' \
+            "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
         fi ;;
       'Acceptance step backup-restore-backup: fail ('*) printf 'step backup-restore-backup: fail\n' ;;
       'acceptance: '*) printf 'acceptance: fail\n' ;;

@@ -565,6 +565,9 @@ backup_acceptance_step() {
       *"shared backup archive helper is missing"*|*"command not found"*|*"No such file or directory"*|*"could not invoke"*) reason=helper-invocation ;;
       *"backup completed but one or more previously active services could not be restarted"*) reason=service-restart ;;
       *"cannot verify the LocalAI service account"*|*"cannot verify rootless"*|*"rootless service account does not exist"*) reason=rootless-context ;;
+      *"service-home ancestry has unexpected ownership"*) reason=graphroot-ancestor-owner ;;
+      *"service-home ancestry is publicly traversable"*) reason=graphroot-ancestor-mode ;;
+      *"service-home ancestry has special permission bits"*) reason=graphroot-ancestor-special ;;
       *"subordinate ID"*|*"user namespace mapping"*|*"rootless namespace"*) reason=rootless-mapping ;;
       *"rootless archive"*|*"rootless graphroot archive"*|*"rootless graphroot extraction"*) reason=rootless-archive ;;
       *"backup metadata"*) reason=archive-metadata ;;
@@ -577,8 +580,13 @@ backup_acceptance_step() {
     printf 'diagnostic backup-restore-backup-reason: %s\n' "$reason" >>"$receipt"
     if [[ "$output" =~ diagnostic-controller-site:([0-9]{1,6}) ]]; then
       printf 'diagnostic backup-restore-controller-site: %s\n' "${BASH_REMATCH[1]}" >>"$receipt"
-    elif [[ "$output" =~ diagnostic-helper-site:([0-9]{1,6}) ]]; then
+    fi
+    if [[ "$output" =~ diagnostic-helper-site:([0-9]{1,6}) ]]; then
       printf 'diagnostic backup-restore-helper-site: %s\n' "${BASH_REMATCH[1]}" >>"$receipt"
+    fi
+    if [[ "$output" =~ diagnostic-graphroot-ancestor-mode:depth-([0-9]{1,2}):mode-([0-7]{4}) ]]; then
+      printf 'diagnostic backup-restore-graphroot-ancestor-mode: depth-%s mode-%s\n' \
+        "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" >>"$receipt"
     fi
   fi
   unset output

@@ -1077,13 +1077,48 @@ with tempfile.TemporaryDirectory(prefix="graphroot-home-mode-", dir=os.environ["
          patch.object(helper, "graphroot_mounts", return_value=[]):
         helper.validate_graphroot_path(graphroot, service_home, uid, gid, [service_home])
         os.chmod(private, 0o750)
-        with contextlib.redirect_stderr(io.StringIO()):
+        public_error = io.StringIO()
+        with patch.dict(os.environ, {"LOCALAI_ACCEPTANCE_DIAGNOSTIC": "1"}), \
+             contextlib.redirect_stderr(public_error):
             try:
                 helper.validate_graphroot_path(graphroot, service_home, uid, gid, [service_home])
             except SystemExit:
                 pass
             else:
                 raise SystemExit("graphroot accepted a public descendant directory")
+        if "service-home ancestry is publicly traversable" not in public_error.getvalue():
+            raise SystemExit("graphroot public descendant refusal lacked its fixed category")
+        if "diagnostic-graphroot-ancestor-mode:depth-1:mode-0750" not in public_error.getvalue():
+            raise SystemExit("graphroot mode diagnostic exposed an unexpected category or value")
+        os.chmod(private, 0o700)
+        def wrong_owner_lstat(path, *args, **kwargs):
+            if os.fspath(path) == private:
+                fields = list(real_lstat(path, *args, **kwargs))
+                fields[4] = uid + 1
+                return os.stat_result(fields)
+            return ancestry_lstat(path, *args, **kwargs)
+        owner_error = io.StringIO()
+        with patch.object(helper.os, "lstat", side_effect=wrong_owner_lstat), \
+             contextlib.redirect_stderr(owner_error):
+            try:
+                helper.validate_graphroot_path(graphroot, service_home, uid, gid, [service_home])
+            except SystemExit:
+                pass
+            else:
+                raise SystemExit("graphroot accepted an ancestor with unexpected ownership")
+        if "service-home ancestry has unexpected ownership" not in owner_error.getvalue():
+            raise SystemExit("graphroot owner refusal lacked its fixed category")
+        os.chmod(private, 0o2700)
+        special_error = io.StringIO()
+        with contextlib.redirect_stderr(special_error):
+            try:
+                helper.validate_graphroot_path(graphroot, service_home, uid, gid, [service_home])
+            except SystemExit:
+                pass
+            else:
+                raise SystemExit("graphroot accepted special permission bits on an ancestor")
+        if "service-home ancestry has special permission bits" not in special_error.getvalue():
+            raise SystemExit("graphroot special-bit refusal lacked its fixed category")
         os.chmod(private, 0o700)
         os.chmod(graphroot, 0o500)
         with contextlib.redirect_stderr(io.StringIO()):
