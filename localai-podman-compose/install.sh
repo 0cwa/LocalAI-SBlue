@@ -1009,35 +1009,54 @@ tcp_port_local_override() {
   tcp_port_match_from_listing "$listing" "$port"
 }
 
-tcp_port_type() {
-  local port="$1" override listing match
-  override="$(tcp_port_local_override "$port")" || return 1
-  if [[ -n "$override" ]]; then
-    printf '%s\n' "${override#*|}"
-    return 0
-  fi
+tcp_port_base_match() {
+  local port="$1" listing
   listing="$(semanage port -l)" || return 1
-  match="$(tcp_port_match_from_listing "$listing" "$port")"
-  if [[ -n "$match" ]]; then printf '%s\n' "${match#*|}"; fi
+  tcp_port_match_from_listing "$listing" "$port"
+}
+
+tcp_port_type() {
+  local port="$1" override base_match
+  override="$(tcp_port_local_override "$port")" || return 1
+  base_match="$(tcp_port_base_match "$port")" || return 1
+  if [[ "$override" == exact\|* ]]; then
+    printf '%s\n' "${override#*|}"
+  elif [[ "$base_match" == exact\|* ]]; then
+    printf '%s\n' "${base_match#*|}"
+  elif [[ -n "$override" ]]; then
+    printf '%s\n' "${override#*|}"
+  elif [[ -n "$base_match" ]]; then
+    printf '%s\n' "${base_match#*|}"
+  fi
   return 0
 }
 
 selinux_port_change_action() {
-  case "$1" in
-    exact\|*) printf 'modify\n' ;;
+  local local_override="$1" base_match="$2"
+  case "$local_override" in
+    exact\|*) printf 'modify|modify|%s\n' "${local_override#*|}" ;;
     range\|*) return 2 ;;
-    '') printf 'add\n' ;;
+    '')
+      if [[ "$base_match" == exact\|* ]]; then
+        # semanage -m replaces an exact base-policy record and creates a local
+        # override; rollback must delete that override to reveal the base type.
+        printf 'add|modify|\n'
+      else
+        printf 'add|add|\n'
+      fi
+      ;;
     *) return 1 ;;
   esac
 }
 
 label_one_forward_selinux_port() {
   local role="$1" port="$2" purpose="$3"
-  local current_type action state_file status current_after local_override previous_type
+  local current_type action operation state_file status current_after local_override base_match previous_type
   [[ -n "$port" ]] || return 0
 
   state_file="$(selinux_port_state_file "$role")" || die "Invalid SELinux port role."
   local_override="$(tcp_port_local_override "$port")" || die "Could not inspect local SELinux port overrides."
+  base_match="$(tcp_port_base_match "$port")" || die "Could not inspect base SELinux port definitions."
   current_type="$(tcp_port_type "$port")" || die "Could not resolve SELinux type for TCP port $port."
 
   if [[ "$current_type" == "$tls_selinux_port_type" ]]; then
@@ -1045,9 +1064,7 @@ label_one_forward_selinux_port() {
     return 0
   fi
 
-  action="$(selinux_port_change_action "$local_override")" || die "Refusing to replace an administrator-defined SELinux port range."
-  previous_type=''
-  [[ "$action" == modify ]] && previous_type="${local_override#*|}"
+  IFS='|' read -r action operation previous_type < <(selinux_port_change_action "$local_override" "$base_match") || die "Refusing to replace an administrator-defined SELinux port range."
 
   cat >&2 <<EOF
 
@@ -1059,7 +1076,7 @@ systemd_socket_proxyd_port_t type. Scope: this one TCP port label only.
 EOF
 
   localai_installer_write_selinux_port_state "$role" "$action" "$port" "$previous_type" "$tls_selinux_port_type" || die "Could not save root-owned SELinux rollback metadata."
-  if [[ "$action" == modify ]]; then
+  if [[ "$operation" == modify ]]; then
     run0_pipe semanage port -m -t "$tls_selinux_port_type" -p tcp "$port" || status=$?
   else
     run0_pipe semanage port -a -t "$tls_selinux_port_type" -p tcp "$port" || status=$?

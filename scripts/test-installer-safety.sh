@@ -584,6 +584,7 @@ printf 'SELinux TCP port override classification checks\n'
 (
   source_production_function "$repo_root/localai-podman-compose/install.sh" tcp_port_match_from_listing
   source_production_function "$repo_root/localai-podman-compose/install.sh" tcp_port_local_override
+  source_production_function "$repo_root/localai-podman-compose/install.sh" tcp_port_base_match
   source_production_function "$repo_root/localai-podman-compose/install.sh" tcp_port_type
   source_production_function "$repo_root/localai-podman-compose/install.sh" selinux_port_change_action
   # shellcheck disable=SC2329
@@ -591,19 +592,22 @@ printf 'SELinux TCP port override classification checks\n'
     [[ "$1" == port && "$2" == -l ]] || return 90
     if [[ "${3:-}" == -C ]]; then printf '%s\n' "$mock_local_ports"; else printf '%s\n' "$mock_base_ports"; fi
   }
-  mock_base_ports=$'unreserved_port_t tcp 1024-65535\nhttp_port_t tcp 80, 443'
+  mock_base_ports=$'unreserved_port_t tcp 1024-65535\nhttp_port_t tcp 80, 443\nreserved_port_t tcp 8443'
   mock_local_ports=''
   [[ "$(tcp_port_match_from_listing "$mock_base_ports" 18444)" == 'range|unreserved_port_t' ]]
   [[ -z "$(tcp_port_local_override 18444)" ]]
   [[ "$(tcp_port_type 18444)" == unreserved_port_t ]]
-  [[ "$(selinux_port_change_action "$(tcp_port_local_override 18444)")" == add ]]
+  [[ "$(selinux_port_change_action "$(tcp_port_local_override 18444)" "$(tcp_port_base_match 18444)")" == 'add|add|' ]]
+  [[ "$(tcp_port_base_match 8443)" == 'exact|reserved_port_t' ]]
+  [[ "$(tcp_port_type 8443)" == reserved_port_t ]]
+  [[ "$(selinux_port_change_action "$(tcp_port_local_override 8443)" "$(tcp_port_base_match 8443)")" == 'add|modify|' ]]
 
   mock_local_ports=$'custom_port_t tcp 18444\nadmin_range_t tcp 20000-21000'
   [[ "$(tcp_port_local_override 18444)" == 'exact|custom_port_t' ]]
   [[ "$(tcp_port_type 18444)" == custom_port_t ]]
-  [[ "$(selinux_port_change_action "$(tcp_port_local_override 18444)")" == modify ]]
+  [[ "$(selinux_port_change_action "$(tcp_port_local_override 18444)" "$(tcp_port_base_match 18444)")" == 'modify|modify|custom_port_t' ]]
   [[ "$(tcp_port_local_override 20444)" == 'range|admin_range_t' ]]
-  if selinux_port_change_action "$(tcp_port_local_override 20444)"; then
+  if selinux_port_change_action "$(tcp_port_local_override 20444)" "$(tcp_port_base_match 20444)"; then
     fail "administrator-defined SELinux port range was marked safe to modify"
   else
     [[ "$?" == 2 ]] || fail "administrator-defined SELinux port range returned an unexpected classification"
@@ -611,7 +615,54 @@ printf 'SELinux TCP port override classification checks\n'
 
   mock_local_ports='local_range_t tcp 18000-19000,18444'
   [[ "$(tcp_port_local_override 18444)" == 'exact|local_range_t' ]]
+  mock_local_ports=$'local_range_t tcp 18000-19000\nlocal_exact_t tcp 18444'
+  [[ "$(tcp_port_type 18444)" == local_exact_t ]]
+  [[ "$(selinux_port_change_action "$(tcp_port_local_override 18444)" "$(tcp_port_base_match 18444)")" == 'modify|modify|local_exact_t' ]]
 ) || fail "SELinux TCP port override classification failed"
+
+printf 'SELinux port rollback preserves local override state checks\n'
+(
+  source_production_function "$repo_root/localai-podman-compose/install.sh" restore_forward_selinux_port_if_tracked
+  # shellcheck disable=SC2034
+  tls_selinux_port_type=systemd_socket_proxyd_port_t
+  mock_state_file="$scratch/selinux-port-state"
+  mock_base_type=reserved_port_t mock_local_override=systemd_socket_proxyd_port_t
+  touch "$mock_state_file"
+  # shellcheck disable=SC2329
+  selinux_port_state_file() { printf '%s\n' "$mock_state_file"; }
+  # shellcheck disable=SC2329
+  localai_installer_read_selinux_port_state() { printf '%s\n' "$mock_state"; }
+  # shellcheck disable=SC2329
+  tcp_port_type() { [[ -n "$mock_local_override" ]] && printf '%s\n' "$mock_local_override" || printf '%s\n' "$mock_base_type"; }
+  # shellcheck disable=SC2329
+  require_cmd() { :; }
+  # shellcheck disable=SC2329
+  log() { :; }
+  # shellcheck disable=SC2329
+  die() { fail "$*"; }
+  # shellcheck disable=SC2329
+  run0_pipe() {
+    printf '%s\n' "$*" >> "$scratch/selinux-port-rollback-calls"
+    if [[ "$3" == -d ]]; then mock_local_override=''
+    elif [[ "$3" == -m ]]; then mock_local_override="$5"
+    fi
+  }
+  # shellcheck disable=SC2329
+  localai_installer_remove_selinux_port_state() { : > "$scratch/selinux-port-removed"; }
+
+  mock_state='add|8443||systemd_socket_proxyd_port_t'
+  restore_forward_selinux_port_if_tracked public
+  [[ -z "$mock_local_override" && "$(tcp_port_type 8443)" == reserved_port_t ]]
+  rg -q '^semanage port -d -p tcp 8443$' "$scratch/selinux-port-rollback-calls"
+
+  : > "$scratch/selinux-port-rollback-calls"
+  : > "$scratch/selinux-port-removed"
+  mock_local_override=systemd_socket_proxyd_port_t
+  mock_state='modify|18444|admin_port_t|systemd_socket_proxyd_port_t'
+  restore_forward_selinux_port_if_tracked internal
+  [[ "$mock_local_override" == admin_port_t ]]
+  rg -q '^semanage port -m -t admin_port_t -p tcp 18444$' "$scratch/selinux-port-rollback-calls"
+) || fail "SELinux port rollback did not restore the original local override state"
 
 printf 'TLS Podman parent directory ownership checks\n'
 (
