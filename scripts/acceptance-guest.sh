@@ -53,6 +53,14 @@ evidence_mode_for_host() {
   esac
 }
 
+acceptance_guest_work_dir() {
+  local scratch="$1" canonical_scratch work
+  canonical_scratch="$(realpath -e -- "$scratch")" || return 1
+  [[ -d "$canonical_scratch" && ! -L "$canonical_scratch" ]] || return 1
+  work="$(mktemp -d "$canonical_scratch/guest.XXXXXX")" || return 1
+  realpath -e -- "$work"
+}
+
 wait_for_health() {
   local controller="$1" output deadline=$((SECONDS + 80))
   while (( SECONDS < deadline )); do
@@ -151,7 +159,7 @@ if [[ "$mode" == host ]]; then
 else
   scratch="${HOME:?}/agent-scratch/LocalAI-SBlue/host-acceptance"
   mkdir -p "$scratch"
-  work="$(mktemp -d "$scratch/guest.XXXXXX")"
+  work="$(acceptance_guest_work_dir "$scratch")" || fail 'could not prepare canonical acceptance scratch.'
   progress=''
   receipt="$work/receipt"
   : >"$receipt"
@@ -251,6 +259,10 @@ backup_acceptance_step() {
       *"could not stop "*|*"could not verify that "*|*"cannot determine a stable "*" service state"*) reason=service-stop ;;
       *"not verifiably managed"*|*"unit is not owned"*|*"unit owner"*|*"service unit is not"*) reason=unit-ownership ;;
       *"insufficient free disk space"*|*"No space left on device"*|*"quota exceeded"*) reason=capacity ;;
+      *"backup destination parent must not contain symbolic links or traversal components"*) reason='destination-parent-unsafe' ;;
+      *"backup destination already exists"*) reason='destination-exists' ;;
+      *"backup destination directory does not exist"*) reason='destination-directory' ;;
+      *"backup destination must be outside the configuration and persistent data paths"*) reason='destination-overlap' ;;
       *"configured backup paths must be distinct absolute paths"*) reason=configured-paths ;;
       *"backup must be a regular non-linked file"*) reason=archive-file-type ;;
       *"backup contains an unsafe member name"*) reason=unsafe-name ;;

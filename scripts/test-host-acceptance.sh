@@ -15,6 +15,22 @@ work="$(test_mktemp_dir acceptance-steps)"
 trap 'rm -rf -- "$work"' EXIT
 receipt="$work/receipt"
 : >"$receipt"
+# Guest backup destinations must use a canonical path even when HOME's
+# agent-scratch prefix is a symlink alias.
+(
+  # shellcheck disable=SC1090
+  source <(sed -n '/^acceptance_guest_work_dir() {$/,/^}/p' "$repo_root/scripts/acceptance-guest.sh")
+  canonical_root="$work/real-scratch"
+  alias_root="$work/scratch-alias"
+  mkdir -m 0700 "$canonical_root"
+  ln -s "$canonical_root" "$alias_root"
+  created="$(acceptance_guest_work_dir "$alias_root")"
+  canonical_root="$(realpath -e -- "$canonical_root")"
+  [[ "$created" == "$canonical_root"/guest.* && -d "$created" && ! -L "$created" ]] || {
+    printf 'acceptance guest scratch path was not canonicalized\n' >&2; exit 1;
+  }
+  rm -rf -- "$created"
+)
 localai_acceptance_step success 2 "$receipt" bash -c 'printf secret-value'
 if localai_acceptance_step rejected 2 "$receipt" bash -c 'printf secret-value >&2; exit 7'; then
   printf 'Failed command was accepted\n' >&2; exit 1
@@ -197,6 +213,10 @@ EOF
     printf 'failed backup diagnostic fixture was accepted\n' >&2; exit 1
   fi
   rg -q '^diagnostic backup-restore-backup-reason: system-manager-tree$' "$receipt" || { printf 'backup failure was not reduced to an allowlisted category\n' >&2; exit 1; }
+  if TEST_BACKUP_FAIL=1 TEST_BACKUP_MESSAGE='backup destination parent must not contain symbolic links or traversal components' backup_acceptance_step "$test_work/symlinked-parent.tar.gz"; then
+    printf 'unsafe backup destination parent diagnostic fixture was accepted\n' >&2; exit 1
+  fi
+  rg -q '^diagnostic backup-restore-backup-reason: destination-parent-unsafe$' "$receipt" || { printf 'backup destination parent failure was not classified\n' >&2; exit 1; }
   if TEST_BACKUP_FAIL=1 TEST_BACKUP_MESSAGE='backup weakens metadata on an installed user service unit ancestor' backup_acceptance_step "$test_work/unsafe-ancestor.tar.gz"; then
     printf 'unsafe unit ancestor diagnostic fixture was accepted\n' >&2; exit 1
   fi
