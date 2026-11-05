@@ -374,10 +374,11 @@ chmod 0700 "$diagnostic_scratch"
 read -r diagnostic_key_type diagnostic_key_data _ <"$vm_mock_dir/hostkey.pub"
 printf '[127.0.0.1]:23456 %s %s\n' "$diagnostic_key_type" "$diagnostic_key_data" >"$diagnostic_run/known_hosts"
 chmod 0600 "$diagnostic_run/known_hosts" "$vm_mock_dir/key"
-printf '23456\n%s\n%s\n' "$vm_mock_dir/key" "$diagnostic_run/known_hosts" >"$diagnostic_scratch/diagnostic-connection"
+printf '23456\n%s\n' "$diagnostic_run/known_hosts" >"$diagnostic_scratch/diagnostic-connection"
 : >"$diagnostic_scratch/diagnostic-active"
 chmod 0600 "$diagnostic_scratch/diagnostic-connection" "$diagnostic_scratch/diagnostic-active"
-if result="$(HOME="$vm_mock_dir/test-home" main --diagnose-vm-backup 2>/dev/null)"; then
+[[ "$(<"$diagnostic_scratch/diagnostic-connection")" != *"$vm_mock_dir/key"* ]] || { printf 'VM diagnostic connection stored an SSH identity path\n' >&2; exit 1; }
+if result="$(HOME="$vm_mock_dir/test-home" main --diagnose-vm-backup "$vm_mock_dir/key" 2>/dev/null)"; then
   printf 'VM diagnostic control accepted a failed backup probe\n' >&2; exit 1
 fi
 [[ "$result" == $'step backup-restore-backup: fail\ndiagnostic backup-restore-backup-reason: system-manager-tree' ]] || { printf 'VM diagnostic control did not sanitize its guest response\n' >&2; exit 1; }

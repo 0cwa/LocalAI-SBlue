@@ -11,7 +11,7 @@ diagnostic_connection_created=0
 usage() {
   printf '%s\n' 'Usage: host-acceptance.sh --vm BASE.qcow2 SSH_KEY UEFI_VARS SSH_HOST_PUBLIC_KEY'
   printf '%s\n' '       host-acceptance.sh --host [--resume]'
-  printf '%s\n' '       host-acceptance.sh --diagnose-vm-backup'
+  printf '%s\n' '       host-acceptance.sh --diagnose-vm-backup SSH_KEY'
   printf '%s\n' '       host-acceptance.sh --release-vm-diagnostic-pause'
   printf '%s\n' 'VM receipts go to stdout; host mode writes a receipt after reboot.'
 }
@@ -31,7 +31,8 @@ release_vm_diagnostic_pause() {
 diagnose_vm_backup() {
   local scratch active connection port key known_hosts worker output line status=0 reason
   local -a connection_fields=() ssh_args=()
-  [[ "$#" == 1 ]] || { usage >&2; exit 2; }
+  [[ "$#" == 2 && "$2" == /* ]] || { usage >&2; exit 2; }
+  key="$(realpath -e -- "$2")" || fail 'VM diagnostic identity is unavailable.'
   scratch="${HOME:?}/agent-scratch/LocalAI-SBlue/acceptance-vm"
   active="$scratch/diagnostic-active"
   connection="$scratch/diagnostic-connection"
@@ -39,10 +40,9 @@ diagnose_vm_backup() {
   [[ -f "$active" && ! -L "$active" && "$(stat -c '%u:%a' -- "$active")" == "$(id -u):600" ]] || fail 'VM diagnostic pause is not active.'
   [[ -f "$connection" && ! -L "$connection" && "$(stat -c '%u:%a' -- "$connection")" == "$(id -u):600" ]] || fail 'VM diagnostic connection is unavailable.'
   mapfile -t connection_fields <"$connection"
-  [[ "${#connection_fields[@]}" == 3 ]] || fail 'VM diagnostic connection is invalid.'
+  [[ "${#connection_fields[@]}" == 2 ]] || fail 'VM diagnostic connection is invalid.'
   port="${connection_fields[0]}"
-  key="${connection_fields[1]}"
-  known_hosts="${connection_fields[2]}"
+  known_hosts="${connection_fields[1]}"
   if [[ ! "$port" =~ ^[0-9]{1,5}$ ]]; then fail 'VM diagnostic connection is invalid.'; fi
   if (( 10#$port == 0 || 10#$port > 65535 )); then fail 'VM diagnostic connection is invalid.'; fi
   [[ "$key" == /* && ! -L "$key" && -f "$key" && "$(stat -c '%u' -- "$key")" == "$(id -u)" ]] || fail 'VM diagnostic identity is unavailable.'
@@ -189,7 +189,7 @@ cp -- "$vars" "$work/vars.fd"
 port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
 connection="$scratch/diagnostic-connection"
 [[ ! -e "$connection" && ! -L "$connection" ]] || fail 'VM diagnostic connection path is already occupied.'
-(umask 077; set -o noclobber; printf '%s\n%s\n%s\n' "$port" "$key" "$work/known_hosts" >"$connection") || fail 'could not prepare VM diagnostic connection.'
+(umask 077; set -o noclobber; printf '%s\n%s\n' "$port" "$work/known_hosts" >"$connection") || fail 'could not prepare VM diagnostic connection.'
 diagnostic_connection_created=1
 chmod 0600 -- "$connection"
 # QEMU's comma-separated drive syntax escapes a literal comma as two commas.
