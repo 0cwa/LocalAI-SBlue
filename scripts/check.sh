@@ -84,6 +84,9 @@ bash scripts/test-render-config.sh
 printf 'Writable runtime path checks\n'
 bash scripts/test-runtime-paths.sh
 
+printf 'Mocked writable runtime probe checks\n'
+bash scripts/test-runtime-writable-probe.sh
+
 printf 'Installer safety checks\n'
 bash scripts/test-installer-safety.sh
 
