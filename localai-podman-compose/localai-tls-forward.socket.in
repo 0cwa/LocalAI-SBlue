@@ -1,6 +1,7 @@
 [Unit]
 Description=LocalAI HTTPS socket
 Documentation=man:systemd.socket(5)
+ConditionPathExists=!/var/lib/.localaictl-backup-restore.pending
 
 [Socket]
 User=@LOCALAI_SERVICE_USER@

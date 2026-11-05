@@ -169,19 +169,8 @@ def owner_id_policy(root_path: str) -> tuple[int, int, str, list[tuple[int, int]
         username = pwd.getpwuid(root.st_uid).pw_name
     except (OSError, KeyError):
         fail("cannot verify configured persistent root ownership")
-    uid_ranges: list[tuple[int, int]] = []
-    gid_ranges: list[tuple[int, int]] = []
-    for filename, ranges in (("/etc/subuid", uid_ranges), ("/etc/subgid", gid_ranges)):
-        try:
-            with open(filename, encoding="ascii") as stream:
-                for line in stream:
-                    fields = line.rstrip("\n").split(":")
-                    if len(fields) == 3 and fields[0] in {username, str(root.st_uid)} and fields[1].isdigit() and fields[2].isdigit():
-                        start, length = int(fields[1]), int(fields[2])
-                        if length > 0 and start + length <= 2**32:
-                            ranges.append((start, start + length))
-        except (OSError, UnicodeError):
-            fail("cannot verify persistent root subordinate ID ranges")
+    uid_ranges, _ = validated_subid_ranges(username, "/etc/subuid", {str(root.st_uid)})
+    gid_ranges, _ = validated_subid_ranges(username, "/etc/subgid", {str(root.st_uid)})
     return root.st_uid, root.st_gid, username, uid_ranges, gid_ranges
 
 
@@ -280,7 +269,8 @@ def parse_id_map(value: str) -> list[tuple[int, int, int]]:
     return result
 
 
-def subid_ranges(account: str, filename: str) -> tuple[list[tuple[int, int]], list[tuple[str, int, int]]]:
+def subid_ranges(account: str, filename: str, aliases: set[str] | None = None) -> tuple[list[tuple[int, int]], list[tuple[str, int, int]]]:
+    account_names = {account, *(aliases or set())}
     own: list[tuple[int, int]] = []
     all_ranges: list[tuple[str, int, int]] = []
     try:
@@ -293,18 +283,16 @@ def subid_ranges(account: str, filename: str) -> tuple[list[tuple[int, int]], li
                 if length < 1:
                     fail("cannot verify rootless subordinate ID ranges")
                 all_ranges.append((fields[0], start, start + length))
-                if fields[0] == account:
+                if fields[0] in account_names:
                     own.append((start, start + length))
     except OSError:
         fail("cannot verify rootless subordinate ID ranges")
     return own, all_ranges
 
 
-def validate_id_map(value: str, primary_id: int, account: str, filename: str) -> list[tuple[int, int, int]]:
-    mapping = parse_id_map(value)
-    if mapping[0][0] != 0 or mapping[0][1] != primary_id or mapping[0][2] != 1:
-        fail("rootless namespace does not map its owner to the service account")
-    own_ranges, all_ranges = subid_ranges(account, filename)
+def validated_subid_ranges(account: str, filename: str, aliases: set[str] | None = None) -> tuple[list[tuple[int, int]], list[tuple[str, int, int]]]:
+    account_names = {account, *(aliases or set())}
+    own_ranges, all_ranges = subid_ranges(account, filename, aliases)
     account_file = "/etc/passwd" if filename.endswith("subuid") else "/etc/group"
     try:
         with open(account_file, encoding="ascii") as stream:
@@ -313,9 +301,26 @@ def validate_id_map(value: str, primary_id: int, account: str, filename: str) ->
                 if len(fields) > 2 and fields[2].isdecimal():
                     identity = int(fields[2])
                     if any(start <= identity < stop for start, stop in own_ranges):
-                        fail("rootless namespace subordinate IDs collide with a local account")
+                        fail("subordinate ID ranges collide with a local account")
     except OSError:
-        fail("cannot verify local account ID ranges")
+        fail("cannot verify local subordinate ID collisions")
+    for other, start, stop in all_ranges:
+        if other not in account_names and any(start < own_stop and own_start < stop for own_start, own_stop in own_ranges):
+            fail("subordinate ID ranges overlap another account")
+    return own_ranges, all_ranges
+
+
+def validate_id_map(value: str, primary_id: int, account: str, filename: str) -> list[tuple[int, int, int]]:
+    mapping = parse_id_map(value)
+    if mapping[0][0] != 0 or mapping[0][1] != primary_id or mapping[0][2] != 1:
+        fail("rootless namespace does not map its owner to the service account")
+    try:
+        service_uid = pwd.getpwnam(account).pw_uid
+    except KeyError:
+        fail("rootless service account does not exist")
+    aliases = {str(service_uid)}
+    account_aliases = {account, *aliases}
+    own_ranges, all_ranges = validated_subid_ranges(account, filename, aliases)
     expected_inside = 1
     outside_ranges: list[tuple[int, int]] = []
     for inside, outside, length in mapping[1:]:
@@ -326,7 +331,7 @@ def validate_id_map(value: str, primary_id: int, account: str, filename: str) ->
         if not any(start <= outside and end <= stop for start, stop in own_ranges):
             fail("rootless namespace maps IDs outside the service subordinate range")
         for other, start, stop in all_ranges:
-            if other != account and outside < stop and start < end:
+            if other not in account_aliases and outside < stop and start < end:
                 fail("rootless namespace ID ranges overlap another account")
         if any(outside < stop and start < end for start, stop in outside_ranges):
             fail("rootless namespace ID ranges overlap")
@@ -493,6 +498,10 @@ def rename_graphroot_noreplace(source: str, destination: str, expected: tuple[in
         if result != 0:
             error_number = ctypes.get_errno()
             fail("rootless graphroot no-replace rename failed" if error_number != 17 else "rootless graphroot rollback destination already exists")
+        renamed_info = os.stat(destination_name, dir_fd=parent_fd, follow_symlinks=False)
+        if expected is not None and (renamed_info.st_dev, renamed_info.st_ino) != expected:
+            fail("rootless graphroot identity changed during rename; recovery marker retained")
+        os.fsync(parent_fd)
     finally:
         os.close(parent_fd)
 
@@ -508,6 +517,7 @@ def create_graphroot_noreplace(path: str, service_uid: int, service_gid: int) ->
         parent_fd = open_directory_nofollow(parent)
         os.mkdir(name, 0o700, dir_fd=parent_fd)
         os.chown(name, service_uid, service_gid, dir_fd=parent_fd, follow_symlinks=False)
+        os.fsync(parent_fd)
     except FileExistsError:
         fail("rootless graphroot destination already exists")
     except OSError:
@@ -717,11 +727,11 @@ def validate_archive(
                     expected_uid = 0 if require_root_config else os.stat(config, follow_symlinks=False).st_uid
                     expected_gid = 0 if require_root_config else os.stat(config, follow_symlinks=False).st_gid
                     if (not info.isfile() or info.uid != expected_uid or info.gid != expected_gid or
-                            info.mode & 0o022 or info.mode & 0o007):
+                            info.mode & 0o022 or info.mode & 0o111):
                         ownership = "root-owned" if require_root_config else "owned by its source file owner"
-                        fail(f"backup configuration member must be a {ownership} regular file without public permissions")
-                if name in prefixes and not info.isdir():
-                    fail("configured persistent path must be archived as a directory")
+                        fail(f"backup configuration member must be a {ownership} regular file without write or execute permissions")
+                if name in prefixes and (not info.isdir() or info.mode & 0o700 != 0o700):
+                    fail("configured persistent root must be an owner-writable directory")
                 if name != config_name and name != "metadata":
                     root_name = member_root(name, prefixes)
                     if root_name is None:
@@ -761,6 +771,11 @@ def validate_archive(
             target_root = member_root(target, prefixes)
             if target not in members or not members[target].isfile() or root != target_root:
                 fail("backup contains an invalid hard link")
+            target_info = members[target]
+            if (info.uid, info.gid, info.mode) != (target_info.uid, target_info.gid, target_info.mode):
+                fail("backup hard link metadata differs from its target")
+            if sensitive_member(name) and target_info.mode & 0o027:
+                fail("backup sensitive hard link target has public or writable permissions")
     if "metadata" not in members or not members["metadata"].isfile():
         fail("backup metadata is missing")
     if nested_member is not None:
@@ -804,13 +819,143 @@ def validate_archive(
 
 
 def copy_source(source: str, destination: str) -> None:
-    fd = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    if not stat.S_ISREG(os.fstat(fd).st_mode):
-        os.close(fd)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        source_fd = os.open(source, flags)
+    except OSError:
         fail("restore source must be a regular non-linked file")
-    with os.fdopen(fd, "rb") as input_file, open(destination, "xb") as output_file:
-        shutil.copyfileobj(input_file, output_file)
-    os.chmod(destination, 0o600)
+    destination_fd = -1
+    try:
+        initial = os.fstat(source_fd)
+        if not stat.S_ISREG(initial.st_mode) or initial.st_size < 0 or initial.st_size > MAX_ARCHIVE_EXPANDED_BYTES:
+            fail("restore source must be a supported regular file")
+        destination_fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                                 getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0), 0o600)
+        remaining = initial.st_size
+        while remaining:
+            chunk = os.read(source_fd, min(1024 * 1024, remaining))
+            if not chunk:
+                fail("restore source changed while it was being staged")
+            view = memoryview(chunk)
+            while view:
+                written = os.write(destination_fd, view)
+                if written <= 0:
+                    fail("could not stage restore source safely")
+                view = view[written:]
+            remaining -= len(chunk)
+        final = os.fstat(source_fd)
+        path_final = os.stat(source, follow_symlinks=False)
+        identity_before = (initial.st_dev, initial.st_ino, initial.st_size, initial.st_mtime_ns, initial.st_ctime_ns)
+        identity_after = (final.st_dev, final.st_ino, final.st_size, final.st_mtime_ns, final.st_ctime_ns)
+        path_identity = (path_final.st_dev, path_final.st_ino, path_final.st_size, path_final.st_mtime_ns, path_final.st_ctime_ns)
+        if not stat.S_ISREG(path_final.st_mode):
+            fail("restore source path changed to a non-regular file while it was being staged")
+        if identity_before != identity_after:
+            fail("restore source descriptor changed while it was being staged")
+        if identity_before != path_identity:
+            fail("restore source changed while it was being staged")
+        os.fchmod(destination_fd, 0o600)
+        os.fsync(destination_fd)
+    except SystemExit:
+        try:
+            os.unlink(destination)
+        except FileNotFoundError:
+            pass
+        raise
+    except OSError:
+        try:
+            os.unlink(destination)
+        except FileNotFoundError:
+            pass
+        fail("could not stage restore source safely")
+    finally:
+        os.close(source_fd)
+        if destination_fd >= 0:
+            os.close(destination_fd)
+
+
+def sync_restore_filesystems(
+    archive_path: str,
+    config: str,
+    roots: list[str],
+    rootless_context: dict[str, str | int] | None = None,
+) -> None:
+    synced: set[tuple[int, int]] = set()
+
+    def sync_path(path: str) -> None:
+        probe = nearest_existing_path(path)
+        metadata = os.stat(probe, follow_symlinks=False)
+        filesystem = os.statvfs(probe)
+        key = (metadata.st_dev, int(getattr(filesystem, "f_fsid", metadata.st_dev)))
+        if key in synced:
+            return
+        descriptor = open_directory_nofollow(probe)
+        try:
+            syncfs = ctypes.CDLL(None, use_errno=True).syncfs
+            syncfs.argtypes = [ctypes.c_int]
+            syncfs.restype = ctypes.c_int
+            if syncfs(descriptor) != 0:
+                fail("could not durably flush restored data and directory metadata")
+        finally:
+            os.close(descriptor)
+        synced.add(key)
+
+    try:
+        with tarfile.open(archive_path, "r:gz") as archive:
+            for info in archive:
+                name = clean_member_name(info.name)
+                if name == "metadata":
+                    continue
+                if name == ROOTLESS_GRAPHROOT_MEMBER:
+                    if rootless_context is None:
+                        fail("cannot durably flush an unverified rootless graphroot")
+                    nested_stream = archive.extractfile(info)
+                    if nested_stream is None:
+                        fail("cannot read rootless graphroot for durable flush")
+                    preflight_tar_stream(nested_stream)
+                    with tarfile.open(fileobj=nested_stream, mode="r:") as nested:
+                        graphroot = str(rootless_context["graphroot"])
+                        prefix = posixpath.basename(graphroot.rstrip("/"))
+                        for nested_info in nested:
+                            nested_name = clean_member_name(nested_info.name)
+                            if nested_name != prefix and not nested_name.startswith(prefix + "/"):
+                                fail("rootless archive contains a path outside its graphroot")
+                            relative = nested_name[len(prefix):].lstrip("/")
+                            target = graphroot if not relative else os.path.join(graphroot, *relative.split("/"))
+                            sync_path(target if nested_info.isdir() else os.path.dirname(target))
+                    continue
+                target = "/" + name
+                sync_path(target if info.isdir() else os.path.dirname(target))
+            sync_path(os.path.dirname(config))
+    except (OSError, tarfile.TarError) as error:
+        fail(f"could not durably flush restored filesystems ({type(error).__name__})")
+
+
+def sync_staging_snapshot(snapshot: str, stage: str) -> None:
+    """Persist the rollback archive and staging directory before live mutation."""
+    try:
+        if os.path.lexists(snapshot):
+            fd = os.open(snapshot, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) |
+                         getattr(os, "O_CLOEXEC", 0))
+            try:
+                info = os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode):
+                    fail("rollback snapshot is not a regular file")
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            parent_fd = open_directory_nofollow(os.path.dirname(snapshot))
+            try:
+                os.fsync(parent_fd)
+            finally:
+                os.close(parent_fd)
+        stage_fd = open_directory_nofollow(stage)
+        try:
+            os.fsync(stage_fd)
+        finally:
+            os.close(stage_fd)
+    except OSError:
+        fail("could not durably persist rollback snapshot and staging directory")
 
 
 def stage_check(stage: str) -> None:
@@ -979,10 +1124,12 @@ def directory_metadata_not_weaker(staged: str, installed: str) -> bool:
     staged_xattrs = {
         name: os.getxattr(staged, name, follow_symlinks=False)
         for name in os.listxattr(staged, follow_symlinks=False)
+        if name != "security.selinux"
     }
     installed_xattrs = {
         name: os.getxattr(installed, name, follow_symlinks=False)
         for name in os.listxattr(installed, follow_symlinks=False)
+        if name != "security.selinux"
     }
     return staged_xattrs == installed_xattrs
 
@@ -1499,6 +1646,11 @@ def main() -> None:
             raise SystemExit(2)
         stage_check(sys.argv[2])
         return
+    if sys.argv[1:2] == ["sync-staging-snapshot"]:
+        if len(sys.argv) != 4:
+            raise SystemExit(2)
+        sync_staging_snapshot(sys.argv[2], sys.argv[3])
+        return
     if sys.argv[1:2] == ["restore-marker-check"]:
         if len(sys.argv) != 2:
             raise SystemExit(2)
@@ -1538,7 +1690,7 @@ def main() -> None:
             destinations = rest[1:]
         space_check(sys.argv[2], sys.argv[3], collision_file, destinations, staged=staged, rootless_context=rootless_context)
         return
-    if len(sys.argv) < 4 or sys.argv[1] not in {"validate", "validate-created", "members0", "collisions0", "destinations", "skip-links0", "unit-trees0", "rollback-new", "copy-source", "rootless-present"}:
+    if len(sys.argv) < 4 or sys.argv[1] not in {"validate", "validate-created", "members0", "collisions0", "destinations", "skip-links0", "unit-trees0", "rollback-new", "copy-source", "rootless-present", "sync-destinations"}:
         raise SystemExit(2)
     mode, archive, config = sys.argv[1:4]
     rest = sys.argv[4:]
@@ -1553,6 +1705,9 @@ def main() -> None:
         if len(rest) < 1:
             raise SystemExit(2)
         copy_source(archive, rest[-1])
+        return
+    if mode == "sync-destinations":
+        sync_restore_filesystems(archive, config, rest, rootless_context)
         return
     if mode == "rollback-new":
         if len(rest) < 3:

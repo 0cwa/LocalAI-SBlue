@@ -54,10 +54,20 @@ if [[ "${1:-}" == /usr/bin/python3 && "${2:-}" == "${LOCALAI_FAKE_BACKUP_HELPER:
     restore-marker-create)
       [[ ! -e "${LOCALAI_FAKE_TRANSACTION_MARKER:?}" ]] || exit 1
       printf 'synthetic pending transaction\n' >"$LOCALAI_FAKE_TRANSACTION_MARKER"
+      printf 'restore-marker-create\n' >>"${LOCALAI_FAKE_LOG:?}"
       exit 0
       ;;
     restore-marker-clear)
+      printf 'restore-marker-clear\n' >>"${LOCALAI_FAKE_LOG:?}"
       rm -f -- "${LOCALAI_FAKE_TRANSACTION_MARKER:?}"
+      exit 0
+      ;;
+    sync-destinations)
+      printf 'sync-destinations\n' >>"${LOCALAI_FAKE_LOG:?}"
+      exit 0
+      ;;
+    sync-staging-snapshot)
+      printf 'sync-staging-snapshot\n' >>"${LOCALAI_FAKE_LOG:?}"
       exit 0
       ;;
     rollback-new)
@@ -147,7 +157,10 @@ if [[ -n "${LOCALAI_DOCTOR_TOKEN+x}" ]]; then
   printf 'doctor token leaked to systemctl environment\n' >&2
   exit 97
 fi
-if [[ -e "${LOCALAI_FAKE_TRANSACTION_MARKER:-}" && " $* " == *" start localai.service "* ]]; then
+if [[ -e "${LOCALAI_FAKE_TRANSACTION_MARKER:-}" && ( " $* " == *" start localai.service "* ||
+      " $* " == *" start localai-tls-compose.service "* ||
+      " $* " == *" start localai-tls-forward.socket "* ||
+      " $* " == *" start localai-tls-forward.service "* ) ]]; then
   exit 1
 fi
 if [[ " $* " == *" is-active "* ]]; then
@@ -168,6 +181,7 @@ if [[ " $* " == *" show localai.service --property=Environment --value "* ]]; th
   printf 'LOCALAI_AUTH=true LOCALAI_AUTH_DATABASE_URL=%s/database.db LOCALAI_ADDRESS=127.0.0.1:11455\n' "${LOCALAI_FAKE_DATA_PATH:-/var/lib/localai/data}"
 fi
 if [[ " $* " == *" stop localai.service "* ]]; then printf 'inactive\n' >"${LOCALAI_FAKE_STATE_DIR}/backend"; fi
+if [[ "${LOCALAI_FAKE_FAIL_BACKEND:-false}" == true && " $* " == *" start localai.service "* ]]; then exit 1; fi
 if [[ " $* " == *" start localai.service "* ]]; then printf 'active\n' >"${LOCALAI_FAKE_STATE_DIR}/backend"; fi
 if [[ " $* " == *" stop localai-tls-compose.service "* ]]; then printf 'inactive\n' >"${LOCALAI_FAKE_STATE_DIR}/tls"; fi
 if [[ " $* " == *" start localai-tls-compose.service "* ]]; then printf 'active\n' >"${LOCALAI_FAKE_STATE_DIR}/tls"; fi
@@ -463,13 +477,82 @@ stop_tls_line="$(rg -n -- 'stop localai-tls-compose.service' "$tmp_dir/commands"
 stop_backend_line="$(rg -n -- 'stop localai.service' "$tmp_dir/commands" | head -n1 | cut -d: -f1)"
 (( stop_socket_line < stop_tls_line && stop_tls_line < stop_backend_line ))
 
+export LOCALAI_FAKE_FAIL_BACKEND=true
+: >"$tmp_dir/commands"
+if "$repo_root/bin/localaictl" start; then
+  printf 'start ignored a backend start failure\n' >&2
+  exit 1
+fi
+unset LOCALAI_FAKE_FAIL_BACKEND
+if rg -q 'start localai-tls-compose.service|start localai-tls-forward.socket' "$tmp_dir/commands"; then
+  printf 'start activated TLS after a backend start failure\n' >&2
+  exit 1
+fi
+
+(
+  # shellcheck disable=SC1090,SC2030,SC2031,SC2034
+  source <(sed -n '/^restore_backup_service_state() {$/,/^}/p' "$repo_root/bin/localaictl")
+  # shellcheck disable=SC2034
+  backup_was_active=(backend tls socket)
+  # shellcheck disable=SC2034
+  RESTORE_STACK_POLICY_SET=1
+  # shellcheck disable=SC2030
+  RESTORE_TLS_ENABLED=false
+  # shellcheck disable=SC2030
+  RESTORE_TLS_PUBLIC_SOCKET=true
+  # shellcheck disable=SC2329
+  backup_unit_action() { printf '%s\n' "$1" >>"$tmp_dir/reconciled-units"; }
+  # shellcheck disable=SC2329
+  log() { :; }
+  : >"$tmp_dir/reconciled-units"
+  restore_backup_service_state
+  [[ "$(<"$tmp_dir/reconciled-units")" == backend ]]
+
+  RESTORE_TLS_ENABLED=true
+  RESTORE_TLS_PUBLIC_SOCKET=false
+  : >"$tmp_dir/reconciled-units"
+  restore_backup_service_state
+  [[ "$(<"$tmp_dir/reconciled-units")" == $'backend\ntls' ]]
+
+  RESTORE_TLS_PUBLIC_SOCKET=true
+  : >"$tmp_dir/reconciled-units"
+  # shellcheck disable=SC2329
+  backup_unit_action() {
+    printf '%s\n' "$1" >>"$tmp_dir/reconciled-units"
+    [[ "$1" != backend ]]
+  }
+  if restore_backup_service_state; then
+    printf 'restore restarted dependent services after backend start failed\n' >&2
+    exit 1
+  fi
+  [[ "$(<"$tmp_dir/reconciled-units")" == backend ]]
+)
+
+(
+  # shellcheck disable=SC1090,SC2030,SC2031,SC2034
+  source <(sed -n '/^load_restore_stack_policy() {$/,/^}/p' "$repo_root/bin/localaictl")
+  # shellcheck disable=SC2034
+  config_lib="$repo_root/lib/config.sh"
+  # shellcheck disable=SC2034
+  legacy_config_file="$repo_root/localai/localai.lock"
+  restored_config="$tmp_dir/restore-policy.conf"
+  printf 'LOCALAI_TLS_ENABLED=false\nLOCALAI_TLS_PUBLIC_SOCKET=false\n' >"$restored_config"
+  export LOCALAI_TLS_ENABLED=true LOCALAI_TLS_PUBLIC_SOCKET=true
+  load_restore_stack_policy "$restored_config"
+  # shellcheck disable=SC2031
+  [[ "$RESTORE_TLS_ENABLED" == false && "$RESTORE_TLS_PUBLIC_SOCKET" == false ]]
+)
+
 export LOCALAI_FAKE_FAIL_TLS=true
 if "$repo_root/bin/localaictl" start; then
   printf 'expected partial TLS start failure\n' >&2
   exit 1
 fi
 rg -q '"action":"start".*"result":"failure"' "$tmp_dir/audit/$(date +%Y-%m-%d).jsonl"
-rg -q 'start localai-tls-forward.socket' "$tmp_dir/commands"
+if rg -q 'start localai-tls-forward.socket' "$tmp_dir/commands"; then
+  printf 'start activated the public socket after TLS service startup failed\n' >&2
+  exit 1
+fi
 
 # Backup and restore exercise real tar metadata operations against disposable
 # paths while service-manager commands remain mocked.
@@ -546,6 +629,10 @@ rg -q '^ExecStartPre=/usr/bin/test ! -e /var/lib/\.localaictl-backup-restore\.pe
   "$repo_root/secureblue-localai-install/localai.service.in"
 rg -q '^ExecStartPre=/usr/bin/test ! -e /var/lib/\.localaictl-backup-restore\.pending$' \
   "$repo_root/localai-podman-compose/localai-tls-compose.service.in"
+rg -q '^ConditionPathExists=!/var/lib/\.localaictl-backup-restore\.pending$' \
+  "$repo_root/localai-podman-compose/localai-tls-forward.socket.in"
+rg -q '^ConditionPathExists=!/var/lib/\.localaictl-backup-restore\.pending$' \
+  "$repo_root/localai-podman-compose/localai-tls-forward.service.in"
 archive_listing="$tmp_dir/backup-members"
 /usr/bin/tar -tzf "$backup_archive" >"$archive_listing"
 # A configured-off public socket can still be active from an earlier setup.
@@ -553,6 +640,7 @@ archive_listing="$tmp_dir/backup-members"
 # prove that the socket is managed by this installer.
 printf '# Managed by LocalAI secureblue TLS installer.\n' >"$tmp_dir/systemd/localai-tls-forward.socket"
 printf '# Managed by LocalAI secureblue TLS installer.\n' >"$tmp_dir/systemd/localai-tls-forward.service"
+printf 'active\n' >"$tmp_dir/service-state/socket"
 : >"$tmp_dir/commands"
 stale_socket_archive="$tmp_dir/stale-managed-socket.tar.gz"
 if ! LOCALAI_TLS_ENABLED=true LOCALAI_TLS_PUBLIC_SOCKET=false "$repo_root/bin/localaictl" backup "$stale_socket_archive" >"$tmp_dir/stale-socket-output" 2>"$tmp_dir/stale-socket-error"; then
@@ -569,6 +657,24 @@ if python3 "$repo_root/lib/backup_archive.py" validate "$backup_archive" "$tmp_d
   printf 'archive validator accepted a non-root-owned configuration member\n' >&2
   exit 1
 fi
+root_config_archive="$tmp_dir/root-config-generated-backup.tar.gz"
+python3 - "$backup_archive" "$root_config_archive" "$tmp_dir/backup-config-dir/localai.conf" <<'PY'
+import os, sys, tarfile
+source_path, destination_path, config_path = sys.argv[1:]
+with tarfile.open(source_path, 'r:gz') as source, tarfile.open(destination_path, 'w:gz', format=tarfile.PAX_FORMAT) as target:
+    for info in source:
+        data = source.extractfile(info) if info.isfile() else None
+        if info.name == config_path.lstrip('/'):
+            info.uid = info.gid = 0
+            info.mode = 0o644
+        target.addfile(info, data)
+os.chmod(destination_path, 0o600)
+PY
+python3 "$repo_root/lib/backup_archive.py" validate "$root_config_archive" "$tmp_dir/backup-config-dir/localai.conf" \
+  "$tmp_dir/backup-state" "$tmp_dir/backup-tls" "$tmp_dir/backup-cache" || {
+  printf 'archive validator rejected a generated root-owned 0644 configuration backup\n' >&2
+  exit 1
+}
 python3 - "$backup_archive" "$tmp_dir/backup-config-dir/localai.conf" <<'PY'
 import os, sys, tarfile, tempfile
 archive_path, config_path = sys.argv[1:]
@@ -646,6 +752,52 @@ from unittest.mock import patch
 sys.path.insert(0, sys.argv[1])
 import backup_archive as helper
 
+with tempfile.TemporaryDirectory(prefix="source-growth-test-", dir=os.environ["TMPDIR"]) as parent:
+    source = os.path.join(parent, "source.tar.gz")
+    destination = os.path.join(parent, "staged.tar.gz")
+    with open(source, "wb") as stream:
+        stream.write(b"synthetic archive source")
+    real_read = os.read
+    did_grow = {"value": False}
+    def grow_source_after_read(fd, size):
+        chunk = real_read(fd, size)
+        if not did_grow["value"]:
+            did_grow["value"] = True
+            with open(source, "ab") as stream:
+                stream.write(b"concurrent growth")
+        return chunk
+    with patch.object(helper.os, "read", side_effect=grow_source_after_read):
+        try:
+            helper.copy_source(source, destination)
+        except SystemExit:
+            pass
+        else:
+            raise SystemExit("restore source staging accepted a concurrently grown archive")
+    if os.path.exists(destination):
+        raise SystemExit("restore source staging retained a partial copy after source growth")
+
+with tempfile.TemporaryDirectory(prefix="label-metadata-test-", dir=os.environ["TMPDIR"]) as parent:
+    staged = os.path.join(parent, "staged")
+    installed = os.path.join(parent, "installed")
+    os.mkdir(staged, 0o700)
+    os.mkdir(installed, 0o700)
+    def xattrs(path, **kwargs):
+        return ["security.selinux"]
+    def labels(path, name, **kwargs):
+        return b"staging_t" if os.fspath(path) == staged else b"container_file_t"
+    with patch.object(helper.os, "listxattr", side_effect=xattrs), \
+         patch.object(helper.os, "getxattr", side_effect=labels):
+        if not helper.directory_metadata_not_weaker(staged, installed):
+            raise SystemExit("destination policy relabel was rejected as a changed ancestor xattr")
+    def custom_xattrs(path, **kwargs):
+        return ["user.localai-ancestor-test"]
+    def custom_values(path, name, **kwargs):
+        return b"staged" if os.fspath(path) == staged else b"installed"
+    with patch.object(helper.os, "listxattr", side_effect=custom_xattrs), \
+         patch.object(helper.os, "getxattr", side_effect=custom_values):
+        if helper.directory_metadata_not_weaker(staged, installed):
+            raise SystemExit("directory metadata validation ignored a non-SELinux xattr difference")
+
 uid_map = "0:1001:1;1:200000:65536"
 gid_map = "0:1001:1;1:300000:65536"
 rootless_path = "/var/lib/localai/.local/share/containers/storage"
@@ -662,6 +814,67 @@ def fixture_open(filename, *args, **kwargs):
     if filename == "/etc/subgid":
         return io.StringIO("localai:300000:65536\n")
     return original_open(filename, *args, **kwargs)
+
+with tempfile.TemporaryDirectory(prefix="owner-policy-test-", dir=os.environ["TMPDIR"]) as parent:
+    def check_owner_policy(subuid, subgid, passwd, group):
+        files = {
+            "/etc/subuid": subuid,
+            "/etc/subgid": subgid,
+            "/etc/passwd": passwd,
+            "/etc/group": group,
+        }
+        def policy_open(filename, *args, **kwargs):
+            if os.fspath(filename) in files:
+                return io.StringIO(files[os.fspath(filename)])
+            return original_open(filename, *args, **kwargs)
+        with patch.object(pwd, "getpwuid", return_value=SimpleNamespace(pw_name="svc")), \
+             patch.object(builtins, "open", side_effect=policy_open):
+            return helper.owner_id_policy(parent)
+
+    safe_policy = check_owner_policy(
+        "svc:200000:100\nother:300000:100\n",
+        "svc:400000:100\nother:500000:100\n",
+        "root:x:0:0:root:/root:/bin/bash\nsvc:x:1001:1001:svc:/nonexistent:/sbin/nologin\n",
+        "root:x:0:\nsvc:x:1001:\n",
+    )
+    if (200000, 200100) not in safe_policy[3] or (400000, 400100) not in safe_policy[4]:
+        raise SystemExit("valid persistent-root subordinate ID ranges were not accepted")
+    root_metadata = os.stat(parent)
+    numeric_policy = check_owner_policy(
+        f"{root_metadata.st_uid}:210000:100\nother:310000:100\n",
+        f"{root_metadata.st_uid}:410000:100\nother:510000:100\n",
+        "root:x:0:0:root:/root:/bin/bash\nsvc:x:1001:1001:svc:/nonexistent:/sbin/nologin\n",
+        "root:x:0:\nsvc:x:1001:\n",
+    )
+    if (210000, 210100) not in numeric_policy[3] or (410000, 410100) not in numeric_policy[4]:
+        raise SystemExit("numeric-keyed persistent-root subordinate ID ranges were rejected")
+    numeric_map_files = {
+        "/etc/subuid": f"{root_metadata.st_uid}:200000:65536\n",
+        "/etc/subgid": f"{root_metadata.st_uid}:300000:65536\n",
+        "/etc/passwd": "root:x:0:0:root:/root:/bin/bash\nsvc:x:1001:1001:svc:/nonexistent:/sbin/nologin\n",
+        "/etc/group": "root:x:0:\nsvc:x:1001:\n",
+    }
+    def numeric_map_open(filename, *args, **kwargs):
+        if os.fspath(filename) in numeric_map_files:
+            return io.StringIO(numeric_map_files[os.fspath(filename)])
+        return original_open(filename, *args, **kwargs)
+    with patch.object(pwd, "getpwnam", return_value=SimpleNamespace(pw_uid=root_metadata.st_uid)), \
+         patch.object(builtins, "open", side_effect=numeric_map_open):
+        helper.validate_id_map(f"0:1001:1;1:200000:65536", 1001, "svc", "/etc/subuid")
+        helper.validate_id_map(f"0:1001:1;1:300000:65536", 1001, "svc", "/etc/subgid")
+    unsafe_policies = (
+        ("svc:200000:100\nother:200050:100\n", "svc:400000:100\n", "root:x:0:0:root:/root:/bin/bash\nsvc:x:1001:1001:svc:/nonexistent:/sbin/nologin\n", "root:x:0:\nsvc:x:1001:\n"),
+        ("svc:200000:100\n", "svc:400000:100\nother:400050:100\n", "root:x:0:0:root:/root:/bin/bash\nsvc:x:1001:1001:svc:/nonexistent:/sbin/nologin\n", "root:x:0:\nsvc:x:1001:\n"),
+        ("svc:200000:100\n", "svc:400000:100\n", "intruder:x:200050:1002::/:/sbin/nologin\n", "root:x:0:\nsvc:x:1001:\n"),
+        ("svc:200000:100\n", "svc:400000:100\n", "root:x:0:0:root:/root:/bin/bash\nsvc:x:1001:1001:svc:/nonexistent:/sbin/nologin\n", "intruder:x:400050:\n"),
+    )
+    for policy in unsafe_policies:
+        with contextlib.redirect_stderr(io.StringIO()):
+            try:
+                check_owner_policy(*policy)
+            except SystemExit:
+                continue
+        raise SystemExit("persistent-root subordinate ID collision or overlap was accepted")
 
 def make_archive(entries):
     output = io.BytesIO()
@@ -885,6 +1098,23 @@ with tempfile.TemporaryDirectory(prefix="graphroot-rename-", dir=os.environ["TMP
         raise SystemExit("rootless graphroot cleanup followed a symbolic link")
     os.unlink(sentinel)
 
+    race_source = os.path.join(parent, "race-store")
+    race_old = os.path.join(parent, "race-store.original")
+    race_destination = os.path.join(parent, "race-store.rollback")
+    os.mkdir(race_source, 0o700)
+    expected = os.stat(race_source)
+    os.rename(race_source, race_old)
+    os.mkdir(race_source, 0o700)
+    with contextlib.redirect_stderr(io.StringIO()):
+        try:
+            helper.rename_graphroot_noreplace(race_source, race_destination, (expected.st_dev, expected.st_ino))
+        except SystemExit:
+            pass
+        else:
+            raise SystemExit("rootless graphroot rename accepted a replaced source inode")
+    if os.path.exists(race_destination) or not os.path.isdir(race_source) or not os.path.isdir(race_old):
+        raise SystemExit("rootless graphroot replacement race changed either tree")
+
 with tempfile.TemporaryDirectory(prefix="graphroot-outer-", dir=os.environ["TMPDIR"]) as outer:
     os.chmod(outer, 0o700)
     graphroot = os.path.join(outer, "storage")
@@ -906,6 +1136,15 @@ with tempfile.TemporaryDirectory(prefix="graphroot-outer-", dir=os.environ["TMPD
                       (helper.tarfile.TarInfo(config.lstrip("/")), b"synthetic config\n")]
     outer_members[-1][0].mode = 0o600
     outer_members[-1][0].uid, outer_members[-1][0].gid = uid, gid
+    ordinary_name = outer.lstrip("/") + "/ordinary.data"
+    ordinary = helper.tarfile.TarInfo(ordinary_name)
+    ordinary.mode, ordinary.uid, ordinary.gid = 0o600, uid, gid
+    outer_members.append((ordinary, b"synthetic payload\n"))
+    sensitive_link = helper.tarfile.TarInfo(outer.lstrip("/") + "/ca.key")
+    sensitive_link.type = helper.tarfile.LNKTYPE
+    sensitive_link.linkname = ordinary_name
+    sensitive_link.mode, sensitive_link.uid, sensitive_link.gid = 0o600, uid, gid
+    outer_members.append((sensitive_link, None))
     nested_info = helper.tarfile.TarInfo(helper.ROOTLESS_GRAPHROOT_MEMBER)
     nested_info.mode, nested_info.uid, nested_info.gid = 0o600, 0, 0
     outer_members.append((nested_info, valid))
@@ -916,9 +1155,10 @@ with tempfile.TemporaryDirectory(prefix="graphroot-outer-", dir=os.environ["TMPD
                 info.size = len(payload)
                 bundle.addfile(info, io.BytesIO(payload))
             else:
-                info.type = helper.tarfile.DIRTYPE
-                info.mode = 0o700
-                info.uid, info.gid = uid, gid
+                if not (info.issym() or info.islnk()):
+                    info.type = helper.tarfile.DIRTYPE
+                    info.mode = 0o700
+                    info.uid, info.gid = uid, gid
                 bundle.addfile(info)
     with open(archive_path, "wb") as stream:
         stream.write(outer_raw.getvalue())
@@ -945,22 +1185,54 @@ with tempfile.TemporaryDirectory(prefix="graphroot-outer-", dir=os.environ["TMPD
             raise SystemExit("nested graphroot tar was included in ordinary restore paths")
         helper.space_check(archive_path, outer, destinations=[outer], rootless_context=context)
 
+        sync_calls = []
+        def synthetic_syncfs(descriptor):
+            sync_calls.append(os.fstat(descriptor).st_dev)
+            return 0
+        with patch.object(helper.ctypes, "CDLL", return_value=SimpleNamespace(syncfs=synthetic_syncfs)):
+            helper.sync_restore_filesystems(archive_path, config, [outer], rootless_context=context)
+        if not sync_calls:
+            raise SystemExit("restore durability check did not flush any destination filesystem")
+        with patch.object(helper.ctypes, "CDLL", return_value=SimpleNamespace(syncfs=lambda _fd: -1)), \
+             contextlib.redirect_stderr(io.StringIO()):
+            try:
+                helper.sync_restore_filesystems(archive_path, config, [outer], rootless_context=context)
+            except SystemExit:
+                pass
+            else:
+                raise SystemExit("restore durability check ignored a filesystem flush failure")
+
+        snapshot = os.path.join(outer, "rollback.tar")
+        with open(snapshot, "wb") as stream:
+            stream.write(b"synthetic rollback")
+        fsync_calls = []
+        original_fsync = helper.os.fsync
+        def capture_fsync(descriptor):
+            fsync_calls.append(descriptor)
+            return original_fsync(descriptor)
+        with patch.object(helper.os, "fsync", side_effect=capture_fsync):
+            helper.sync_staging_snapshot(snapshot, outer)
+        if len(fsync_calls) < 2:
+            raise SystemExit("rollback snapshot durability did not flush both file and staging directory")
+
         def archive_with_config_change(changed_path, mutate, destination_name):
             with helper.tarfile.open(archive_path, "r:gz") as source, \
                  helper.tarfile.open(destination_name, "w:gz") as destination:
                 for member in source:
-                    if member.name == changed_path:
+                    if member.name.rstrip("/") == changed_path.rstrip("/"):
                         mutate(member)
                     destination.addfile(member, source.extractfile(member) if member.isfile() else None)
 
         for case, mutate in (
             ("foreign-owner", lambda member: setattr(member, "uid", uid + 10000)),
             ("foreign-group", lambda member: setattr(member, "gid", gid + 10000)),
+            ("sensitive-hardlink-mode", lambda member: setattr(member, "mode", 0o640)),
             ("unsafe-acl", lambda member: member.pax_headers.update({"SCHILY.acl.access": "other::rw-"})),
             ("unsafe-selinux", lambda member: member.pax_headers.update({"SCHILY.xattr.security.selinux": "untrusted_t:s0"})),
         ):
             changed_archive = os.path.join(outer, f"{case}.tar.gz")
-            archive_with_config_change(config.lstrip("/"), mutate, changed_archive)
+            changed_path = outer.lstrip("/") + "/ca.key" if case == "sensitive-hardlink-mode" else config.lstrip("/")
+            archive_with_config_change(changed_path, mutate, changed_archive)
             with contextlib.redirect_stderr(io.StringIO()):
                 try:
                     helper.validate_archive(changed_archive, config, [outer], require_root_config=False,
@@ -969,6 +1241,18 @@ with tempfile.TemporaryDirectory(prefix="graphroot-outer-", dir=os.environ["TMPD
                     pass
                 else:
                     raise SystemExit(f"outer archive accepted {case}")
+
+        for unsafe_root_mode in (0o000, 0o500):
+            changed_archive = os.path.join(outer, f"root-mode-{unsafe_root_mode:o}.tar.gz")
+            archive_with_config_change(outer.lstrip("/"), lambda member, mode=unsafe_root_mode: setattr(member, "mode", mode), changed_archive)
+            with contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    helper.validate_archive(changed_archive, config, [outer], require_root_config=False,
+                                            rootless_context=context)
+                except SystemExit:
+                    pass
+                else:
+                    raise SystemExit("outer archive accepted a non-writable persistent root")
 
         bad_context = dict(context, graphroot=os.path.join(outer, "other-storage"))
         with contextlib.redirect_stderr(io.StringIO()):
@@ -1297,6 +1581,12 @@ printf 'damaged state\n' >"$tmp_dir/backup-state/database.db"
 printf 'damaged external cache\n' >"$tmp_dir/backup-cache/cache.db"
 chmod 0755 "$tmp_dir/backup-state"
 "$repo_root/bin/localaictl" restore --yes "$backup_archive" >"$tmp_dir/restore-output"
+snapshot_sync_line="$(rg -n '^sync-staging-snapshot$' "$tmp_dir/commands" | head -n1 | cut -d: -f1)"
+marker_create_line="$(rg -n '^restore-marker-create$' "$tmp_dir/commands" | head -n1 | cut -d: -f1)"
+destination_sync_line="$(rg -n '^sync-destinations$' "$tmp_dir/commands" | tail -n1 | cut -d: -f1)"
+marker_clear_line="$(rg -n '^restore-marker-clear$' "$tmp_dir/commands" | tail -n1 | cut -d: -f1)"
+[[ -n "$snapshot_sync_line" && -n "$marker_create_line" && -n "$destination_sync_line" && -n "$marker_clear_line" ]]
+(( snapshot_sync_line < marker_create_line && destination_sync_line < marker_clear_line ))
 [[ "$(stat -c '%a' "$tmp_dir/backup-state")" == 710 ]]
 restore_config_dir="$tmp_dir/restore-config"
 mkdir -m 0700 "$restore_config_dir"
@@ -1414,6 +1704,10 @@ if "$repo_root/bin/localaictl" restore --yes "$backup_archive" >"$tmp_dir/rollba
 fi
 unset LOCALAI_FAKE_FAIL_LABEL
 [[ "$(<"$tmp_dir/backup-state/database.db")" == 'before rollback' ]]
+rollback_sync_line="$(rg -n '^sync-destinations$' "$tmp_dir/commands" | tail -n1 | cut -d: -f1)"
+rollback_marker_clear_line="$(rg -n '^restore-marker-clear$' "$tmp_dir/commands" | tail -n1 | cut -d: -f1)"
+[[ -n "$rollback_sync_line" && -n "$rollback_marker_clear_line" ]]
+(( rollback_sync_line < rollback_marker_clear_line ))
 if [[ "$(<"$LOCALAI_FAKE_STATE_DIR/backend")" != active ]]; then
   cat "$tmp_dir/rollback-output" "$tmp_dir/rollback-error" >&2
   cat "$tmp_dir/commands" >&2
@@ -1433,8 +1727,23 @@ if [[ "$(<"$LOCALAI_FAKE_STATE_DIR/backend")" == active ]]; then
   printf 'services restarted with an unresolved restore marker\n' >&2
   exit 1
 fi
+: >"$tmp_dir/commands"
+if "$repo_root/bin/localaictl" start >/dev/null 2>&1; then
+  printf 'controller start ignored an unresolved restore marker\n' >&2
+  exit 1
+fi
+if rg -q 'start localai.service|start localai-tls-compose.service|start localai-tls-forward.socket' "$tmp_dir/commands"; then
+  printf 'controller issued start commands with an unresolved restore marker\n' >&2
+  exit 1
+fi
 if "$LOCALAI_SYSTEMCTL_BIN" --user --machine=localai@.host start localai.service >/dev/null 2>&1; then
   printf 'service startup ignored the durable restore marker\n' >&2
+  exit 1
+fi
+if "$LOCALAI_SYSTEMCTL_BIN" --user --machine=localai-tls@.host start localai-tls-compose.service >/dev/null 2>&1 ||
+   "$LOCALAI_SYSTEMCTL_BIN" start localai-tls-forward.socket >/dev/null 2>&1 ||
+   "$LOCALAI_SYSTEMCTL_BIN" start localai-tls-forward.service >/dev/null 2>&1; then
+  printf 'TLS activation ignored the durable restore marker\n' >&2
   exit 1
 fi
 : >"$tmp_dir/commands"

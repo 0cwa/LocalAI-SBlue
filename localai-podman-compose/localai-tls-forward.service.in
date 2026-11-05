@@ -1,6 +1,7 @@
 [Unit]
 Description=LocalAI HTTPS socket proxy
 Documentation=man:systemd-socket-proxyd(8)
+ConditionPathExists=!/var/lib/.localaictl-backup-restore.pending
 Requires=localai-tls-forward.socket
 Wants=user@@TLS_UID@.service
 After=network-online.target user@@TLS_UID@.service

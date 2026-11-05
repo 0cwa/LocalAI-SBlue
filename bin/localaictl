@@ -35,6 +35,22 @@ legacy_config_file="${LOCALAI_LEGACY_CONFIG_FILE:-$repo_root/localai/localai.loc
 audit_dir="${LOCALAI_AUDIT_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/localai/audit}"
 dry_run=0
 status_elevated=0
+RESTORE_STACK_POLICY_SET=0
+RESTORE_TLS_ENABLED=false
+RESTORE_TLS_PUBLIC_SOCKET=false
+RESTORE_TLS_PUBLIC_HOST=''
+RESTORE_TLS_PUBLIC_PORT=''
+RESTORE_TLS_INTERNAL_HOST=''
+RESTORE_TLS_INTERNAL_PORT=''
+RESTORE_TLS_STATE_DIR=''
+RESTORE_TLS_COMPOSE_DIR=''
+RESTORE_TLS_COMPOSE_FILE_NAME=''
+RESTORE_TLS_COMPOSE_PROJECT_NAME=''
+RESTORE_TLS_USER=''
+RESTORE_SERVICE_USER=''
+RESTORE_TLS_SERVICE_NAME=''
+RESTORE_TLS_FORWARD_SOCKET_NAME=''
+RESTORE_TLS_FORWARD_SERVICE_NAME=''
 
 die() { printf 'localaictl: %s\n' "$*" >&2; exit 1; }
 log() { printf '%s\n' "$*"; }
@@ -354,6 +370,68 @@ verify_restore_backend_unit() {
   printf '%s\n' "$environment" | run_elevated_pipe /usr/bin/python3 /etc/localai/bootstrap-guard.py --unit-environment-restore-safe "$restored_config"
 }
 
+load_restore_stack_policy() {
+  local restored_config="$1" values
+  # The archive's configuration determines which prior listeners may be
+  # restarted. Ignore caller LOCALAI_* overrides so they cannot re-enable one.
+  # shellcheck disable=SC2016
+  values="$(/usr/bin/env -i PATH=/usr/bin:/bin \
+    LOCALAI_CONFIG_FILE="$restored_config" LOCALAI_CONFIG_LIB="$config_lib" \
+    LOCALAI_LEGACY_CONFIG_FILE="$legacy_config_file" /usr/bin/bash -c '
+      set -euo pipefail
+      source "$LOCALAI_CONFIG_LIB"
+      localai_config_load_compat "$LOCALAI_CONFIG_FILE" "$LOCALAI_LEGACY_CONFIG_FILE" >/dev/null
+      restore_public_host="${LOCALAI_TLS_PUBLIC_HOST:--}"
+      printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+        "$LOCALAI_TLS_ENABLED" "$LOCALAI_TLS_PUBLIC_SOCKET" "$restore_public_host" \
+        "$LOCALAI_TLS_PUBLIC_PORT" "$LOCALAI_TLS_INTERNAL_HOST" "$LOCALAI_TLS_INTERNAL_PORT" \
+        "$LOCALAI_TLS_STATE_DIR" "$LOCALAI_TLS_COMPOSE_DIR" "$LOCALAI_TLS_COMPOSE_FILE_NAME" \
+        "$LOCALAI_TLS_COMPOSE_PROJECT_NAME" "$LOCALAI_TLS_USER" "$LOCALAI_SERVICE_USER" \
+        "$LOCALAI_TLS_SERVICE_NAME" "$LOCALAI_TLS_FORWARD_SOCKET_NAME" "$LOCALAI_TLS_FORWARD_SERVICE_NAME"
+    ' 2>/dev/null)" || return 1
+  IFS=$'\t' read -r RESTORE_TLS_ENABLED RESTORE_TLS_PUBLIC_SOCKET RESTORE_TLS_PUBLIC_HOST \
+    RESTORE_TLS_PUBLIC_PORT RESTORE_TLS_INTERNAL_HOST RESTORE_TLS_INTERNAL_PORT \
+    RESTORE_TLS_STATE_DIR RESTORE_TLS_COMPOSE_DIR RESTORE_TLS_COMPOSE_FILE_NAME \
+    RESTORE_TLS_COMPOSE_PROJECT_NAME RESTORE_TLS_USER RESTORE_SERVICE_USER \
+    RESTORE_TLS_SERVICE_NAME RESTORE_TLS_FORWARD_SOCKET_NAME RESTORE_TLS_FORWARD_SERVICE_NAME <<<"$values"
+  [[ "$RESTORE_TLS_ENABLED" == true || "$RESTORE_TLS_ENABLED" == false ]] || return 1
+  [[ "$RESTORE_TLS_PUBLIC_SOCKET" == true || "$RESTORE_TLS_PUBLIC_SOCKET" == false ]] || return 1
+  if [[ "$RESTORE_TLS_PUBLIC_HOST" == - ]]; then RESTORE_TLS_PUBLIC_HOST=''; fi
+  RESTORE_STACK_POLICY_SET=1
+}
+
+verify_restore_tls_unit_settings() {
+  [[ "$RESTORE_TLS_ENABLED" == true ]] || return 0
+  [[ "$RESTORE_SERVICE_USER" == "$LOCALAI_SERVICE_USER" &&
+     "$RESTORE_TLS_USER" == "$LOCALAI_TLS_USER" &&
+     "$RESTORE_TLS_STATE_DIR" == "$LOCALAI_TLS_STATE_DIR" &&
+     "$RESTORE_TLS_COMPOSE_DIR" == "$LOCALAI_TLS_COMPOSE_DIR" &&
+     "$RESTORE_TLS_COMPOSE_FILE_NAME" == "$LOCALAI_TLS_COMPOSE_FILE_NAME" &&
+     "$RESTORE_TLS_COMPOSE_PROJECT_NAME" == "$LOCALAI_TLS_COMPOSE_PROJECT_NAME" &&
+     "$RESTORE_TLS_SERVICE_NAME" == "$LOCALAI_TLS_SERVICE_NAME" &&
+     "$RESTORE_TLS_FORWARD_SOCKET_NAME" == "$LOCALAI_TLS_FORWARD_SOCKET_NAME" &&
+     "$RESTORE_TLS_FORWARD_SERVICE_NAME" == "$LOCALAI_TLS_FORWARD_SERVICE_NAME" ]] || return 1
+  tls_unit_managed || return 1
+  local tls_unit="$LOCALAI_TLS_STATE_DIR/.config/systemd/user/$LOCALAI_TLS_SERVICE_NAME"
+  local tls_uid compose_file="${RESTORE_TLS_COMPOSE_DIR%/}/$RESTORE_TLS_COMPOSE_FILE_NAME"
+  tls_uid="$(service_uid "$RESTORE_TLS_USER")" || return 1
+  run_elevated /usr/bin/grep -Fqx "WorkingDirectory=$RESTORE_TLS_STATE_DIR" "$tls_unit" || return 1
+  run_elevated /usr/bin/grep -Fqx "Environment=HOME=$RESTORE_TLS_STATE_DIR" "$tls_unit" || return 1
+  run_elevated /usr/bin/grep -Fqx "Environment=XDG_RUNTIME_DIR=/run/user/$tls_uid" "$tls_unit" || return 1
+  run_elevated /usr/bin/grep -Fqx "ExecStart=/usr/bin/podman compose -p $RESTORE_TLS_COMPOSE_PROJECT_NAME -f $compose_file up -d" "$tls_unit" || return 1
+  run_elevated /usr/bin/grep -Fqx "ExecStop=/usr/bin/podman compose -p $RESTORE_TLS_COMPOSE_PROJECT_NAME -f $compose_file down" "$tls_unit" || return 1
+  if [[ "$RESTORE_TLS_PUBLIC_SOCKET" == true ]]; then
+    socket_units_managed || return 1
+    local socket_unit="$system_unit_dir/$LOCALAI_TLS_FORWARD_SOCKET_NAME"
+    local service_unit="$system_unit_dir/$LOCALAI_TLS_FORWARD_SERVICE_NAME"
+    run_elevated /usr/bin/grep -Fqx "User=$RESTORE_SERVICE_USER" "$socket_unit" || return 1
+    run_elevated /usr/bin/grep -Fqx "ListenStream=$RESTORE_TLS_PUBLIC_HOST:$RESTORE_TLS_PUBLIC_PORT" "$socket_unit" || return 1
+    run_elevated /usr/bin/grep -Fqx "Requires=$LOCALAI_TLS_FORWARD_SOCKET_NAME" "$service_unit" || return 1
+    run_elevated /usr/bin/grep -Fqx "ExecStart=/usr/bin/systemd-socket-proxyd $RESTORE_TLS_INTERNAL_HOST:$RESTORE_TLS_INTERNAL_PORT" "$service_unit" ||
+      run_elevated /usr/bin/grep -Fqx "ExecStart=/usr/lib/systemd/systemd-socket-proxyd $RESTORE_TLS_INTERNAL_HOST:$RESTORE_TLS_INTERNAL_PORT" "$service_unit" || return 1
+  fi
+}
+
 socket_units_managed() {
   local socket="$system_unit_dir/$LOCALAI_TLS_FORWARD_SOCKET_NAME" service="$system_unit_dir/$LOCALAI_TLS_FORWARD_SERVICE_NAME" path owner
   if [[ ! -e "$socket" && ! -L "$socket" && ! -e "$service" && ! -L "$service" ]]; then return 1; fi
@@ -396,19 +474,24 @@ run_or_dry() {
 
 start_stack() {
   local result=success actions="backend-start"
+  if [[ "$dry_run" != 1 ]]; then
+    run_elevated /usr/bin/python3 "$backup_archive_helper" restore-marker-check || die "a previous backup restore is incomplete; managed services remain blocked pending recovery"
+  fi
   if [[ "$dry_run" != 1 ]] && { [[ "$LOCALAI_AUTH" != true ]] || ! run_elevated /usr/bin/python3 /etc/localai/bootstrap-guard.py "$LOCALAI_DATA_PATH/database.db" >/dev/null 2>&1; }; then
     bootstrap_admin
     return $?
   fi
   if ! run_or_dry backend_systemctl start localai.service; then
     log "start: backend failed; inspect with 'localaictl logs backend'"
-    result=failure
+    audit start failure "$actions"
+    return 1
   fi
   if tls_enabled; then
     actions+=",tls-start"
     if ! run_or_dry tls_systemctl start "$LOCALAI_TLS_SERVICE_NAME"; then
       log "start: TLS Compose service failed; inspect with 'localaictl logs tls'"
-      result=failure
+      audit start failure "$actions"
+      return 1
     fi
     if [[ "$LOCALAI_TLS_PUBLIC_SOCKET" == true ]]; then
       actions+=",socket-start"
@@ -737,13 +820,19 @@ backup_unit_action() {
 }
 
 restore_backup_service_state() {
-  local unit status=0
+  local unit
   for unit in backend tls socket; do
     if [[ " ${backup_was_active[*]:-} " == *" $unit "* ]]; then
-      backup_unit_action "$unit" start || { printf 'localaictl: warning: could not restore the previous %s service state\n' "$unit" >&2; status=1; }
+      if [[ "${RESTORE_STACK_POLICY_SET:-0}" == 1 ]]; then
+        case "$unit" in
+          tls) [[ "$RESTORE_TLS_ENABLED" == true ]] || continue ;;
+          socket) [[ "$RESTORE_TLS_ENABLED" == true && "$RESTORE_TLS_PUBLIC_SOCKET" == true ]] || continue ;;
+        esac
+      fi
+      backup_unit_action "$unit" start || { printf 'localaictl: warning: could not restore the previous %s service state\n' "$unit" >&2; return 1; }
     fi
   done
-  return "$status"
+  return 0
 }
 
 backup_stop_services() {
@@ -907,7 +996,7 @@ restore_archive() {
 }
 
 restore_locked() {
-  local source="$1" stage source_copy members collisions snapshot skip_links target answer item had_target=0 stage_base needs_confirmation=0
+  local source="$1" stage source_copy members collisions snapshot skip_links target answer item had_target=0 stage_base needs_confirmation=0 restored_config_path
   local rootless_present=0 rootless_archive rootless_old_path='' rootless_source_inode='' rootless_initial_inode=''
   local marker_graphroot='' marker_rollback=''
   local rootless_graphroot_had_old=0 rootless_graphroot_mutated=0
@@ -958,6 +1047,10 @@ restore_locked() {
   if grep -zFxq "${LOCALAI_STATE_DIR#/}/.config/systemd/user/localai.service" "$members"; then
     verify_restore_backend_unit "$stage/${config_file#/}" || die "restored config does not match the trusted installed backend unit and manager settings"
   fi
+  restored_config_path="$config_file"
+  [[ ! -e "$stage/${config_file#/}" ]] || restored_config_path="$stage/${config_file#/}"
+  load_restore_stack_policy "$restored_config_path" || die "restored configuration cannot be read safely for service-state reconciliation"
+  verify_restore_tls_unit_settings || die "restored TLS configuration does not match the installed service units"
   for target in "${backup_roots[@]}"; do
     if [[ -d "$target" ]] && [[ -n "$(run_elevated find "$target" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then needs_confirmation=1; fi
   done
@@ -1006,6 +1099,7 @@ restore_locked() {
   for item in "${links_to_keep[@]}"; do
     run_elevated /usr/bin/rm -rf -- "${stage:?}/$item"
   done
+  run_elevated /usr/bin/python3 "$helper" sync-staging-snapshot "$snapshot" "$stage" || die "could not durably persist rollback snapshot and staging data"
   if [[ "$rootless_present" == 1 ]]; then
     [[ -d "$rootless_graphroot" && ! -L "$rootless_graphroot" ]] || die "rootless graphroot disappeared before restore"
     rootless_old_path="$rootless_graphroot.localaictl-rollback.$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
@@ -1019,7 +1113,10 @@ restore_locked() {
   restore_marker_created=1
   restore_mutation_started=1
   if [[ "$rootless_present" == 1 ]]; then
-    run_elevated /usr/bin/python3 "$helper" graphroot-rename "$rootless_graphroot" "$rootless_old_path" || die "could not reserve the rootless graphroot rollback path"
+    local rootless_source_device rootless_source_ino
+    IFS=: read -r rootless_source_device rootless_source_ino <<<"$rootless_source_inode"
+    run_elevated /usr/bin/python3 "$helper" graphroot-rename-expected \
+      "$rootless_graphroot" "$rootless_old_path" "$rootless_source_device" "$rootless_source_ino" || die "could not reserve the rootless graphroot rollback path"
     local service_uid_value service_gid_value
     service_uid_value="$(service_uid "$LOCALAI_SERVICE_USER")"
     service_gid_value="$(service_gid "$LOCALAI_SERVICE_USER")"
@@ -1054,6 +1151,11 @@ restore_locked() {
     fi
     run_elevated "$matchpathcon_bin" -V "$target" || die "SELinux label verification failed; rollback will run before services restart"
   done
+  if [[ "$rootless_present" == 1 ]]; then
+    run_backup_helper sync-destinations "$source" "$config_file" "${backup_roots[@]}" || die "could not durably flush restored data; rollback will run before services restart"
+  else
+    run_backup_helper sync-destinations "$source" "$config_file" "${backup_roots[@]}" || die "could not durably flush restored data; rollback will run before services restart"
+  fi
   restore_completed=1
   if [[ "$rootless_graphroot_had_old" == 1 ]]; then
     local old_inode old_device old_ino
@@ -1132,6 +1234,10 @@ restore_exit_cleanup() {
   if [[ "${restore_mutation_started:-0}" == 1 && "${restore_completed:-0}" != 1 ]]; then
     restore_rollback "$members" "$collisions" "$snapshot" "$had_target" \
       "$rootless_graphroot" "$rootless_old_path" "$rootless_graphroot_had_old" "$rootless_graphroot_mutated" || RESTORE_ROLLBACK_FAILED=1
+    RESTORE_STACK_POLICY_SET=0
+    if [[ "$RESTORE_ROLLBACK_FAILED" == 0 ]]; then
+      run_backup_helper sync-destinations "$source" "$config_file" "${backup_roots[@]}" || RESTORE_ROLLBACK_FAILED=1
+    fi
     if [[ "$RESTORE_ROLLBACK_FAILED" == 0 && "${restore_marker_created:-0}" == 1 ]]; then
       run_elevated /usr/bin/python3 "$backup_archive_helper" restore-marker-clear || RESTORE_ROLLBACK_FAILED=1
     fi
