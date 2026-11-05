@@ -116,6 +116,8 @@ fi
   # shellcheck disable=SC1090
   source <(sed -n '/^step() {$/,/^}/p' "$repo_root/scripts/acceptance-guest.sh")
   # shellcheck disable=SC1090
+  source <(sed -n '/^backup_acceptance_step() {$/,/^}/p' "$repo_root/scripts/acceptance-guest.sh")
+  # shellcheck disable=SC1090
   source <(sed -n '/^backup_restore_roundtrip() {$/,/^}/p' "$repo_root/scripts/acceptance-guest.sh")
   test_work="$work/backup-restore"
   mkdir -m 0700 "$test_work"
@@ -133,6 +135,7 @@ fi
 #!/usr/bin/env bash
 case "$1" in
   backup)
+    if [[ "${TEST_BACKUP_FAIL:-0}" == 1 ]]; then printf 'localaictl: backup contains system manager unit configuration\n' >&2; exit 1; fi
     cp -- "$TEST_CONFIG" "$TEST_WORK/saved-config"
     cp -- "$TEST_MARKER" "$TEST_WORK/saved-marker"
     cp -- "$TEST_GRAPH_MARKER" "$TEST_WORK/saved-graph-marker"
@@ -187,6 +190,11 @@ EOF
   rg -q '^waiting backup-restore-backup: timeout 1800s$' "$receipt" || { printf 'backup acceptance timeout was not recorded\n' >&2; exit 1; }
   rg -q '^step backup-restore-backup: pass$' "$receipt" || { printf 'backup acceptance result was not recorded\n' >&2; exit 1; }
   rg -q '^step backup-restore-restore: pass$' "$receipt" || { printf 'restore acceptance result was not recorded\n' >&2; exit 1; }
+  if TEST_BACKUP_FAIL=1 backup_acceptance_step "$test_work/failing-backup.tar.gz"; then
+    printf 'failed backup diagnostic fixture was accepted\n' >&2; exit 1
+  fi
+  rg -q '^diagnostic backup-restore-backup-reason: system-manager-tree$' "$receipt" || { printf 'backup failure was not reduced to an allowlisted category\n' >&2; exit 1; }
+  ! rg -q 'system manager unit configuration|suppressed fixture output|/var/home|secret' "$receipt" "$test_work/step-output" || { printf 'raw backup diagnostic escaped into acceptance output\n' >&2; exit 1; }
   ! rg -q 'suppressed fixture output|/var/home|secret' "$receipt" "$test_work/step-output" || { printf 'acceptance output leaked fixture data\n' >&2; exit 1; }
 )
 # Health checks retry a briefly unavailable service without recording output.
@@ -312,7 +320,10 @@ ssh() {
         printf 'step install: fail\n'; return 1
       fi
       printf 'step install: pass\n' ;;
-    *' verify') printf 'step verify: pass\n' ;;
+    *' diagnose-backup') : >"$vm_mock_dir/diagnose-command-seen"; printf 'step backup-restore-backup: fail\ndiagnostic backup-restore-backup-reason: system-manager-tree\n'; return 1 ;;
+    *' verify')
+      if [[ "${MOCK_VERIFY_FAIL:-0}" == 1 ]]; then : >"$vm_mock_dir/verify-failure-seen"; printf 'step verify: fail\n'; return 1; fi
+      printf 'step verify: pass\n' ;;
     'systemctl reboot --no-block') : >"$vm_mock_dir/rebooted" ;;
     'cat /proc/sys/kernel/random/boot_id')
       if [[ -e "$vm_mock_dir/rebooted" ]]; then
@@ -327,6 +338,33 @@ result="$(HOME="$vm_mock_dir/test-home" main --vm "$vm_mock_dir/base.qcow2" "$vm
 [[ "$result" == "project-version: $(<"$repo_root/VERSION")"$'\n'project-archive-sha256:\ *$'\nstep install: pass\nstep verify: pass' ]]
 grep -Eq '^project-archive-sha256: [a-f0-9]{64}$' <<<"$result"
 [[ -e "$vm_mock_dir/rebooted" ]]
+[[ -z "$(find "$vm_mock_dir/test-home/agent-scratch/LocalAI-SBlue/acceptance-vm" -mindepth 1 -print -quit)" ]]
+sleep() {
+  local control_home="$vm_mock_dir/test-home" active="$vm_mock_dir/test-home/agent-scratch/LocalAI-SBlue/acceptance-vm/diagnostic-active"
+  if [[ -f "$active" ]]; then
+    HOME="$control_home" main --release-vm-diagnostic-pause
+  else
+    /usr/bin/sleep "$@"
+  fi
+}
+rm -f -- "$vm_mock_dir/rebooted" "$vm_mock_dir/verify-failure-seen" "$vm_mock_dir/diagnose-command-seen"
+if result="$(LOCALAI_ACCEPTANCE_DIAGNOSTIC_PAUSE_SECONDS=5 MOCK_VERIFY_FAIL=1 HOME="$vm_mock_dir/test-home" main --vm "$vm_mock_dir/base.qcow2" "$vm_mock_dir/key" "$vm_mock_dir/vars" "$vm_mock_dir/hostkey.pub" 2>/dev/null)"; then
+  printf 'VM verification failure was accepted during diagnostic hold\n' >&2; exit 1
+fi
+if [[ ! -f "$vm_mock_dir/verify-failure-seen" ]]; then
+  [[ "$result" == *'step install: pass'* ]] || printf 'VM install stage did not pass before mock failure\n' >&2
+  [[ "$result" == *'step vm-orchestration: fail'* ]] || printf 'VM orchestration did not report a failure stage\n' >&2
+  printf 'VM verification failure mock was not reached\n' >&2; exit 1
+fi
+[[ -f "$vm_mock_dir/diagnose-command-seen" ]] || { printf 'same-overlay diagnostic retry mock was not reached\n' >&2; exit 1; }
+if [[ "$result" != *'diagnostic-recheck: started'* || "$result" != *'diagnostic backup-restore-backup-reason: system-manager-tree'* || "$result" != *'diagnostic-pause: active'* || "$result" != *'diagnostic-pause: released'* || "$result" != *'diagnostic-pause: release-requested'* ]]; then
+  [[ "$result" == *'diagnostic-recheck: started'* ]] || printf 'missing diagnostic recheck stage\n' >&2
+  [[ "$result" == *'diagnostic backup-restore-backup-reason: system-manager-tree'* ]] || printf 'missing categorized backup diagnostic\n' >&2
+  [[ "$result" == *'diagnostic-pause: active'* ]] || printf 'missing diagnostic pause stage\n' >&2
+  [[ "$result" == *'diagnostic-pause: released'* ]] || printf 'missing diagnostic release stage\n' >&2
+  [[ "$result" == *'diagnostic-pause: release-requested'* ]] || printf 'missing diagnostic control response\n' >&2
+  printf 'same-overlay diagnostic hold/release regression failed\n' >&2; exit 1
+fi
 [[ -z "$(find "$vm_mock_dir/test-home/agent-scratch/LocalAI-SBlue/acceptance-vm" -mindepth 1 -print -quit)" ]]
 if result="$(MOCK_INSTALL_FAIL=1 HOME="$vm_mock_dir/test-home" main --vm "$vm_mock_dir/base.qcow2" "$vm_mock_dir/key" "$vm_mock_dir/vars" "$vm_mock_dir/hostkey.pub" 2>/dev/null)"; then
   printf 'VM install failure was accepted\n' >&2; exit 1

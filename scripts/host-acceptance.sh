@@ -5,13 +5,55 @@ PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+diagnostic_control_created=0
+diagnostic_control_scratch=''
 usage() {
   printf '%s\n' 'Usage: host-acceptance.sh --vm BASE.qcow2 SSH_KEY UEFI_VARS SSH_HOST_PUBLIC_KEY'
   printf '%s\n' '       host-acceptance.sh --host [--resume]'
+  printf '%s\n' '       host-acceptance.sh --release-vm-diagnostic-pause'
   printf '%s\n' 'VM receipts go to stdout; host mode writes a receipt after reboot.'
 }
 fail() { printf 'step %s: fail\n' "${failure_scope:-vm-orchestration}"; printf 'acceptance: %s\n' "$*" >&2; exit 1; }
+release_vm_diagnostic_pause() {
+  local scratch active release
+  [[ "$#" == 1 ]] || { usage >&2; exit 2; }
+  scratch="${HOME:?}/agent-scratch/LocalAI-SBlue/acceptance-vm"
+  active="$scratch/diagnostic-active"
+  release="$scratch/diagnostic-release"
+  [[ -d "$scratch" && ! -L "$scratch" && "$(stat -c '%u:%a' -- "$scratch")" == "$(id -u):700" ]] || fail 'VM diagnostic pause is not active.'
+  [[ -f "$active" && ! -L "$active" && "$(stat -c '%u:%a' -- "$active")" == "$(id -u):600" ]] || fail 'VM diagnostic pause is not active.'
+  [[ ! -e "$release" && ! -L "$release" ]] || fail 'VM diagnostic release is already pending.'
+  (umask 077; set -o noclobber; : >"$release") || fail 'could not release VM diagnostic pause.'
+  printf 'diagnostic-pause: release-requested\n'
+}
+bounded_vm_diagnostic_pause() {
+  local scratch="$1" duration="$2" active release elapsed=0
+  (( duration > 0 )) || return 0
+  active="$scratch/diagnostic-active"
+  release="$scratch/diagnostic-release"
+  [[ ! -e "$active" && ! -L "$active" && ! -e "$release" && ! -L "$release" ]] || fail 'VM diagnostic control path is already occupied.'
+  (umask 077; set -o noclobber; : >"$active") || fail 'could not prepare VM diagnostic pause.'
+  chmod 0600 -- "$active"
+  diagnostic_control_created=1
+  printf 'diagnostic-pause: active\n'
+  while (( elapsed < duration )); do
+    [[ -f "$release" && ! -L "$release" ]] && break
+    sleep 1
+    ((elapsed += 1))
+  done
+  if [[ -f "$release" && ! -L "$release" ]]; then
+    printf 'diagnostic-pause: released\n'
+  else
+    printf 'diagnostic-pause: expired\n'
+  fi
+  rm -f -- "$active" "$release"
+  diagnostic_control_created=0
+}
 main() {
+if [[ "${1:-}" == --release-vm-diagnostic-pause ]]; then
+  release_vm_diagnostic_pause "$@"
+  return 0
+fi
 if [[ "${1:-}" == --host ]]; then
   failure_scope=host-orchestration
   [[ "$#" == 1 || ( "$#" == 2 && "$2" == --resume ) ]] || { usage >&2; exit 2; }
@@ -32,6 +74,10 @@ if [[ "${1:-}" == --host ]]; then
   return 0
 fi
 [[ "$#" == 5 && "$1" == --vm ]] || { usage >&2; exit 2; }
+local diagnostic_pause_seconds="${LOCALAI_ACCEPTANCE_DIAGNOSTIC_PAUSE_SECONDS:-0}"
+if [[ ! "$diagnostic_pause_seconds" =~ ^[0-9]{1,3}$ ]] || (( diagnostic_pause_seconds > 300 )); then
+  fail 'VM diagnostic pause must be an integer from 0 through 300 seconds.'
+fi
 base="$(realpath -e -- "$2")" || fail 'base image does not exist.'
 key="$(realpath -e -- "$3")" || fail 'SSH key does not exist.'
 vars="$(realpath -e -- "$4")" || fail 'UEFI variables file does not exist.'
@@ -60,12 +106,17 @@ read -r hostkey_type hostkey_data _ < "$hostkey" || fail 'cannot read SSH host p
 scratch="${HOME:?}/agent-scratch/LocalAI-SBlue/acceptance-vm"
 umask 077
 mkdir -p "$scratch"
+[[ ! -L "$scratch" && "$(stat -c '%u:%a' -- "$scratch")" == "$(id -u):700" ]] || fail 'VM scratch directory must be owned and private.'
+diagnostic_control_scratch="$scratch"
 work="$(mktemp -d "$scratch/run.XXXXXX")"
 qemu_pid=''
 cleanup() {
   if [[ -n "$qemu_pid" ]]; then
     kill "$qemu_pid" 2>/dev/null || :
     wait "$qemu_pid" 2>/dev/null || :
+  fi
+  if [[ "$diagnostic_control_created" == 1 ]]; then
+    rm -f -- "$diagnostic_control_scratch/diagnostic-active" "$diagnostic_control_scratch/diagnostic-release"
   fi
   rm -rf -- "$work"
 }
@@ -130,7 +181,17 @@ done
 printf 'Waiting for post-reboot VM acceptance...\n' >&2
 # The worker path is a fixed path inside the disposable VM.
 # shellcheck disable=SC2029
-timeout 7200s ssh "${ssh_args[@]}" root@127.0.0.1 "bash $worker verify" || fail 'post-reboot VM acceptance failed.'
+if ! timeout 7200s ssh "${ssh_args[@]}" root@127.0.0.1 "bash $worker verify"; then
+  if (( diagnostic_pause_seconds > 0 )); then
+    printf 'diagnostic-recheck: started\n'
+    # The guest emits only allowlisted backup failure categories from this
+    # read-only-in-purpose backup retry; the disposable overlay remains alive.
+    timeout 1800s ssh "${ssh_args[@]}" root@127.0.0.1 "bash $worker diagnose-backup" || :
+    printf 'diagnostic-recheck: complete\n'
+    bounded_vm_diagnostic_pause "$scratch" "$diagnostic_pause_seconds"
+  fi
+  fail 'post-reboot VM acceptance failed.'
+fi
 
 }
 

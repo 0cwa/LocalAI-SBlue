@@ -47,7 +47,7 @@ def validate_archive(archive: str, config: str, roots: list[str], *, require_roo
                 name = clean_member_name(info.name)
                 if name in members:
                     fail("backup contains duplicate member names")
-                if has_systemd_tree(name, "system"):
+                if has_systemd_tree(name, "system", roots):
                     fail("backup contains system manager unit configuration")
                 if name != "metadata" and name != config_name and member_root(name, prefixes) is None:
                     fail("backup contains a path outside configured LocalAI paths")
@@ -123,16 +123,16 @@ def stage_check(stage: str) -> None:
         fail("restore staging filesystem is memory-backed")
 
 
-def systemd_tree_prefix(name: str, tree: str) -> str | None:
-    parts = name.split("/")
-    for index in range(len(parts) - 1):
-        if parts[index] == "systemd" and parts[index + 1] == tree:
-            return "/".join(parts[: index + 2])
+def systemd_tree_prefix(name: str, tree: str, roots: list[str]) -> str | None:
+    for root in roots:
+        prefix = root.lstrip("/").rstrip("/") + f"/.config/systemd/{tree}"
+        if name == prefix or name.startswith(prefix + "/"):
+            return prefix
     return None
 
 
-def has_systemd_tree(name: str, tree: str) -> bool:
-    return systemd_tree_prefix(name, tree) is not None
+def has_systemd_tree(name: str, tree: str, roots: list[str]) -> bool:
+    return systemd_tree_prefix(name, tree, roots) is not None
 
 
 def same_file_bytes(left: str, right: str) -> bool:
@@ -181,7 +181,7 @@ def unit_trees(
 ) -> list[str]:
     names = validate_archive(archive_path, config, roots)
     directories: dict[str, set[str]] = {}
-    archive_prefixes = {systemd_tree_prefix(name, "user") for name in names}
+    archive_prefixes = {systemd_tree_prefix(name, "user", expected_roots) for name in names}
     for index, root in enumerate(expected_roots):
         prefix = os.path.abspath(root).lstrip("/").rstrip("/") + "/.config/systemd/user"
         live_root = os.path.join("/", prefix)
@@ -198,7 +198,7 @@ def unit_trees(
                 ):
                     fail("backup weakens metadata on an installed persistent root")
         for name in names:
-            prefix = systemd_tree_prefix(name, "user")
+            prefix = systemd_tree_prefix(name, "user", expected_roots)
             if prefix is None:
                 continue
             directories.setdefault(prefix, set()).add(name)

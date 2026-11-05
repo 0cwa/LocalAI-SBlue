@@ -446,6 +446,10 @@ printf 'LOCALAI_STATE_DIR=%s\nLOCALAI_MODELS_PATH=%s\nLOCALAI_BACKENDS_PATH=%s/b
   "$tmp_dir/backup-state" "$tmp_dir/backup-state/models" "$tmp_dir/backup-state" "$tmp_dir/backup-state" "$tmp_dir/backup-state" "$tmp_dir/backup-state" "$tmp_dir/backup-state" "$tmp_dir/backup-state" "$tmp_dir/backup-state" "$tmp_dir/backup-cache" "$tmp_dir/backup-state" "$tmp_dir/backup-tls" "$tmp_dir/backup-tls" "$tmp_dir/backup-tls" "$tmp_dir/backup-tls" "$tmp_dir/backup-tls" >"$tmp_dir/backup-config-dir/localai.conf"
 mkdir -p "$tmp_dir/backup-state/models"
 printf 'model fixture\n' >"$tmp_dir/backup-state/models/model.bin"
+podman_layer="$tmp_dir/backup-state/.local/share/containers/storage/overlay/acceptance-layer/diff/usr/lib/systemd"
+mkdir -p "$podman_layer/system" "$podman_layer/user"
+printf 'inert image system unit\n' >"$podman_layer/system/inert.service"
+printf 'inert image user unit\n' >"$podman_layer/user/inert.service"
 export LOCALAI_CONFIG_FILE="$tmp_dir/backup-config-dir/localai.conf"
 cat >"$tmp_dir/tar-test" <<'EOF'
 #!/usr/bin/env bash
@@ -476,6 +480,8 @@ if ! "$repo_root/bin/localaictl" backup --exclude-models "$backup_archive" 2>"$t
   cat "$tmp_dir/commands" >&2
   exit 1
 fi
+archive_listing="$tmp_dir/backup-members"
+/usr/bin/tar -tzf "$backup_archive" >"$archive_listing"
 # A configured-off public socket can still be active from an earlier setup.
 # Inventory and stop/restart it only when both root-owned LocalAI unit files
 # prove that the socket is managed by this installer.
@@ -519,22 +525,45 @@ rg -q 'TLS CA private key' "$tmp_dir/backup-warning"
 archive_metadata="$(/usr/bin/tar -xOzf "$backup_archive" metadata)"
 rg -q '^backend_image=' <<<"$archive_metadata"
 rg -q '^backend_digest=' <<<"$archive_metadata"
-if ! /usr/bin/tar -tzf "$backup_archive" | rg -q 'backup-state/.config/systemd/user/localai.service'; then
+if ! rg -q 'backup-state/.config/systemd/user/localai.service' "$archive_listing"; then
   printf 'backup omitted the configured backend service unit state\n' >&2
   exit 1
 fi
-if ! /usr/bin/tar -tzf "$backup_archive" | rg -q 'backup-tls/.config/systemd/user/localai-tls-compose.service'; then
+if ! rg -q 'backup-tls/.config/systemd/user/localai-tls-compose.service' "$archive_listing"; then
   printf 'backup omitted the configured TLS service unit state\n' >&2
   exit 1
 fi
-if /usr/bin/tar -tzf "$backup_archive" | rg -q 'models/model.bin'; then
+if rg -q 'models/model.bin' "$archive_listing"; then
   printf 'models were included despite --exclude-models\n' >&2
   exit 1
 fi
-if ! /usr/bin/tar -tzf "$backup_archive" | rg -q 'backup-cache/cache.db'; then
+if ! rg -q 'backup-cache/cache.db' "$archive_listing"; then
   printf 'configured persistent data outside the main state root was omitted\n' >&2
   exit 1
 fi
+python3 - "$repo_root/lib" "$backup_archive" "$tmp_dir/backup-config-dir/localai.conf" "$tmp_dir/backup-state" "$tmp_dir/backup-tls" "$tmp_dir/backup-cache" "$podman_layer" <<'PY'
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from backup_archive import has_systemd_tree, systemd_tree_prefix, validate_archive
+
+archive, config, state, tls, cache, podman_layer = sys.argv[2:]
+roots = [state, tls, cache]
+names = validate_archive(archive, config, roots, require_root_config=False)
+for manager in ("system", "user"):
+    image_unit = f"{podman_layer.lstrip('/')}/{manager}/inert.service"
+    if image_unit not in names or has_systemd_tree(image_unit, manager, roots):
+        raise SystemExit("inert Podman image unit was treated as host unit configuration")
+    if systemd_tree_prefix(image_unit, manager, [state, tls]) is not None:
+        raise SystemExit("inert Podman image unit was treated as service-home unit configuration")
+for service_root, unit in ((state, "localai.service"), (tls, "localai-tls-compose.service")):
+    unit_path = f"{service_root.lstrip('/')}/.config/systemd/user/{unit}"
+    if systemd_tree_prefix(unit_path, "user", [state, tls]) != f"{service_root.lstrip('/')}/.config/systemd/user":
+        raise SystemExit("configured service-home unit tree was not recognized")
+system_unit = f"{state.lstrip('/')}/.config/systemd/system/evil.service"
+if not has_systemd_tree(system_unit, "system", roots):
+    raise SystemExit("configured-root system manager unit tree was not rejected")
+PY
 stop_count_before="$(rg -c ' stop localai.service$' "$tmp_dir/commands" || true)"
 if LOCALAI_FAKE_WRONG_TLS_UNIT_OWNER=true "$repo_root/bin/localaictl" backup "$tmp_dir/wrong-tls-owner.tar.gz" >/dev/null 2>&1; then
   printf 'backup accepted a TLS unit with the wrong owner\n' >&2

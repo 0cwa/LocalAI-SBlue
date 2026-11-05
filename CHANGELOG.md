@@ -14,6 +14,9 @@ has been runtime-qualified on secureblue or on a GPU.
 - Include user service unit state in archives while requiring a byte-for-byte
   match with already installed unit entries before restore; restore does not
   install or reload unit definitions and refuses missing or changed entries.
+- Match systemd paths at the configured service-home roots so inert unit files
+  inside rootless Podman image layers do not block backups or get treated as
+  active user unit definitions.
 
 ## 0.2.0
 

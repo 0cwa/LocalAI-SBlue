@@ -135,7 +135,7 @@ if [[ "${1:-}" == --set-unit-enabled && "$#" == 2 ]]; then
 fi
 
 phase="${1:-}"
-[[ "$#" == 1 && ( "$phase" == install || "$phase" == verify ) ]] || fail 'expected install or verify phase.'
+[[ "$#" == 1 && ( "$phase" == install || "$phase" == verify || "$phase" == diagnose-backup ) ]] || fail 'expected install, verify, or backup diagnostic phase.'
 umask 077
 if [[ "$mode" == host ]]; then
   work="$host_state/work"
@@ -239,6 +239,40 @@ check() {
   return 1
 }
 
+backup_acceptance_step() {
+  local destination="$1" status=0 reason=other output=''
+  printf 'command backup-restore-backup: localaictl backup with root-owned config and persistent marker\n' >>"$receipt"
+  printf 'waiting backup-restore-backup: timeout 1800s\n' >>"$receipt"
+  if output="$(timeout --kill-after=10s 1800s "$controller" backup "$destination" 2>&1 >/dev/null)"; then
+    printf 'step backup-restore-backup: pass\n' >>"$receipt"
+  else
+    status=$?
+    case "$output" in
+      *"could not stop "*|*"could not verify that "*|*"cannot determine a stable "*" service state"*) reason=service-stop ;;
+      *"not verifiably managed"*|*"unit is not owned"*|*"unit owner"*|*"service unit is not"*) reason=unit-ownership ;;
+      *"insufficient free disk space"*|*"No space left on device"*|*"quota exceeded"*) reason=capacity ;;
+      *"backup contains a symbolic link crossing configured persistent paths"*) reason=link-cross-root ;;
+      *"backup contains a symbolic link escaping its archived tree"*) reason=link-escape ;;
+      *"backup contains an invalid hard link"*) reason=hardlink ;;
+      *"backup contains system manager unit configuration"*) reason=system-manager-tree ;;
+      *"backup contains an unsupported special file"*) reason=special-member ;;
+      *"backup contains setuid or setgid permission bits"*) reason=privileged-mode ;;
+      *"backup contains a file capability xattr"*) reason='file-capability' ;;
+      *"backup configuration member must be"*) reason=config-member ;;
+      *"backup omits an installed user service unit tree"*|*"backup weakens metadata on an installed user service unit ancestor"*|*"backup user unit tree entries differ"*|*"backup contains unsafe or changed systemd unit configuration"*) reason=unit-tree-validation ;;
+      *"backup contains an unsafe symbolic link"*) reason=symlink ;;
+      *"unsupported or unsafe filesystem entries"*|*"backup contains an unsafe"*|*"backup contains unsupported"*|*"symbolic link"*|*"file capability"*|*"setuid or setgid"*) reason=archive-validation ;;
+      *"archive creation failed"*|*"tar: "*|*"Unexpected EOF"*|*"Write error"*) reason=tar ;;
+      *"already running"*) reason=lock-contention ;;
+      *"configuration file must"*) reason=config-guard ;;
+    esac
+    printf 'step backup-restore-backup: %s\n' "$([[ "$status" == 124 ]] && printf timeout || printf fail)" >>"$receipt"
+    printf 'diagnostic backup-restore-backup-reason: %s\n' "$reason" >>"$receipt"
+  fi
+  unset output
+  return "$status"
+}
+
 backup_restore_roundtrip() {
   local test_work="$1" config_path="$2" backup_path
   backup_path="$test_work/backup-restore.tar.gz"
@@ -303,7 +337,7 @@ backup_restore_roundtrip() {
   graph_stat="$(stat -c '%u:%a' -- "$graph_marker")"
   printf '# localai backup restore acceptance marker\n' >>"$config_path"
   check_unit active disabled || fail 'backend was not active before backup acceptance.'
-  step backup-restore-backup 1800 "$controller" backup "$backup_path" || fail 'backup acceptance command failed.'
+  backup_acceptance_step "$backup_path" || fail 'backup acceptance command failed.'
   [[ -f "$backup_path" && ! -L "$backup_path" && "$(stat -c '%a' -- "$backup_path")" == 600 ]] || fail 'backup archive is not a private regular file.'
   printf 'damaged marker\n' >"$marker_path"
   printf 'damaged graph marker\n' >"$graph_marker"
@@ -343,6 +377,11 @@ TRACE
 }
 installer="$repo_root/secureblue-localai-install/install.sh"
 controller="$repo_root/bin/localaictl"
+
+if [[ "$phase" == diagnose-backup ]]; then
+  backup_acceptance_step "$work/diagnostic-backup.tar.gz" || exit 1
+  exit 0
+fi
 
 if [[ "$phase" == install ]]; then
   ensure_initial_isolation
