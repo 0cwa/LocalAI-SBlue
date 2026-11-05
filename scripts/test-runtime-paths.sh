@@ -52,6 +52,25 @@ assert "--userns=keep-id" in service
 assert "--group-add=keep-groups" in service
 assert "--security-opt=no-new-privileges" in service
 
+# Render the service's container command with synthetic values so the hardening
+# assertions cover the generated invocation, including the loopback port map.
+rendered = service.replace("@PUBLISH_HOST@", "127.0.0.1")
+rendered = rendered.replace("${LOCALAI_BIND_PORT}", "11455")
+exec_start = next(line for line in rendered.splitlines() if line.startswith("ExecStart="))
+for flag in (
+    "--cap-drop=all",
+    "--security-opt=no-new-privileges",
+    "--pids-limit=4096",
+    "--read-only",
+    "--tmpfs /tmp:rw,nosuid,nodev,size=2g",
+    "--network=pasta",
+    "--publish 127.0.0.1:11455:11455",
+    "--env LOCALAI_ADDRESS=0.0.0.0:11455",
+):
+    assert flag in exec_start, f"missing rendered backend hardening flag: {flag}"
+assert "--network=host" not in exec_start, "backend must not share the host network namespace"
+assert "--memory" not in exec_start, "memory limit remains unselected pending model workload qualification"
+
 assert "@TLS_VOLUME_ENTRIES@" in compose, "TLS compose must use the individually generated volume list"
 assert "@TLS_APP_HOME_DIR@" in compose, "TLS container HOME must use an app-only directory"
 assert "HOME: @TLS_APP_HOME_DIR@" in compose
