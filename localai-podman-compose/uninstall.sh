@@ -31,7 +31,6 @@ legacy_tls_service_name="${LOCALAI_TLS_LEGACY_SERVICE_NAME:-localai-tls.service}
 tls_compose_project_name="${LOCALAI_TLS_COMPOSE_PROJECT_NAME:-localai-tls}"
 tls_forward_service_name="${LOCALAI_TLS_FORWARD_SERVICE_NAME:-localai-tls-forward.service}"
 tls_forward_socket_name="${LOCALAI_TLS_FORWARD_SOCKET_NAME:-localai-tls-forward.socket}"
-tls_system_unit_dir="${LOCALAI_TLS_SYSTEM_UNIT_DIR:-/etc/systemd/system}"
 tls_legacy_selinux_module="${LOCALAI_TLS_LEGACY_SELINUX_MODULE:-localai_tls_forward}"
 tls_bind_selinux_module="${LOCALAI_TLS_BIND_SELINUX_MODULE:-localai_tls_forward_bind}"
 tls_bind_selinux_module_prefix="localai-tls-forward-bind."
@@ -249,15 +248,19 @@ run_tls_unit() {
   run_as_tls "$@"
 }
 
+tls_host_unit_path() {
+  printf '/etc/systemd/system/%s\n' "$1"
+}
+
 stop_service() {
-  if [[ -f "$tls_system_unit_dir/$tls_forward_socket_name" ]]; then
+  if [[ -f "$(tls_host_unit_path "$tls_forward_socket_name")" ]]; then
     log "Disabling and stopping public HTTPS socket proxy if present"
     if ! run0_pipe /usr/bin/systemctl disable --now "$tls_forward_socket_name"; then
       localai_installer_error "Could not disable and stop the public HTTPS socket."
       return 1
     fi
   fi
-  if [[ -f "$tls_system_unit_dir/$tls_forward_service_name" ]]; then
+  if [[ -f "$(tls_host_unit_path "$tls_forward_service_name")" ]]; then
     if ! run0_pipe /usr/bin/systemctl stop "$tls_forward_service_name"; then
       localai_installer_error "Could not stop the public HTTPS socket proxy."
       return 1
@@ -265,23 +268,33 @@ stop_service() {
   fi
 
   if [[ -n "${tls_uid:-}" ]]; then
-    if [[ -f "$tls_state_dir/.config/systemd/user/$tls_service_name" ]]; then
-      log "Disabling and stopping $tls_service_name in the $tls_user user manager if present"
-      if ! run_as_tls /usr/bin/systemctl --user disable --now "$tls_service_name"; then
-        localai_installer_error "Could not disable and stop the TLS user service."
-        return 1
-      fi
-    fi
+    stop_tls_user_unit_if_present "$tls_service_name" "TLS user service" || return 1
     if [[ "$legacy_tls_service_name" != "$tls_service_name" ]]; then
-      if [[ -f "$tls_state_dir/.config/systemd/user/$legacy_tls_service_name" ]]; then
-        log "Disabling legacy direct-Caddy unit $legacy_tls_service_name if present"
-        if ! run_as_tls /usr/bin/systemctl --user disable --now "$legacy_tls_service_name"; then
-          localai_installer_error "Could not disable and stop the legacy TLS user service."
-          return 1
-        fi
-      fi
+      stop_tls_user_unit_if_present "$legacy_tls_service_name" "legacy TLS user service" || return 1
     fi
   fi
+}
+
+stop_tls_user_unit_if_present() {
+  local unit="$1" description="$2" manager_status=0
+  [[ -f "$tls_state_dir/.config/systemd/user/$unit" ]] || return 0
+  localai_installer_user_manager_is_active "$tls_uid" || manager_status=$?
+  case "$manager_status" in
+    0)
+      log "Disabling and stopping $description in the $tls_user user manager"
+      if ! run_as_tls /usr/bin/systemctl --user disable --now "$unit"; then
+        localai_installer_error "Could not disable and stop $description."
+        return 1
+      fi
+      ;;
+    3)
+      log "The $tls_user user manager is inactive; no $description can be running."
+      ;;
+    *)
+      localai_installer_error "Could not determine whether the $tls_user user manager is active."
+      return 1
+      ;;
+  esac
 }
 
 confirm_tls_service_account_removal() {
@@ -331,15 +344,15 @@ remove_unit_and_config() {
     run_as_tls /usr/bin/systemctl --user daemon-reload || true
   fi
 
-  if [[ -e "$tls_system_unit_dir/$tls_forward_service_name" ]]; then
-    localai_installer_check_managed_file "$tls_system_unit_dir/$tls_forward_service_name" "TLS host socket-proxy unit" 0 \
+  if [[ -e "$(tls_host_unit_path "$tls_forward_service_name")" ]]; then
+    localai_installer_check_managed_file "$(tls_host_unit_path "$tls_forward_service_name")" "TLS host socket-proxy unit" 0 \
       '# Managed by LocalAI secureblue TLS installer.' 'Description=LocalAI HTTPS socket proxy' || die "Refusing to remove an unrelated host unit."
-    run0_pipe /usr/bin/rm -f -- "$tls_system_unit_dir/$tls_forward_service_name"
+    run0_pipe /usr/bin/rm -f -- "$(tls_host_unit_path "$tls_forward_service_name")"
   fi
-  if [[ -e "$tls_system_unit_dir/$tls_forward_socket_name" ]]; then
-    localai_installer_check_managed_file "$tls_system_unit_dir/$tls_forward_socket_name" "TLS host socket unit" 0 \
+  if [[ -e "$(tls_host_unit_path "$tls_forward_socket_name")" ]]; then
+    localai_installer_check_managed_file "$(tls_host_unit_path "$tls_forward_socket_name")" "TLS host socket unit" 0 \
       '# Managed by LocalAI secureblue TLS installer.' 'Description=LocalAI HTTPS socket' || die "Refusing to remove an unrelated host unit."
-    run0_pipe /usr/bin/rm -f -- "$tls_system_unit_dir/$tls_forward_socket_name"
+    run0_pipe /usr/bin/rm -f -- "$(tls_host_unit_path "$tls_forward_socket_name")"
   fi
   run0_pipe /usr/bin/systemctl daemon-reload
 }
@@ -501,13 +514,26 @@ tcp_port_local_override() {
 }
 
 tls_user_processes_running() {
-  local uid="$1" status=0
-  /usr/bin/pgrep -u "$uid" >/dev/null 2>&1 || status=$?
+  local uid="$1" status=0 pid command
+  local listing
+  listing="$(/usr/bin/pgrep -u "$uid" -a 2>/dev/null)" || status=$?
   case "$status" in
-    0) return 0 ;;
+    0) tls_user_process_listing_has_workloads "$listing" ;;
     1) return 1 ;;
     *) return 2 ;;
   esac
+}
+
+tls_user_process_listing_has_workloads() {
+  local listing="$1" pid command
+  while read -r pid command; do
+    [[ -n "$pid" && -n "$command" ]] || continue
+    if [[ "$command" =~ ^(/usr/lib/systemd/systemd|systemd)[[:space:]]+--user([[:space:]]|$) ]]; then
+      continue
+    fi
+    return 0
+  done <<< "$listing"
+  return 1
 }
 
 wait_for_tls_user_processes() {

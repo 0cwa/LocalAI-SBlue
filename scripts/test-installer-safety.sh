@@ -735,16 +735,19 @@ printf 'Uninstall rollback prefers exact SELinux entries over ranges checks\n'
 printf 'TLS uninstall stops managed units before removing them checks\n'
 (
   source_production_function "$repo_root/localai-podman-compose/uninstall.sh" stop_service
-  tls_system_unit_dir="$scratch/system-units"
+  source_production_function "$repo_root/localai-podman-compose/uninstall.sh" stop_tls_user_unit_if_present
+  # shellcheck disable=SC2329
+  tls_host_unit_path() { printf '%s/%s\n' "$scratch/system-units" "$1"; }
   tls_forward_socket_name=localai-tls-forward.socket
   tls_forward_service_name=localai-tls-forward.service
   tls_service_name=localai-tls-compose.service
   legacy_tls_service_name=localai-tls.service
-  tls_state_dir="$scratch/tls-state"
+  tls_state_dir="$scratch/tls-stop-state"
+  tls_user=localai-tls
   tls_uid=''
-  mkdir -p "$tls_system_unit_dir"
-  : > "$tls_system_unit_dir/$tls_forward_socket_name"
-  : > "$tls_system_unit_dir/$tls_forward_service_name"
+  mkdir -p "$scratch/system-units"
+  : > "$scratch/system-units/$tls_forward_socket_name"
+  : > "$scratch/system-units/$tls_forward_service_name"
   # shellcheck disable=SC2329
   log() { :; }
   # shellcheck disable=SC2329
@@ -762,10 +765,31 @@ printf 'TLS uninstall stops managed units before removing them checks\n'
   stop_service
   [[ "$(wc -l < "$scratch/tls-stop-calls")" -eq 2 ]] || fail "managed host units were not stopped"
 
-  rm -f "$tls_system_unit_dir/$tls_forward_socket_name" "$tls_system_unit_dir/$tls_forward_service_name"
+  rm -f "$scratch/system-units/$tls_forward_socket_name" "$scratch/system-units/$tls_forward_service_name"
   : > "$scratch/tls-stop-calls"
   stop_service
   [[ ! -s "$scratch/tls-stop-calls" ]] || fail "absent managed units caused stop commands"
+
+  mkdir -p "$tls_state_dir/.config/systemd/user"
+  : > "$tls_state_dir/.config/systemd/user/$tls_service_name"
+  tls_uid=956
+  mock_manager_status=3
+  # shellcheck disable=SC2329
+  localai_installer_user_manager_is_active() { return "$mock_manager_status"; }
+  # shellcheck disable=SC2329
+  run_as_tls() {
+    printf '%s\n' "$*" >> "$scratch/tls-user-stop-calls"
+    [[ "${TEST_FAIL_USER_STOP:-0}" != 1 ]]
+  }
+  stop_service
+  [[ ! -e "$scratch/tls-user-stop-calls" ]] || fail "inactive user manager was treated as an unhandled stop failure"
+  mock_manager_status=0
+  stop_service
+  [[ "$(wc -l < "$scratch/tls-user-stop-calls")" -eq 1 ]] || fail "active user manager did not receive a managed-unit stop"
+  : > "$scratch/tls-user-stop-calls"
+  mock_manager_status=4
+  if stop_service 2>/dev/null; then fail "unknown user-manager state was treated as inactive"; fi
+  [[ ! -s "$scratch/tls-user-stop-calls" ]] || fail "unknown manager state issued a user stop command"
 ) || fail "TLS uninstall ignored a managed service stop failure"
 
 printf 'TLS state purge requires service-account quiescence checks\n'
@@ -789,6 +813,17 @@ printf 'TLS state purge requires service-account quiescence checks\n'
   if remove_state 2>/dev/null; then fail "state purge proceeded while TLS account processes were active"; fi
   [[ ! -e "$scratch/purge-commands" ]] || fail "state purge removed files before checking TLS account quiescence"
 ) || fail "TLS state purge did not fail closed while service processes remained"
+
+printf 'TLS purge ignores only the exact user-manager process checks\n'
+(
+  source_production_function "$repo_root/localai-podman-compose/uninstall.sh" tls_user_process_listing_has_workloads
+  if tls_user_process_listing_has_workloads $'42 /usr/lib/systemd/systemd --user'; then
+    fail "linger user manager was classified as a workload"
+  fi
+  if ! tls_user_process_listing_has_workloads $'42 /usr/lib/systemd/systemd --user\n43 podman compose up'; then
+    fail "non-manager service-account process was ignored"
+  fi
+) || fail "TLS process classification did not distinguish user manager from workloads"
 
 printf 'TLS Podman parent directory ownership checks\n'
 (
