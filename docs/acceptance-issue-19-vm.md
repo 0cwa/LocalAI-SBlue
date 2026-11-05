@@ -1,13 +1,13 @@
 # Issue 19 container hardening VM acceptance
 
 Date: 2026-11-05. Result: **pass** in a disposable secureblue VM using the
-CPU image. This receipt covers the backend hardening controls, TLS forwarding,
-and the post-reboot application lifecycle. It does not qualify a physical host,
-a GPU, or model inference.
+CPU image. This receipt covers the final backend hardening controls, TLS
+forwarding and cleanup, and the post-reboot application lifecycle. It does not
+qualify a physical host, a GPU, or model inference.
 
-- Tested source commit: `38163e780eca92aa64987792bcf0915cfb147c7d`.
+- Tested source commit: `0e1445709cb0825486b25a80289e5369977d4ed2`.
 - Project version: `0.2.0`; source archive SHA-256:
-  `02efe07daf4c11ff4ac8294d2713ee96ef181c5895c235a9c66158b453d3e1e9`.
+  `a67b79fba116e142eeb5e3deba2ee45251f8d7d8f183dc7852544e47eac8b2c4`.
 - OS: secureblue 44 kinoite-main-hardened; deployment
   `a21fc280bc53cfbb3c80622ec36cac9a1f574899623dadb731314c5c79efa817`.
 - Kernel `6.19.14-300.fc44.x86_64`, Podman `5.8.2`, systemd `259`; SELinux
@@ -20,7 +20,7 @@ The first TLS installer attempt found no `podman compose` provider in the base
 guest. The bounded diagnostic installed Fedora's `podman-compose` package inside
 the disposable overlay, then reran the hardening and TLS checks in that same
 overlay. The base image was unchanged. The retry and the complete runner exited
-successfully.
+successfully with status `0`.
 
 The backend started with `--network=pasta` and its configured loopback host
 publication passed inspection and API health checks. The backend outbound
@@ -48,5 +48,6 @@ a test-only removal fallback.
 
 The run used a pinned SSH host key and a throwaway overlay. Its sanitized output
 was saved as
-`issue-19-vm-receipt-38163e7-20261105-final.txt` in task scratch; no keys,
-credentials, raw logs, or failed VM copies are part of this repository.
+`issue-19-vm-receipt-0e14457-20261105-run3.txt` in task scratch (SHA-256
+`c8b401ddce75aa5ec30d3937308983d707434c356718fc865a0968d81d76f285`); no keys,
+credentials, raw logs, or VM overlays are part of this repository.
