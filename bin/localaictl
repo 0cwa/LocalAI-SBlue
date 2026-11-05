@@ -447,13 +447,15 @@ socket_units_managed() {
 effective_execstartpre_has_restore_guard() {
   local manager="$1" unit="$2" commands
   commands="$($manager show --property=ExecStartPre --value "$unit" 2>/dev/null)" || return 1
-  [[ "$commands" == *"/usr/bin/test ! -e $RESTORE_MARKER_PATH"* ]]
+  printf '%s\n' "$commands" | /usr/bin/grep -Fq -- \
+    "{ path=/usr/bin/test ; argv[]=/usr/bin/test ! -e $RESTORE_MARKER_PATH ; ignore_errors=no ;"
 }
 
 effective_condition_has_restore_guard() {
   local manager="$1" unit="$2" conditions
   conditions="$($manager show --property=Conditions --value "$unit" 2>/dev/null)" || return 1
-  printf '%s\n' "$conditions" | /usr/bin/grep -Fqx "ConditionPathExists=!$RESTORE_MARKER_PATH"
+  printf '%s\n' "$conditions" | /usr/bin/grep -Fq -- \
+    "{ type=ConditionPathExists ; trigger=false ; negate=true ; parameter=$RESTORE_MARKER_PATH ;"
 }
 
 verify_effective_restore_guards() {

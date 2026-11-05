@@ -362,6 +362,9 @@ ssh() {
     'install -o root -g root -m 0644 /dev/stdin /root/agent-scratch/LocalAI-SBlue/acceptance-source/scripts/acceptance-guest.sh')
       cat >/dev/null
       : >"$vm_mock_dir/diagnostic-worker-refreshed" ;;
+    *'ps -eo comm=,etimes='*)
+      printf 'vm-install-process: container-runtime count=1 max-elapsed=42s\n'
+      printf 'untrusted process detail: /etc/passwd\n' ;;
     *'--rootless-archive-roundtrip'*)
       printf 'diagnostic graphroot-unshare-poc-run: pass\n'
       printf 'diagnostic graphroot-unshare-poc-reason: user-xattr-failed\n'
@@ -388,6 +391,23 @@ ssh() {
     *) return 1 ;;
   esac
 }
+sleep() {
+  local control_home="$vm_mock_dir/test-home" active="$vm_mock_dir/test-home/agent-scratch/LocalAI-SBlue/acceptance-vm/diagnostic-active"
+  if [[ "${1:-}" == 60 ]]; then
+    /usr/bin/sleep 0.1
+  elif [[ -f "$active" ]]; then
+    HOME="$control_home" main --release-vm-diagnostic-pause
+  else
+    /usr/bin/sleep "$@"
+  fi
+}
+ssh_args=(-F /dev/null -o ProxyCommand=none -o ProxyJump=none -o IdentitiesOnly=yes
+  -o ControlMaster=no -o ControlPath=none)
+snapshot="$(install_process_snapshot)"
+[[ "$snapshot" == 'vm-install-process: container-runtime count=1 max-elapsed=42s
+vm-install-process: result-unavailable' ]] || {
+  printf 'install process snapshot did not allowlist its output\n' >&2; exit 1;
+}
 if ! result="$(HOME="$vm_mock_dir/test-home" main --vm "$vm_mock_dir/base.qcow2" "$vm_mock_dir/key" "$vm_mock_dir/vars" "$vm_mock_dir/hostkey.pub")"; then
   printf 'mock VM success path failed\n' >&2; exit 1
 fi
@@ -398,14 +418,6 @@ grep -Eq '^project-archive-sha256: [a-f0-9]{64}$' <<<"$result" || { printf 'mock
 [[ -e "$vm_mock_dir/rebooted" ]]
 [[ -z "$(find "$vm_mock_dir/test-home/agent-scratch/LocalAI-SBlue/acceptance-vm" -mindepth 1 -print -quit)" ]]
 printf 'Mock VM successful lifecycle flow passed.\n'
-sleep() {
-  local control_home="$vm_mock_dir/test-home" active="$vm_mock_dir/test-home/agent-scratch/LocalAI-SBlue/acceptance-vm/diagnostic-active"
-  if [[ -f "$active" ]]; then
-    HOME="$control_home" main --release-vm-diagnostic-pause
-  else
-    /usr/bin/sleep "$@"
-  fi
-}
 rm -f -- "$vm_mock_dir/rebooted" "$vm_mock_dir/verify-failure-seen" "$vm_mock_dir/diagnose-command-seen"
 if result="$(LOCALAI_ACCEPTANCE_DIAGNOSTIC_PAUSE_SECONDS=5 MOCK_VERIFY_FAIL=1 HOME="$vm_mock_dir/test-home" main --vm "$vm_mock_dir/base.qcow2" "$vm_mock_dir/key" "$vm_mock_dir/vars" "$vm_mock_dir/hostkey.pub" 2>/dev/null)"; then
   printf 'VM verification failure was accepted during diagnostic hold\n' >&2; exit 1

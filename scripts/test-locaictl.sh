@@ -176,18 +176,27 @@ if [[ " $* " == *" is-active "* ]]; then
 fi
 if [[ " $* " == *" show --property=ExecStartPre --value "* ]]; then
   if [[ "${LOCALAI_FAKE_MISSING_RESTORE_GUARD:-}" != backend && " $* " == *" localai.service "* ]]; then
-    printf '/usr/bin/test ! -e /var/lib/.localaictl-backup-restore.pending\n'
+    case "${LOCALAI_FAKE_RESTORE_GUARD_FORM:-exact}" in
+      wrapped)
+        printf '{ path=/bin/sh ; argv[]=/bin/sh -c echo /usr/bin/test ! -e /var/lib/.localaictl-backup-restore.pending ; ignore_errors=no ; start_time=[n/a] ; }\n' ;;
+      ignored)
+        printf '{ path=/usr/bin/test ; argv[]=/usr/bin/test ! -e /var/lib/.localaictl-backup-restore.pending ; ignore_errors=yes ; start_time=[n/a] ; }\n' ;;
+      extra-argv)
+        printf '{ path=/usr/bin/test ; argv[]=/usr/bin/test ! -e /var/lib/.localaictl-backup-restore.pending extra ; ignore_errors=no ; start_time=[n/a] ; }\n' ;;
+      *)
+        printf '{ path=/usr/bin/test ; argv[]=/usr/bin/test ! -e /var/lib/.localaictl-backup-restore.pending ; ignore_errors=no ; start_time=[n/a] ; }\n' ;;
+    esac
   fi
   if [[ "${LOCALAI_FAKE_MISSING_RESTORE_GUARD:-}" != tls && " $* " == *" localai-tls-compose.service "* ]]; then
-    printf '/usr/bin/test ! -e /var/lib/.localaictl-backup-restore.pending\n'
+    printf '{ path=/usr/bin/test ; argv[]=/usr/bin/test ! -e /var/lib/.localaictl-backup-restore.pending ; ignore_errors=no ; start_time=[n/a] ; }\n'
   fi
 fi
 if [[ " $* " == *" show --property=Conditions --value "* ]]; then
   if [[ "${LOCALAI_FAKE_MISSING_RESTORE_GUARD:-}" != socket && " $* " == *" localai-tls-forward.socket "* ]]; then
-    printf 'ConditionPathExists=!/var/lib/.localaictl-backup-restore.pending\n'
+    printf '{ type=ConditionPathExists ; trigger=false ; negate=true ; parameter=/var/lib/.localaictl-backup-restore.pending ; state=untested ; }\n'
   fi
   if [[ "${LOCALAI_FAKE_MISSING_RESTORE_GUARD:-}" != forward-service && " $* " == *" localai-tls-forward.service "* ]]; then
-    printf 'ConditionPathExists=!/var/lib/.localaictl-backup-restore.pending\n'
+    printf '{ type=ConditionPathExists ; trigger=false ; negate=true ; parameter=/var/lib/.localaictl-backup-restore.pending ; state=untested ; }\n'
   fi
 fi
 if [[ " $* " == *" show localai.service --property=DropInPaths --value "* ]]; then
@@ -1340,6 +1349,15 @@ for missing_restore_guard in backend tls socket forward-service; do
   stop_count_before="$(rg -c ' stop localai.service$' "$tmp_dir/commands" || true)"
   if LOCALAI_FAKE_MISSING_RESTORE_GUARD="$missing_restore_guard" "$repo_root/bin/localaictl" restore --yes "$backup_archive" >/dev/null 2>&1; then
     printf 'restore proceeded with an old effective %s unit lacking the durable marker guard\n' "$missing_restore_guard" >&2
+    exit 1
+  fi
+  stop_count_after="$(rg -c ' stop localai.service$' "$tmp_dir/commands" || true)"
+  [[ "$stop_count_before" == "$stop_count_after" ]]
+done
+for restore_guard_form in wrapped ignored extra-argv; do
+  stop_count_before="$(rg -c ' stop localai.service$' "$tmp_dir/commands" || true)"
+  if LOCALAI_FAKE_RESTORE_GUARD_FORM="$restore_guard_form" "$repo_root/bin/localaictl" restore --yes "$backup_archive" >/dev/null 2>&1; then
+    printf 'restore accepted a %s effective backend marker guard\n' "$restore_guard_form" >&2
     exit 1
   fi
   stop_count_after="$(rg -c ' stop localai.service$' "$tmp_dir/commands" || true)"

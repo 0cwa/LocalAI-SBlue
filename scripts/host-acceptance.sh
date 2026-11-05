@@ -74,6 +74,24 @@ isolated_ssh_args() {
     -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$known_hosts")
 }
 
+install_process_snapshot() {
+  local output line
+  local snapshot_command="ps -eo comm=,etimes= | awk '{ name=\$1; elapsed=\$2; class=\"\"; if (name == \"rpm-ostree\" || name == \"rpm-ostreed\" || name == \"rpm\" || name == \"dnf\") class=\"package-manager\"; else if (name == \"podman\" || name == \"conmon\" || name == \"crun\" || name == \"localai\" || name == \"caddy\") class=\"container-runtime\"; else if (name == \"curl\" || name == \"wget\" || name == \"git\") class=\"network-transfer\"; else if (name == \"systemd\" || name == \"systemd-run\" || name == \"systemctl\" || name == \"dbus-broker\") class=\"service-manager\"; else if (name == \"bash\" || name == \"sh\" || name == \"timeout\" || name == \"python3\" || name == \"install\" || name == \"tar\" || name == \"cp\") class=\"installer\"; if (class != \"\") { count[class]++; if (elapsed > max_elapsed[class]) max_elapsed[class]=elapsed } } END { for (class in count) printf \"vm-install-process: %s count=%d max-elapsed=%ds\\n\", class, count[class], max_elapsed[class]; if (length(count) == 0) print \"vm-install-process: no-classified-processes count=0 max-elapsed=0s\" }'"
+  if output="$(timeout 15s ssh "${ssh_args[@]}" root@127.0.0.1 "$snapshot_command" 2>/dev/null)"; then
+    while IFS= read -r line; do
+      if [[ "$line" =~ ^vm-install-process:\ (package-manager|container-runtime|network-transfer|service-manager|installer|no-classified-processes)\ count=[0-9]+\ max-elapsed=[0-9]+s$ ]]; then
+        printf '%s\n' "$line"
+      else
+        printf 'vm-install-process: result-unavailable\n'
+      fi
+    done <<<"$output"
+    [[ -n "$output" ]] || printf 'vm-install-process: result-unavailable\n'
+  else
+    printf 'vm-install-process: unavailable\n'
+  fi
+  unset output
+}
+
 qemu_log_category() {
   local log_path="$1"
   if [[ ! -s "$log_path" ]]; then
@@ -370,7 +388,13 @@ worker=/root/agent-scratch/LocalAI-SBlue/acceptance-source/scripts/acceptance-gu
 printf 'Waiting for VM install and initial idle checks...\n' >&2
 # The worker path is a fixed path inside the disposable VM.
 # shellcheck disable=SC2029
-timeout 1800s ssh "${ssh_args[@]}" root@127.0.0.1 "bash $worker install" || fail 'VM install phase failed.'
+timeout 1800s ssh "${ssh_args[@]}" root@127.0.0.1 "bash $worker install" 2>/dev/null &
+install_ssh_pid=$!
+while kill -0 "$install_ssh_pid" 2>/dev/null; do
+  sleep 60
+  if kill -0 "$install_ssh_pid" 2>/dev/null; then install_process_snapshot; fi
+done
+wait "$install_ssh_pid" || fail 'VM install phase failed.'
 old_boot="$(timeout 15s ssh "${ssh_args[@]}" root@127.0.0.1 'cat /proc/sys/kernel/random/boot_id' 2>/dev/null)" || fail 'could not read VM boot state.'
 [[ "$old_boot" =~ ^[0-9a-f-]{36}$ ]] || fail 'invalid VM boot state.'
 timeout 20s ssh "${ssh_args[@]}" root@127.0.0.1 'systemctl reboot --no-block' >/dev/null 2>&1 || :
