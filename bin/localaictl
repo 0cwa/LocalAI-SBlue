@@ -38,11 +38,19 @@ status_elevated=0
 
 die() { printf 'localaictl: %s\n' "$*" >&2; exit 1; }
 log() { printf '%s\n' "$*"; }
-backup_archive_helper="$repo_root/lib/backup_archive.py"
-if [[ ! -f "$backup_archive_helper" || -L "$backup_archive_helper" ]]; then
-  backup_archive_helper="$script_dir/backup_archive.py"
-fi
-[[ -f "$backup_archive_helper" && ! -L "$backup_archive_helper" ]] || die "shared backup archive helper is missing."
+backup_archive_helper_for() {
+  local adjacent="$1/backup_archive.py" repository="$2/lib/backup_archive.py"
+  if [[ -e "$adjacent" || -L "$adjacent" ]]; then
+    [[ -f "$adjacent" && ! -L "$adjacent" ]] || return 1
+    printf '%s\n' "$adjacent"
+  elif [[ -e "$repository" || -L "$repository" ]]; then
+    [[ -f "$repository" && ! -L "$repository" ]] || return 1
+    printf '%s\n' "$repository"
+  else
+    return 1
+  fi
+}
+backup_archive_helper="$(backup_archive_helper_for "$script_dir" "$repo_root")" || die "shared backup archive helper is missing."
 
 if [[ -z "${LOCALAI_CONFIG_FILE:-}" && ! -e "$config_file" ]]; then
   # A repository checkout may use its editable config while developing. An

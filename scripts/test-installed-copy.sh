@@ -2,6 +2,7 @@
 set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck disable=SC2034
 TEST_REPO_ROOT="$repo_root"
 source "$repo_root/scripts/test-support.sh"
 test_sanitize_localai_environment
@@ -17,7 +18,25 @@ cp "$repo_root/lib/backup_archive.py" "$install_dir/backup_archive.py"
 chmod 0755 "$install_dir/localaictl"
 [[ ! -e "$tmp_dir/lib/backup_archive.py" && -f "$install_dir/backup_archive.py" ]]
 python3 "$install_dir/backup_archive.py" stage-check "$tmp_dir"
-rg -q '^  backup_archive_helper="\$script_dir/backup_archive\.py"$' "$repo_root/bin/localaictl"
+helper_fixture="$tmp_dir/helper-selection"
+mkdir -p "$helper_fixture/install" "$helper_fixture/lib"
+printf 'print("source-helper")\n' >"$helper_fixture/lib/backup_archive.py"
+printf 'print("adjacent-helper")\n' >"$helper_fixture/install/backup_archive.py"
+# Exercise the production selector with both candidate paths present.
+# shellcheck disable=SC1090
+source <(sed -n '/^backup_archive_helper_for() {$/,/^}/p' "$repo_root/bin/localaictl")
+selected_helper="$(backup_archive_helper_for "$helper_fixture/install" "$helper_fixture")"
+[[ "$selected_helper" == "$helper_fixture/install/backup_archive.py" ]]
+[[ "$(python3 "$selected_helper")" == adjacent-helper ]]
+mv "$helper_fixture/install/backup_archive.py" "$helper_fixture/install/backup_archive.real"
+ln -s "$helper_fixture/lib/backup_archive.py" "$helper_fixture/install/backup_archive.py"
+if backup_archive_helper_for "$helper_fixture/install" "$helper_fixture" >/dev/null 2>&1; then
+  printf 'helper selector followed a symlink instead of failing closed\n' >&2
+  exit 1
+fi
+rm "$helper_fixture/install/backup_archive.py"
+selected_helper="$(backup_archive_helper_for "$helper_fixture/install" "$helper_fixture")"
+[[ "$selected_helper" == "$helper_fixture/lib/backup_archive.py" ]]
 [[ "$("$install_dir/localaictl" --version)" == "localaictl $(<"$repo_root/VERSION")" ]]
 
 cat >"$install_dir/config/localai.conf" <<'EOF'

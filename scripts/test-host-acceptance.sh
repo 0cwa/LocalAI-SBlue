@@ -312,6 +312,11 @@ qemu-system-x86_64() { exec sleep 60; }
 timeout() { if [[ "$1" == --kill-after=* ]]; then shift; fi; shift; "$@"; }
 ssh() {
   local command="${*: -1}"
+  local ssh_argv=" $* " required
+  for required in '-F /dev/null' '-o ProxyCommand=none' '-o ProxyJump=none' \
+    '-o IdentitiesOnly=yes' '-o ControlMaster=no' '-o ControlPath=none'; do
+    [[ "$ssh_argv" == *" $required "* ]] || { : >"$vm_mock_dir/ssh-isolation-failure"; return 90; }
+  done
   case "$command" in
     true) return 0 ;;
     mkdir*) cat >/dev/null ;;
@@ -334,11 +339,16 @@ ssh() {
     *) return 1 ;;
   esac
 }
-result="$(HOME="$vm_mock_dir/test-home" main --vm "$vm_mock_dir/base.qcow2" "$vm_mock_dir/key" "$vm_mock_dir/vars" "$vm_mock_dir/hostkey.pub")"
-[[ "$result" == "project-version: $(<"$repo_root/VERSION")"$'\n'project-archive-sha256:\ *$'\nstep install: pass\nstep verify: pass' ]]
-grep -Eq '^project-archive-sha256: [a-f0-9]{64}$' <<<"$result"
+if ! result="$(HOME="$vm_mock_dir/test-home" main --vm "$vm_mock_dir/base.qcow2" "$vm_mock_dir/key" "$vm_mock_dir/vars" "$vm_mock_dir/hostkey.pub")"; then
+  printf 'mock VM success path failed\n' >&2; exit 1
+fi
+[[ "$result" == "project-version: $(<"$repo_root/VERSION")"$'\n'project-archive-sha256:\ *$'\nstep install: pass\nstep verify: pass' ]] || {
+  printf 'mock VM success receipt did not match expected stages\n' >&2; exit 1;
+}
+grep -Eq '^project-archive-sha256: [a-f0-9]{64}$' <<<"$result" || { printf 'mock VM receipt digest was invalid\n' >&2; exit 1; }
 [[ -e "$vm_mock_dir/rebooted" ]]
 [[ -z "$(find "$vm_mock_dir/test-home/agent-scratch/LocalAI-SBlue/acceptance-vm" -mindepth 1 -print -quit)" ]]
+printf 'Mock VM successful lifecycle flow passed.\n'
 sleep() {
   local control_home="$vm_mock_dir/test-home" active="$vm_mock_dir/test-home/agent-scratch/LocalAI-SBlue/acceptance-vm/diagnostic-active"
   if [[ -f "$active" ]]; then
@@ -351,7 +361,9 @@ rm -f -- "$vm_mock_dir/rebooted" "$vm_mock_dir/verify-failure-seen" "$vm_mock_di
 if result="$(LOCALAI_ACCEPTANCE_DIAGNOSTIC_PAUSE_SECONDS=5 MOCK_VERIFY_FAIL=1 HOME="$vm_mock_dir/test-home" main --vm "$vm_mock_dir/base.qcow2" "$vm_mock_dir/key" "$vm_mock_dir/vars" "$vm_mock_dir/hostkey.pub" 2>/dev/null)"; then
   printf 'VM verification failure was accepted during diagnostic hold\n' >&2; exit 1
 fi
+printf 'Mock VM failure diagnostic flow returned.\n'
 if [[ ! -f "$vm_mock_dir/verify-failure-seen" ]]; then
+  [[ ! -e "$vm_mock_dir/ssh-isolation-failure" ]] || { printf 'VM SSH argv omitted an isolation option\n' >&2; exit 1; }
   [[ "$result" == *'step install: pass'* ]] || printf 'VM install stage did not pass before mock failure\n' >&2
   [[ "$result" == *'step vm-orchestration: fail'* ]] || printf 'VM orchestration did not report a failure stage\n' >&2
   printf 'VM verification failure mock was not reached\n' >&2; exit 1
@@ -372,24 +384,73 @@ diagnostic_run="$diagnostic_scratch/run.controltest"
 mkdir -p "$diagnostic_run"
 chmod 0700 "$diagnostic_run"
 chmod 0700 "$diagnostic_scratch"
+proc_fixture="$vm_mock_dir/proc-fixture"
+fake_qemu_pid=43210
+fake_qemu_start=987654
+fake_qemu_exe="$(realpath -e -- "$(type -P qemu-system-x86_64)")"
+mkdir -p "$proc_fixture/$fake_qemu_pid"
+fake_stat_fields=(S)
+for ((index = 1; index < 19; index++)); do fake_stat_fields+=(0); done
+fake_stat_fields+=("$fake_qemu_start")
+printf '%s (%s) %s\n' "$fake_qemu_pid" 'qemu mock ) name' "${fake_stat_fields[*]}" >"$proc_fixture/$fake_qemu_pid/stat"
+ln -s "$fake_qemu_exe" "$proc_fixture/$fake_qemu_pid/exe"
+printf '%s\0' "$fake_qemu_exe" -machine q35,accel=kvm -nic 'user,hostfwd=tcp:127.0.0.1:23456-:22' -display none >"$proc_fixture/$fake_qemu_pid/cmdline"
+if [[ "$(proc_start_time "$fake_qemu_pid" "$proc_fixture")" != "$fake_qemu_start" ]]; then
+  printf 'QEMU start-time parser did not match synthetic process stat\n' >&2; exit 1
+fi
+qemu_process_matches "$fake_qemu_pid" "$fake_qemu_start" 23456 "$fake_qemu_exe" "$proc_fixture" || {
+  printf 'QEMU identity rejected the valid synthetic instance\n' >&2; exit 1;
+}
+if qemu_process_matches 43211 "$fake_qemu_start" 23456 "$fake_qemu_exe" "$proc_fixture"; then
+  printf 'QEMU identity accepted a dead PID\n' >&2; exit 1
+fi
+if qemu_process_matches "$fake_qemu_pid" 987655 23456 "$fake_qemu_exe" "$proc_fixture"; then
+  printf 'QEMU identity accepted a reused PID with a different start time\n' >&2; exit 1
+fi
+if qemu_process_matches "$fake_qemu_pid" "$fake_qemu_start" 23457 "$fake_qemu_exe" "$proc_fixture"; then
+  printf 'QEMU identity accepted a process bound to another port\n' >&2; exit 1
+fi
+rm "$proc_fixture/$fake_qemu_pid/exe"
+ln -s "$(type -P sleep)" "$proc_fixture/$fake_qemu_pid/exe"
+if qemu_process_matches "$fake_qemu_pid" "$fake_qemu_start" 23456 "$fake_qemu_exe" "$proc_fixture"; then
+  printf 'QEMU identity accepted the wrong executable\n' >&2; exit 1
+fi
+rm "$proc_fixture/$fake_qemu_pid/exe"
+ln -s "$fake_qemu_exe" "$proc_fixture/$fake_qemu_pid/exe"
+printf 'QEMU process identity mock cases passed.\n'
 read -r diagnostic_key_type diagnostic_key_data _ <"$vm_mock_dir/hostkey.pub"
 printf '[127.0.0.1]:23456 %s %s\n' "$diagnostic_key_type" "$diagnostic_key_data" >"$diagnostic_run/known_hosts"
 chmod 0600 "$diagnostic_run/known_hosts" "$vm_mock_dir/key"
-printf '23456\n%s\n' "$vm_mock_dir/test-home-alias/agent-scratch/LocalAI-SBlue/acceptance-vm/run.controltest/known_hosts" >"$diagnostic_scratch/diagnostic-connection"
+printf '23456\n%s\n%s\n%s\n' \
+  "$vm_mock_dir/test-home-alias/agent-scratch/LocalAI-SBlue/acceptance-vm/run.controltest/known_hosts" \
+  "$fake_qemu_pid" "$fake_qemu_start" >"$diagnostic_scratch/diagnostic-connection"
 : >"$diagnostic_scratch/diagnostic-active"
 chmod 0600 "$diagnostic_scratch/diagnostic-connection" "$diagnostic_scratch/diagnostic-active"
 [[ "$(<"$diagnostic_scratch/diagnostic-connection")" != *"$vm_mock_dir/key"* ]] || { printf 'VM diagnostic connection stored an SSH identity path\n' >&2; exit 1; }
-if result="$(HOME="$vm_mock_dir/test-home-alias" main --diagnose-vm-backup "$vm_mock_dir/key" 2>/dev/null)"; then
+rm -f -- "$vm_mock_dir/diagnose-command-seen"
+if result="$(HOME="$vm_mock_dir/test-home-alias" main --diagnose-vm-backup "$vm_mock_dir/key" 2>&1)"; then
+  printf 'VM diagnostic control accepted a nonexistent QEMU PID\n' >&2; exit 1
+fi
+[[ "$result" == *'step vm-orchestration: fail'* && "$result" == *'acceptance: VM diagnostic QEMU process identity is stale or mismatched.'* ]] || {
+  printf 'diagnostic control did not refuse a dead PID before SSH\n' >&2; exit 1;
+}
+[[ ! -e "$vm_mock_dir/diagnose-command-seen" ]] || { printf 'diagnostic SSH ran for a dead PID\n' >&2; exit 1; }
+if result="$(HOME="$vm_mock_dir/test-home-alias" diagnose_vm_backup_with_proc_root "$vm_mock_dir/key" "$proc_fixture" 2>/dev/null)"; then
   printf 'VM diagnostic control accepted a failed backup probe\n' >&2; exit 1
 fi
+[[ -e "$vm_mock_dir/diagnose-command-seen" ]] || { printf 'valid mocked QEMU identity did not reach diagnostic SSH\n' >&2; exit 1; }
 if [[ "$result" != $'step backup-restore-backup: fail\ndiagnostic backup-restore-backup-reason: system-manager-tree' ]]; then
   printf 'VM diagnostic control did not sanitize its fixed mock response\n' >&2; exit 1
 fi
-result="$(HOME="$vm_mock_dir/test-home-alias" main --release-vm-diagnostic-pause)"
-[[ "$result" == 'diagnostic-pause: release-requested' && -f "$diagnostic_scratch/diagnostic-release" && ! -L "$diagnostic_scratch/diagnostic-release" ]]
+result="$(HOME="$vm_mock_dir/test-home-alias" main --release-vm-diagnostic-pause)" || { printf 'diagnostic pause release mock failed\n' >&2; exit 1; }
+[[ "$result" == 'diagnostic-pause: release-requested' && -f "$diagnostic_scratch/diagnostic-release" && ! -L "$diagnostic_scratch/diagnostic-release" ]] || {
+  printf 'diagnostic pause release state did not match expected\n' >&2; exit 1;
+}
 rm -f -- "$diagnostic_scratch/diagnostic-active" "$diagnostic_scratch/diagnostic-release" "$diagnostic_scratch/diagnostic-connection"
 rm -rf -- "$diagnostic_run"
-[[ -z "$(find "$diagnostic_scratch" -mindepth 1 -print -quit)" ]]
+[[ -z "$(find "$diagnostic_scratch" -mindepth 1 -print -quit)" ]] || {
+  printf 'diagnostic connection test left scratch state behind\n' >&2; exit 1;
+}
 if result="$(MOCK_INSTALL_FAIL=1 HOME="$vm_mock_dir/test-home" main --vm "$vm_mock_dir/base.qcow2" "$vm_mock_dir/key" "$vm_mock_dir/vars" "$vm_mock_dir/hostkey.pub" 2>/dev/null)"; then
   printf 'VM install failure was accepted\n' >&2; exit 1
 fi

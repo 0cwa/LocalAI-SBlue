@@ -28,11 +28,58 @@ release_vm_diagnostic_pause() {
   (umask 077; set -o noclobber; : >"$release") || fail 'could not release VM diagnostic pause.'
   printf 'diagnostic-pause: release-requested\n'
 }
-diagnose_vm_backup() {
-  local scratch canonical_scratch active connection port key known_hosts known_hosts_dir run_name canonical_known_hosts worker output line status=0 reason
+proc_start_time() {
+  local pid="$1" proc_root="${2:-/proc}" stat_line stat_fields
+  [[ "$pid" =~ ^[1-9][0-9]*$ && -r "$proc_root/$pid/stat" ]] || return 1
+  IFS= read -r stat_line <"$proc_root/$pid/stat" || return 1
+  stat_fields="${stat_line##*) }"
+  local -a fields=()
+  read -r -a fields <<<"$stat_fields"
+  [[ "${#fields[@]}" -ge 20 && "${fields[19]}" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "${fields[19]}"
+}
+
+qemu_process_matches() {
+  local pid="$1" expected_start="$2" port="$3" expected_exe="$4" proc_root="${5:-/proc}"
+  local current_start exe_arg found_nic=0 found_display=0 index
+  local -a process_args=()
+  [[ "$pid" =~ ^[1-9][0-9]*$ && "$expected_start" =~ ^[0-9]+$ && "$port" =~ ^[0-9]{1,5}$ ]] || return 1
+  (( 10#$port > 0 && 10#$port <= 65535 )) || return 1
+  [[ "$expected_exe" == /* && -x "$expected_exe" ]] || return 1
+  current_start="$(proc_start_time "$pid" "$proc_root")" || return 1
+  [[ "$current_start" == "$expected_start" ]] || return 1
+  exe_arg="$(readlink -f -- "$proc_root/$pid/exe" 2>/dev/null)" || return 1
+  [[ "$exe_arg" == "$expected_exe" ]] || return 1
+  [[ -r "$proc_root/$pid/cmdline" ]] || return 1
+  mapfile -d '' -t process_args <"$proc_root/$pid/cmdline"
+  for ((index = 0; index < ${#process_args[@]}; index++)); do
+    if [[ "${process_args[$index]}" == -nic && "${process_args[$((index + 1))]:-}" == "user,hostfwd=tcp:127.0.0.1:$port-:22" ]]; then
+      found_nic=1
+    fi
+    if [[ "${process_args[$index]}" == -display && "${process_args[$((index + 1))]:-}" == none ]]; then
+      found_display=1
+    fi
+  done
+  [[ "$found_nic" == 1 && "$found_display" == 1 ]]
+}
+
+isolated_ssh_args() {
+  local -n result_ref="$1"
+  local key="$2" port="$3" known_hosts="$4" connect_timeout="$5"
+  # The caller consumes this nameref-backed output array.
+  # shellcheck disable=SC2034
+  result_ref=(-F /dev/null -o ProxyCommand=none -o ProxyJump=none
+    -o IdentitiesOnly=yes -o ControlMaster=no -o ControlPath=none
+    -i "$key" -p "$port" -o BatchMode=yes -o "ConnectTimeout=$connect_timeout"
+    -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$known_hosts")
+}
+
+diagnose_vm_backup_with_proc_root() {
+  local key_arg="$1" proc_root="$2"
+  local scratch canonical_scratch active connection port key known_hosts known_hosts_dir run_name canonical_known_hosts qemu_pid qemu_start expected_exe worker output line status=0 reason
   local -a connection_fields=() ssh_args=()
-  [[ "$#" == 2 && "$2" == /* ]] || { usage >&2; exit 2; }
-  key="$(realpath -e -- "$2")" || fail 'VM diagnostic identity is unavailable.'
+  [[ "$key_arg" == /* ]] || { usage >&2; exit 2; }
+  key="$(realpath -e -- "$key_arg")" || fail 'VM diagnostic identity is unavailable.'
   scratch="${HOME:?}/agent-scratch/LocalAI-SBlue/acceptance-vm"
   canonical_scratch="$(realpath -e -- "$scratch")" || fail 'VM diagnostic scratch is unavailable.'
   active="$scratch/diagnostic-active"
@@ -41,9 +88,11 @@ diagnose_vm_backup() {
   [[ -f "$active" && ! -L "$active" && "$(stat -c '%u:%a' -- "$active")" == "$(id -u):600" ]] || fail 'VM diagnostic pause is not active.'
   [[ -f "$connection" && ! -L "$connection" && "$(stat -c '%u:%a' -- "$connection")" == "$(id -u):600" ]] || fail 'VM diagnostic connection is unavailable.'
   mapfile -t connection_fields <"$connection"
-  [[ "${#connection_fields[@]}" == 2 ]] || fail 'VM diagnostic connection is invalid.'
+  [[ "${#connection_fields[@]}" == 4 ]] || fail 'VM diagnostic connection is invalid.'
   port="${connection_fields[0]}"
   known_hosts="${connection_fields[1]}"
+  qemu_pid="${connection_fields[2]}"
+  qemu_start="${connection_fields[3]}"
   if [[ ! "$port" =~ ^[0-9]{1,5}$ ]]; then fail 'VM diagnostic connection is invalid.'; fi
   if (( 10#$port == 0 || 10#$port > 65535 )); then fail 'VM diagnostic connection is invalid.'; fi
   [[ "$key" == /* && ! -L "$key" && -f "$key" && "$(stat -c '%u' -- "$key")" == "$(id -u)" ]] || fail 'VM diagnostic identity is unavailable.'
@@ -54,9 +103,10 @@ diagnose_vm_backup() {
   canonical_known_hosts="$canonical_scratch/$run_name/known_hosts"
   [[ ! -L "$known_hosts" && -f "$known_hosts" && "$(realpath -e -- "$known_hosts")" == "$canonical_known_hosts" && "$(stat -c '%u:%a' -- "$known_hosts")" == "$(id -u):600" ]] || fail 'VM diagnostic host key is unavailable.'
   ssh-keygen -F "[127.0.0.1]:$port" -f "$known_hosts" >/dev/null 2>&1 || fail 'VM diagnostic host key is invalid.'
+  expected_exe="$(realpath -e -- "$(type -P qemu-system-x86_64)")" || fail 'VM diagnostic QEMU executable is unavailable.'
+  qemu_process_matches "$qemu_pid" "$qemu_start" "$port" "$expected_exe" "$proc_root" || fail 'VM diagnostic QEMU process identity is stale or mismatched.'
   worker=/root/agent-scratch/LocalAI-SBlue/acceptance-source/scripts/acceptance-guest.sh
-  ssh_args=(-i "$key" -p "$port" -o BatchMode=yes -o ConnectTimeout=5
-    -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$known_hosts")
+  isolated_ssh_args ssh_args "$key" "$port" "$known_hosts" 5
   if output="$(timeout 1800s ssh "${ssh_args[@]}" root@127.0.0.1 "bash $worker diagnose-backup" 2>&1)"; then
     status=0
   else
@@ -79,6 +129,10 @@ diagnose_vm_backup() {
   done <<<"$output"
   unset output
   return "$status"
+}
+diagnose_vm_backup() {
+  [[ "$#" == 2 && "$2" == /* ]] || { usage >&2; exit 2; }
+  diagnose_vm_backup_with_proc_root "$2" /proc
 }
 bounded_vm_diagnostic_pause() {
   local scratch="$1" duration="$2" active release elapsed=0
@@ -194,9 +248,6 @@ cp -- "$vars" "$work/vars.fd"
 port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
 connection="$scratch/diagnostic-connection"
 [[ ! -e "$connection" && ! -L "$connection" ]] || fail 'VM diagnostic connection path is already occupied.'
-(umask 077; set -o noclobber; printf '%s\n%s\n' "$port" "$work/known_hosts" >"$connection") || fail 'could not prepare VM diagnostic connection.'
-diagnostic_connection_created=1
-chmod 0600 -- "$connection"
 # QEMU's comma-separated drive syntax escapes a literal comma as two commas.
 overlay_arg="${work//,/,,}/overlay.qcow2"
 vars_arg="${work//,/,,}/vars.fd"
@@ -207,9 +258,12 @@ qemu-system-x86_64 -machine q35,accel=kvm -cpu host -m 6144 -smp 4 \
   -nic "user,hostfwd=tcp:127.0.0.1:$port-:22" \
   -display none -audio none -serial none -monitor none >"$work/qemu.log" 2>&1 &
 qemu_pid=$!
+qemu_start_time="$(proc_start_time "$qemu_pid" /proc)" || fail 'could not record VM process identity.'
+(umask 077; set -o noclobber; printf '%s\n%s\n%s\n%s\n' "$port" "$work/known_hosts" "$qemu_pid" "$qemu_start_time" >"$connection") || fail 'could not prepare VM diagnostic connection.'
+diagnostic_connection_created=1
+chmod 0600 -- "$connection"
 printf '[127.0.0.1]:%s %s %s\n' "$port" "$hostkey_type" "$hostkey_data" > "$work/known_hosts"
-ssh_args=(-i "$key" -p "$port" -o BatchMode=yes -o ConnectTimeout=3
-  -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$work/known_hosts")
+isolated_ssh_args ssh_args "$key" "$port" "$work/known_hosts" 3
 wait_for_guest() {
   local deadline=$((SECONDS + 300))
   printf 'Waiting for the disposable VM to accept SSH (timeout 300s)...\n' >&2
