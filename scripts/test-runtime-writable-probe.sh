@@ -109,7 +109,8 @@ MOCK_PODMAN
 chmod 0755 "$scratch/bin/podman"
 
 export PATH="$scratch/bin:$PATH"
-export LOCALAI_SERVICE_USER="$(id -un)"
+LOCALAI_SERVICE_USER="$(id -un)"
+export LOCALAI_SERVICE_USER
 export LOCALAI_CONFIG_FILE="$scratch/no-config"
 export LOCALAI_STATE_DIR="$scratch/state"
 export LOCALAI_CONTAINER_NAME=mock-localai
