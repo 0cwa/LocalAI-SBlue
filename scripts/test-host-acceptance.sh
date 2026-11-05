@@ -367,22 +367,25 @@ if [[ "$result" != *'diagnostic-recheck: started'* || "$result" != *'diagnostic 
 fi
 [[ -z "$(find "$vm_mock_dir/test-home/agent-scratch/LocalAI-SBlue/acceptance-vm" -mindepth 1 -print -quit)" ]]
 diagnostic_scratch="$vm_mock_dir/test-home/agent-scratch/LocalAI-SBlue/acceptance-vm"
-diagnostic_run="$diagnostic_scratch/run.control-test"
+ln -s "$vm_mock_dir/test-home" "$vm_mock_dir/test-home-alias"
+diagnostic_run="$diagnostic_scratch/run.controltest"
 mkdir -p "$diagnostic_run"
 chmod 0700 "$diagnostic_run"
 chmod 0700 "$diagnostic_scratch"
 read -r diagnostic_key_type diagnostic_key_data _ <"$vm_mock_dir/hostkey.pub"
 printf '[127.0.0.1]:23456 %s %s\n' "$diagnostic_key_type" "$diagnostic_key_data" >"$diagnostic_run/known_hosts"
 chmod 0600 "$diagnostic_run/known_hosts" "$vm_mock_dir/key"
-printf '23456\n%s\n' "$diagnostic_run/known_hosts" >"$diagnostic_scratch/diagnostic-connection"
+printf '23456\n%s\n' "$vm_mock_dir/test-home-alias/agent-scratch/LocalAI-SBlue/acceptance-vm/run.controltest/known_hosts" >"$diagnostic_scratch/diagnostic-connection"
 : >"$diagnostic_scratch/diagnostic-active"
 chmod 0600 "$diagnostic_scratch/diagnostic-connection" "$diagnostic_scratch/diagnostic-active"
 [[ "$(<"$diagnostic_scratch/diagnostic-connection")" != *"$vm_mock_dir/key"* ]] || { printf 'VM diagnostic connection stored an SSH identity path\n' >&2; exit 1; }
-if result="$(HOME="$vm_mock_dir/test-home" main --diagnose-vm-backup "$vm_mock_dir/key" 2>/dev/null)"; then
+if result="$(HOME="$vm_mock_dir/test-home-alias" main --diagnose-vm-backup "$vm_mock_dir/key" 2>/dev/null)"; then
   printf 'VM diagnostic control accepted a failed backup probe\n' >&2; exit 1
 fi
-[[ "$result" == $'step backup-restore-backup: fail\ndiagnostic backup-restore-backup-reason: system-manager-tree' ]] || { printf 'VM diagnostic control did not sanitize its guest response\n' >&2; exit 1; }
-result="$(HOME="$vm_mock_dir/test-home" main --release-vm-diagnostic-pause)"
+if [[ "$result" != $'step backup-restore-backup: fail\ndiagnostic backup-restore-backup-reason: system-manager-tree' ]]; then
+  printf 'VM diagnostic control did not sanitize its fixed mock response\n' >&2; exit 1
+fi
+result="$(HOME="$vm_mock_dir/test-home-alias" main --release-vm-diagnostic-pause)"
 [[ "$result" == 'diagnostic-pause: release-requested' && -f "$diagnostic_scratch/diagnostic-release" && ! -L "$diagnostic_scratch/diagnostic-release" ]]
 rm -f -- "$diagnostic_scratch/diagnostic-active" "$diagnostic_scratch/diagnostic-release" "$diagnostic_scratch/diagnostic-connection"
 rm -rf -- "$diagnostic_run"

@@ -29,11 +29,12 @@ release_vm_diagnostic_pause() {
   printf 'diagnostic-pause: release-requested\n'
 }
 diagnose_vm_backup() {
-  local scratch active connection port key known_hosts worker output line status=0 reason
+  local scratch canonical_scratch active connection port key known_hosts known_hosts_dir run_name canonical_known_hosts worker output line status=0 reason
   local -a connection_fields=() ssh_args=()
   [[ "$#" == 2 && "$2" == /* ]] || { usage >&2; exit 2; }
   key="$(realpath -e -- "$2")" || fail 'VM diagnostic identity is unavailable.'
   scratch="${HOME:?}/agent-scratch/LocalAI-SBlue/acceptance-vm"
+  canonical_scratch="$(realpath -e -- "$scratch")" || fail 'VM diagnostic scratch is unavailable.'
   active="$scratch/diagnostic-active"
   connection="$scratch/diagnostic-connection"
   [[ -d "$scratch" && ! -L "$scratch" && "$(stat -c '%u:%a' -- "$scratch")" == "$(id -u):700" ]] || fail 'VM diagnostic pause is not active.'
@@ -47,7 +48,11 @@ diagnose_vm_backup() {
   if (( 10#$port == 0 || 10#$port > 65535 )); then fail 'VM diagnostic connection is invalid.'; fi
   [[ "$key" == /* && ! -L "$key" && -f "$key" && "$(stat -c '%u' -- "$key")" == "$(id -u)" ]] || fail 'VM diagnostic identity is unavailable.'
   case "$(stat -c '%a' -- "$key")" in 400|600) ;; *) fail 'VM diagnostic identity is not private.' ;; esac
-  [[ "$known_hosts" == "$scratch"/run.*/known_hosts && ! -L "$known_hosts" && -f "$known_hosts" && "$(realpath -e -- "$known_hosts")" == "$known_hosts" && "$(stat -c '%u:%a' -- "$known_hosts")" == "$(id -u):600" ]] || fail 'VM diagnostic host key is unavailable.'
+  known_hosts_dir="${known_hosts%/*}"
+  run_name="${known_hosts_dir##*/}"
+  [[ "$known_hosts" == "$scratch"/run.*/known_hosts && "$run_name" =~ ^run\.[A-Za-z0-9]+$ && ! -L "$known_hosts_dir" && -d "$known_hosts_dir" && "$(stat -c '%u:%a' -- "$known_hosts_dir")" == "$(id -u):700" && "$(realpath -e -- "$known_hosts_dir")" == "$canonical_scratch/$run_name" ]] || fail 'VM diagnostic host key is unavailable.'
+  canonical_known_hosts="$canonical_scratch/$run_name/known_hosts"
+  [[ ! -L "$known_hosts" && -f "$known_hosts" && "$(realpath -e -- "$known_hosts")" == "$canonical_known_hosts" && "$(stat -c '%u:%a' -- "$known_hosts")" == "$(id -u):600" ]] || fail 'VM diagnostic host key is unavailable.'
   ssh-keygen -F "[127.0.0.1]:$port" -f "$known_hosts" >/dev/null 2>&1 || fail 'VM diagnostic host key is invalid.'
   worker=/root/agent-scratch/LocalAI-SBlue/acceptance-source/scripts/acceptance-guest.sh
   ssh_args=(-i "$key" -p "$port" -o BatchMode=yes -o ConnectTimeout=5
