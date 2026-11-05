@@ -331,17 +331,33 @@ The LocalAI image directories `/backends`, `/models`, `/data`, and
 state directory. Upgrades refuse unrecognized existing volumes so their data
 can be inspected and migrated safely before retrying.
 
-Stop the services before taking a file-level backup:
+Create a protected archive with `localaictl`:
 
 ```sh
-bin/localaictl stop
+bin/localaictl backup /path/to/localai-backup.tar.gz
 ```
 
-Back up `/etc/localai/localai.conf`, `/var/lib/localai`, and
-`/var/lib/localai-tls` with a tool that preserves ownership, permissions,
-extended attributes, and SELinux labels. The TLS state includes the CA and
-certificate material. Protect backups as sensitive data and verify restore
-procedures before relying on them.
+The command briefly stops active LocalAI services, archives the configured
+shared configuration and state with numeric ownership, modes, ACLs, extended
+attributes, and SELinux labels, then returns services to their prior active
+state. The archive records the configured backend and TLS image references and
+digests. Use `backup --exclude-models` to leave the configured models directory
+out of the archive; restoring such an archive leaves any existing models
+untouched. The archive is created with mode `0600`.
+
+Backups contain the TLS CA private key and the LocalAI authentication database.
+Store them as sensitive data. Restore into matching configured paths; restore
+rejects unsafe archive entries and linked destination paths. It overlays files
+from the archive, preserving unrelated files. If any archived path already
+exists, review the archive and explicitly confirm the overlay:
+
+```sh
+bin/localaictl restore --yes /path/to/localai-backup.tar.gz
+```
+
+Restore preserves archived ownership and SELinux xattrs, verifies the labels
+on configured state roots, and restores the services' previous active state.
+`--yes` does not remove unrelated files from state directories.
 
 For an upgrade, keep a copy of the previous release and shared config, unpack
 the new release, review changes to `config/localai.conf.example`, and rerun the

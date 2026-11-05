@@ -26,6 +26,8 @@ curl_bin="${LOCALAI_CURL_BIN:-/usr/bin/curl}"
 id_bin="${LOCALAI_ID_BIN:-/usr/bin/id}"
 date_bin="${LOCALAI_DATE_BIN:-/usr/bin/date}"
 sha256_bin="${LOCALAI_SHA256_BIN:-/usr/bin/sha256sum}"
+tar_bin="${LOCALAI_TAR_BIN:-/usr/bin/tar}"
+matchpathcon_bin="${LOCALAI_MATCHPATHCON_BIN:-/usr/sbin/matchpathcon}"
 config_file="${LOCALAI_CONFIG_FILE:-/etc/localai/localai.conf}"
 legacy_config_file="${LOCALAI_LEGACY_CONFIG_FILE:-$repo_root/localai/localai.lock}"
 audit_dir="${LOCALAI_AUDIT_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/localai/audit}"
@@ -68,6 +70,9 @@ tls_enabled() {
 service_uid() { "$id_bin" -u "$1"; }
 
 is_effectively_root() { [[ "$EUID" == 0 ]]; }
+backup_runtime_dir() {
+  if is_effectively_root; then printf '/run\n'; else printf '%s\n' "${XDG_RUNTIME_DIR:-/run}"; fi
+}
 
 # Called through the controller's indirectly selected systemctl helpers.
 # shellcheck disable=SC2329
@@ -465,12 +470,266 @@ doctor() {
   return 1
 }
 
+backup_units() {
+  printf '%s\n' backend
+  if tls_enabled; then
+    printf '%s\n' tls
+    [[ "$LOCALAI_TLS_PUBLIC_SOCKET" == true ]] && printf '%s\n' socket
+  fi
+}
+
+backup_unit_state() {
+  case "$1" in
+    backend) backend_state ;;
+    tls) tls_state ;;
+    socket) socket_state ;;
+    *) return 2 ;;
+  esac
+}
+
+backup_unit_action() {
+  local unit="$1" action="$2"
+  case "$unit" in
+    backend) backend_systemctl "$action" localai.service ;;
+    tls) tls_systemctl "$action" "$LOCALAI_TLS_SERVICE_NAME" ;;
+    socket) root_systemctl "$action" "$LOCALAI_TLS_FORWARD_SOCKET_NAME" "$LOCALAI_TLS_FORWARD_SERVICE_NAME" ;;
+    *) return 2 ;;
+  esac
+}
+
+restore_backup_service_state() {
+  local unit status=0
+  for unit in socket tls backend; do
+    if [[ " ${backup_was_active[*]:-} " == *" $unit "* ]]; then
+      backup_unit_action "$unit" start || { printf 'localaictl: warning: could not restore the previous %s service state\n' "$unit" >&2; status=1; }
+    fi
+  done
+  return "$status"
+}
+
+backup_stop_services() {
+  local unit state
+  backup_was_active=()
+  while IFS= read -r unit; do
+    state="$(backup_unit_state "$unit")"
+    case "$state" in
+      active) backup_was_active+=("$unit") ;;
+      inactive|failed) ;;
+      *) die "cannot determine a stable $unit service state; refusing backup or restore" ;;
+    esac
+  done < <(backup_units)
+  for unit in socket tls backend; do
+    if [[ " ${backup_was_active[*]:-} " == *" $unit "* ]]; then
+      backup_unit_action "$unit" stop || die "could not stop $unit service for backup"
+      state="$(backup_unit_state "$unit")"
+      [[ "$state" == inactive || "$state" == failed ]] || die "could not verify that $unit service stopped"
+    fi
+  done
+}
+
+backup() {
+  local exclude_models=0 destination path lock_file destination_parent tmp
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      --exclude-models) [[ "$exclude_models" == 0 ]] || die "backup accepts --exclude-models once"; exclude_models=1; shift ;;
+      --*) die "unknown backup option: $1" ;;
+      *) break ;;
+    esac
+  done
+  [[ "$#" == 1 ]] || die "backup requires one destination path"
+  destination="$1"
+  [[ "$destination" == /* ]] || destination="$PWD/$destination"
+  [[ ! -e "$destination" && ! -L "$destination" ]] || die "backup destination already exists"
+  [[ -d "${destination%/*}" ]] || die "backup destination directory does not exist"
+  destination_parent="${destination%/*}"
+  [[ "$(realpath -m -- "$destination_parent")" == "$destination_parent" ]] || die "backup destination parent must not contain symbolic links or traversal components"
+  destination="$(realpath -m -- "$destination")"
+  for path in "$config_file" "$LOCALAI_STATE_DIR" "$LOCALAI_TLS_STATE_DIR"; do
+    [[ "$destination" != "$path" && "$destination" != "$path"/* ]] || die "backup destination must be outside the configuration and state paths"
+    [[ ! -L "$path" && "$(realpath -m -- "$path")" == "$path" ]] || die "backup source paths must not use symbolic links"
+  done
+  lock_file=/run/lock/localai-backup.lock
+  tmp="$(mktemp "${destination%/*}/.localaictl-backup.XXXXXX")"
+  chmod 0600 "$tmp"
+  local -a args=(--archive-file "$tmp")
+  [[ "$exclude_models" == 0 ]] || args=(--exclude-models "${args[@]}")
+  if ! run_elevated_pipe /usr/bin/flock -n "$lock_file" "$script_dir/localaictl" __backup "${args[@]}" >"$tmp"; then
+    rm -f -- "$tmp"
+    die "backup is already running or could not start"
+  fi
+  if ! ln -- "$tmp" "$destination"; then
+    rm -f -- "$tmp"
+    die "could not create backup without overwriting another file"
+  fi
+  rm -f -- "$tmp"
+  log "Backup created: $destination"
+}
+
+backup_locked() {
+  local exclude_models=0 archive_file metadata_dir runtime_dir archive_args=() path
+  if [[ "${1:-}" == --exclude-models ]]; then exclude_models=1; shift; fi
+  [[ "${1:-}" == --archive-file && "$#" == 2 ]] || die "internal backup requires an archive stream target"
+  archive_file="$2"
+  runtime_dir="$(backup_runtime_dir)"
+  for path in "$config_file" "$LOCALAI_STATE_DIR" "$LOCALAI_TLS_STATE_DIR"; do
+    [[ ! -L "$path" && "$(realpath -m -- "$path")" == "$path" ]] || die "backup source paths must not use symbolic links"
+  done
+  printf 'WARNING: this backup contains the TLS CA private key and LocalAI authentication database. Store it securely.\n' >&2
+  backup_was_active=()
+  backup_tmp=""
+  backup_metadata_dir=""
+  trap 'backup_exit_cleanup' EXIT
+  backup_stop_services
+  metadata_dir="$(mktemp -d "$runtime_dir/localai-backup.XXXXXX")"
+  backup_metadata_dir="$metadata_dir"
+  chmod 0700 "$metadata_dir"
+  printf 'format=1\nbackend_image=%s\nbackend_digest=%s\ntls_image=%s\ntls_digest=%s\n' \
+    "$LOCALAI_IMAGE_REF" "$LOCALAI_IMAGE_DIGEST" "$LOCALAI_TLS_IMAGE_REF" "$LOCALAI_TLS_IMAGE_DIGEST" >"$metadata_dir/metadata"
+  chmod 0600 "$metadata_dir/metadata"
+  archive_args=(--create --gzip --file - --xattrs --acls --selinux --numeric-owner)
+  if [[ "$exclude_models" == 1 ]]; then
+    path="${LOCALAI_MODELS_PATH#/}"
+    archive_args+=(--exclude="$path" --exclude="$path/*")
+  fi
+  archive_args+=(--directory "$metadata_dir" metadata --directory /)
+  [[ -e "$config_file" ]] && archive_args+=("${config_file#/}")
+  [[ -e "$LOCALAI_STATE_DIR" ]] && archive_args+=("${LOCALAI_STATE_DIR#/}")
+  [[ -e "$LOCALAI_TLS_STATE_DIR" ]] && archive_args+=("${LOCALAI_TLS_STATE_DIR#/}")
+  run_elevated_pipe "$tar_bin" "${archive_args[@]}" || die "backup archive creation failed"
+  run_elevated /usr/bin/python3 "$repo_root/lib/backup_archive.py" validate "$archive_file" "$config_file" "$LOCALAI_STATE_DIR" "$LOCALAI_TLS_STATE_DIR" || die "backup contains unsupported or unsafe filesystem entries"
+  rm -rf -- "$metadata_dir"
+  backup_metadata_dir=""
+  trap - EXIT
+  restore_backup_service_state || die "backup completed but one or more previously active services could not be restarted"
+}
+
+# Called indirectly by the backup EXIT trap.
+# shellcheck disable=SC2329
+backup_exit_cleanup() {
+  [[ -z "${backup_tmp:-}" ]] || rm -f -- "$backup_tmp"
+  [[ -z "${backup_metadata_dir:-}" ]] || rm -rf -- "$backup_metadata_dir"
+  restore_backup_service_state || :
+}
+
+restore_archive() {
+  local source="$1" lock_file
+  [[ -f "$source" && ! -L "$source" ]] || die "restore source must be a regular, non-linked archive file"
+  source="$(realpath -e -- "$source")"
+  lock_file=/run/lock/localai-backup.lock
+  local -a args=("$source")
+  [[ "${restore_confirmed:-0}" == 0 ]] || args=(--yes "$source")
+  run_elevated_pipe /usr/bin/flock -n "$lock_file" "$script_dir/localaictl" __restore "${args[@]}" || die "restore is already running or could not start"
+}
+
+restore_locked() {
+  local source="$1" stage source_copy members collisions snapshot skip_links target answer item had_target=0 runtime_dir needs_confirmation=0
+  local helper="$repo_root/lib/backup_archive.py"
+  runtime_dir="$(backup_runtime_dir)"
+  [[ -f "$source" && ! -L "$source" ]] || die "restore source must be a regular, non-linked archive file"
+  source="$(realpath -e -- "$source")"
+  stage="$(mktemp -d "$runtime_dir/localai-restore.XXXXXX")"
+  backup_was_active=()
+  RESTORE_ROLLBACK_FAILED=0
+  RESTORE_SERVICES_STOPPED=0
+  trap 'restore_exit_cleanup' EXIT
+  chmod 0700 "$stage"
+  members="$stage/members0"
+  collisions="$stage/collisions0"
+  snapshot="$stage/rollback.tar"
+  skip_links="$stage/skip-links0"
+  source_copy="$stage/input.tar.gz"
+  run_elevated /usr/bin/python3 "$helper" copy-source "$source" "$config_file" "$LOCALAI_STATE_DIR" "$LOCALAI_TLS_STATE_DIR" "$source_copy" || die "could not safely copy restore archive"
+  source="$source_copy"
+  run_elevated /usr/bin/python3 "$helper" validate "$source" "$config_file" "$LOCALAI_STATE_DIR" "$LOCALAI_TLS_STATE_DIR" || die "backup contains unsupported or unsafe filesystem entries"
+  run_elevated "$tar_bin" --extract --gzip --file "$source" --directory "$stage" --xattrs --acls --selinux --numeric-owner --same-owner || die "could not extract backup into private staging"
+  run_elevated /usr/bin/python3 "$helper" destinations "$source" "$config_file" "$LOCALAI_STATE_DIR" "$LOCALAI_TLS_STATE_DIR" "$stage" || die "restore paths are unsafe"
+  run_elevated /usr/bin/python3 "$helper" skip-links0 "$source" "$config_file" "$LOCALAI_STATE_DIR" "$LOCALAI_TLS_STATE_DIR" "$stage" >"$skip_links"
+  run_elevated /usr/bin/python3 "$helper" members0 "$source" "$config_file" "$LOCALAI_STATE_DIR" "$LOCALAI_TLS_STATE_DIR" >"$members"
+  run_elevated /usr/bin/python3 "$helper" collisions0 "$source" "$config_file" "$LOCALAI_STATE_DIR" "$LOCALAI_TLS_STATE_DIR" >"$collisions"
+  for target in "$LOCALAI_STATE_DIR" "$LOCALAI_TLS_STATE_DIR"; do
+    if [[ -d "$target" ]] && [[ -n "$(run_elevated find "$target" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then needs_confirmation=1; fi
+  done
+  [[ ! -e "$config_file" ]] || needs_confirmation=1
+  if [[ "$needs_confirmation" == 1 && "${restore_confirmed:-0}" != 1 ]]; then
+    [[ -t 0 ]] || die "restore requires --yes in non-interactive use"
+    printf 'This overlays LocalAI configuration and state, including the TLS CA key and authentication database. Continue? [y/N] ' >&2
+    read -r answer
+    [[ "$answer" == y || "$answer" == Y ]] || die "restore cancelled"
+  fi
+  RESTORE_SERVICES_STOPPED=1
+  backup_stop_services
+  run_elevated /usr/bin/python3 "$helper" destinations "$source" "$config_file" "$LOCALAI_STATE_DIR" "$LOCALAI_TLS_STATE_DIR" "$stage" || die "restore paths changed while services stopped"
+  run_elevated /usr/bin/python3 "$helper" skip-links0 "$source" "$config_file" "$LOCALAI_STATE_DIR" "$LOCALAI_TLS_STATE_DIR" "$stage" >"$skip_links"
+  run_elevated /usr/bin/python3 "$helper" collisions0 "$source" "$config_file" "$LOCALAI_STATE_DIR" "$LOCALAI_TLS_STATE_DIR" >"$collisions"
+  needs_confirmation=0
+  for target in "$LOCALAI_STATE_DIR" "$LOCALAI_TLS_STATE_DIR"; do
+    if [[ -d "$target" ]] && [[ -n "$(run_elevated find "$target" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then needs_confirmation=1; fi
+  done
+  [[ ! -e "$config_file" ]] || needs_confirmation=1
+  if [[ "$needs_confirmation" == 1 && "${restore_confirmed:-0}" != 1 ]]; then
+    die "restore targets changed before restore; rerun with --yes after reviewing the overwrite"
+  fi
+  if [[ -s "$collisions" ]]; then
+    had_target=1
+    run_elevated "$tar_bin" --create --file "$snapshot" --xattrs --acls --selinux --numeric-owner --no-recursion --directory / --null --files-from="$collisions" || die "could not prepare rollback snapshot"
+  fi
+  local -a links_to_keep=()
+  mapfile -d '' -t links_to_keep <"$skip_links"
+  for item in "${links_to_keep[@]}"; do rm -f -- "$stage/$item"; done
+  for target in "$LOCALAI_STATE_DIR" "$LOCALAI_TLS_STATE_DIR"; do
+    if [[ -d "$stage/${target#/}" ]]; then mkdir -p -- "$target"; fi
+  done
+  if [[ -e "$stage/${config_file#/}" ]]; then mkdir -p -- "${config_file%/*}"; fi
+  for target in "$LOCALAI_STATE_DIR" "$LOCALAI_TLS_STATE_DIR"; do
+    if [[ -d "$stage/${target#/}" && ! -L "$stage/${target#/}" ]]; then
+      run_elevated cp -a -- "$stage/${target#/}/." "$target/" || { restore_rollback "$members" "$collisions" "$snapshot" "$had_target" || RESTORE_ROLLBACK_FAILED=1; die "restore failed; rollback was attempted"; }
+    fi
+  done
+  if [[ -e "$stage/${config_file#/}" ]]; then
+    run_elevated cp -a -- "$stage/${config_file#/}" "$config_file" || { restore_rollback "$members" "$collisions" "$snapshot" "$had_target" || RESTORE_ROLLBACK_FAILED=1; die "restore failed; rollback was attempted"; }
+  fi
+  for target in "$LOCALAI_STATE_DIR" "$LOCALAI_TLS_STATE_DIR" "${config_file%/*}"; do
+    [[ -e "$target" ]] || continue
+    run_elevated "$matchpathcon_bin" -V "$target" || { restore_rollback "$members" "$collisions" "$snapshot" "$had_target" || RESTORE_ROLLBACK_FAILED=1; die "SELinux label verification failed; rollback was attempted"; }
+  done
+  rm -rf -- "$stage"
+  trap - EXIT
+  restore_backup_service_state || die "restore completed but one or more previously active services could not be restarted"
+  log "Backup restored. State was overlaid, unrelated files were preserved, and configured root labels were verified."
+}
+
+restore_rollback() {
+  local members="$1" collisions="$2" snapshot="$3" had_target="$4"
+  local status=0
+  run_elevated /usr/bin/python3 "$repo_root/lib/backup_archive.py" rollback-new "$source" "$config_file" "$LOCALAI_STATE_DIR" "$LOCALAI_TLS_STATE_DIR" "$members" "$collisions" || { log "warning: could not remove all newly restored paths"; status=1; }
+  if [[ "$had_target" == 1 ]]; then
+    run_elevated "$tar_bin" --extract --file "$snapshot" --directory / --xattrs --acls --selinux --numeric-owner --same-owner || { log "warning: could not restore the rollback snapshot"; status=1; }
+  fi
+  return "$status"
+}
+
+# Called indirectly by the restore EXIT trap.
+# shellcheck disable=SC2329
+restore_exit_cleanup() {
+  rm -rf -- "${stage:-}"
+  if [[ "${RESTORE_ROLLBACK_FAILED:-0}" == 1 ]]; then
+    log "warning: rollback was incomplete; previously active services remain stopped for manual recovery"
+    return 0
+  fi
+  [[ "${RESTORE_SERVICES_STOPPED:-0}" == 1 ]] || return 0
+  restore_backup_service_state || :
+}
+
 usage() {
   cat <<'EOF'
-Usage: localaictl --version | [--dry-run] <bootstrap-admin|start|stop|restart|status [--json] [--elevated]|logs [backend|tls|all]|doctor>
+Usage: localaictl --version | [--dry-run] <bootstrap-admin|start|stop|restart|status [--json] [--elevated]|logs [backend|tls|all]|doctor|backup [--exclude-models] <dest>|restore [--yes] <src>>
 
 The command controls only the known LocalAI backend, TLS Compose service, and
 TLS forward socket. It does not accept arbitrary systemd or Podman commands.
+
+Backup stops active services temporarily and starts them again afterwards.
+Use `backup --exclude-models` to omit the configured models directory. Restore
+requires an empty target or `--yes` to confirm replacing configuration/state.
 
 doctor uses normal TLS verification. For the local Caddy CA, set
 LOCALAI_DOCTOR_CACERT=/path/to/root.crt. Use LOCALAI_DOCTOR_TOKEN only for a
@@ -499,6 +758,19 @@ while [[ "$#" -gt 0 ]]; do
       fi
       exit $?
       ;;
+    __backup)
+      shift
+      backup_locked "$@"
+      exit $?
+      ;;
+    __restore)
+      shift
+      restore_confirmed=0
+      if [[ "${1:-}" == --yes ]]; then restore_confirmed=1; shift; fi
+      [[ "$#" == 1 ]] || die "internal restore requires one source archive"
+      restore_locked "$1"
+      exit $?
+      ;;
     bootstrap-admin)
       shift
       [[ "$#" == 0 ]] || die "bootstrap-admin accepts no arguments"
@@ -509,6 +781,19 @@ while [[ "$#" -gt 0 ]]; do
       shift
       [[ "$#" == 0 ]] || die "start accepts no arguments"
       start_stack
+      exit $?
+      ;;
+    backup)
+      shift
+      backup "$@"
+      exit $?
+      ;;
+    restore)
+      shift
+      restore_confirmed=0
+      if [[ "${1:-}" == --yes ]]; then restore_confirmed=1; shift; fi
+      [[ "$#" == 1 ]] || die "restore accepts [--yes] and one source archive"
+      restore_archive "$1"
       exit $?
       ;;
     stop)

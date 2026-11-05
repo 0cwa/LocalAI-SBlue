@@ -8,6 +8,9 @@ has been runtime-qualified on secureblue or on a GPU.
 - Add tray endpoint diagnostics, safe endpoint copying, and warning-gated terminal log access that stays open for review while keeping backend and TLS states independent.
 - Probe all configured writable LocalAI paths inside the existing container and document which paths hold persistent data or scratch files.
 
+- Add protected `localaictl backup` and explicitly confirmed overlay restore,
+  preserving archive ownership, modes, xattrs, ACLs, and SELinux labels.
+
 ## 0.2.0
 
 Qualification: repository checks for this release; a preceding 0.1.0 source snapshot passed disposable secureblue CPU VM lifecycle and first-admin checks. Physical host, GPU, and full Caddy TLS remain unverified.

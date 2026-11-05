@@ -26,6 +26,12 @@ while [[ "$#" -gt 0 ]]; do
     *) break ;;
   esac
 done
+if [[ "${1:-}" == /usr/bin/flock ]]; then
+  shift
+  [[ "${1:-}" == -n ]] && shift
+  shift # replace the production lock path with a private fixture path
+  exec /usr/bin/flock -n "${LOCALAI_FAKE_LOCK_FILE:?}" "$@"
+fi
 if [[ "${1:-}" == /usr/bin/python3 && "${2:-}" == /etc/localai/bootstrap-guard.py ]]; then
   exit 0
 fi
@@ -47,13 +53,19 @@ if [[ " $* " == *" is-active "* ]]; then
   case " $* " in
     *" is-active localai.service "*)
       if [[ "${LOCALAI_FAKE_BACKEND_UNAVAILABLE:-false}" == true ]]; then exit 1; fi
-      printf '%s\n' "${LOCALAI_FAKE_BACKEND_STATE:-active}"
+      if [[ -f "${LOCALAI_FAKE_STATE_DIR:-}/backend" ]]; then cat "${LOCALAI_FAKE_STATE_DIR}/backend"; else printf '%s\n' "${LOCALAI_FAKE_BACKEND_STATE:-active}"; fi
       ;;
-    *" is-active localai-tls-compose.service "*) printf '%s\n' "${LOCALAI_FAKE_TLS_STATE:-active}" ;;
-    *" is-active localai-tls-forward.socket "*) printf '%s\n' "${LOCALAI_FAKE_SOCKET_STATE:-active}" ;;
+    *" is-active localai-tls-compose.service "*) if [[ -f "${LOCALAI_FAKE_STATE_DIR:-}/tls" ]]; then cat "${LOCALAI_FAKE_STATE_DIR}/tls"; else printf '%s\n' "${LOCALAI_FAKE_TLS_STATE:-active}"; fi ;;
+    *" is-active localai-tls-forward.socket "*) if [[ -f "${LOCALAI_FAKE_STATE_DIR:-}/socket" ]]; then cat "${LOCALAI_FAKE_STATE_DIR}/socket"; else printf '%s\n' "${LOCALAI_FAKE_SOCKET_STATE:-active}"; fi ;;
     *) printf 'inactive\n' ;;
   esac
 fi
+if [[ " $* " == *" stop localai.service "* ]]; then printf 'inactive\n' >"${LOCALAI_FAKE_STATE_DIR}/backend"; fi
+if [[ " $* " == *" start localai.service "* ]]; then printf 'active\n' >"${LOCALAI_FAKE_STATE_DIR}/backend"; fi
+if [[ " $* " == *" stop localai-tls-compose.service "* ]]; then printf 'inactive\n' >"${LOCALAI_FAKE_STATE_DIR}/tls"; fi
+if [[ " $* " == *" start localai-tls-compose.service "* ]]; then printf 'active\n' >"${LOCALAI_FAKE_STATE_DIR}/tls"; fi
+if [[ " $* " == *" stop localai-tls-forward.socket "* ]]; then printf 'inactive\n' >"${LOCALAI_FAKE_STATE_DIR}/socket"; fi
+if [[ " $* " == *" start localai-tls-forward.socket "* ]]; then printf 'active\n' >"${LOCALAI_FAKE_STATE_DIR}/socket"; fi
 if [[ "${LOCALAI_FAKE_FAIL_TLS:-false}" == true && " $* " == *" start localai-tls-compose.service "* ]]; then
   exit 1
 fi
@@ -94,6 +106,10 @@ export LOCALAI_RUN0_BIN="$tmp_dir/run0"
 export LOCALAI_SYSTEMCTL_BIN="$tmp_dir/systemctl"
 export LOCALAI_AUDIT_DIR="$tmp_dir/audit"
 export LOCALAI_FAKE_LOG="$tmp_dir/commands"
+export LOCALAI_FAKE_STATE_DIR="$tmp_dir/service-state"
+export LOCALAI_FAKE_LOCK_FILE="$tmp_dir/backup.lock"
+export XDG_RUNTIME_DIR="$tmp_dir"
+mkdir -p "$LOCALAI_FAKE_STATE_DIR"
 export LOCALAI_ID_BIN="$tmp_dir/id"
 export LOCALAI_JOURNALCTL_BIN="$tmp_dir/journalctl"
 export LOCALAI_SYSTEM_UNIT_DIR="$tmp_dir/systemd"
@@ -327,5 +343,129 @@ if "$repo_root/bin/localaictl" start; then
 fi
 rg -q '"action":"start".*"result":"failure"' "$tmp_dir/audit/$(date +%Y-%m-%d).jsonl"
 rg -q 'start localai-tls-forward.socket' "$tmp_dir/commands"
+
+# Backup and restore exercise real tar metadata operations against disposable
+# paths while service-manager commands remain mocked.
+unset LOCALAI_FAKE_FAIL_TLS
+mkdir -p "$tmp_dir/backup-state" "$tmp_dir/backup-tls" "$tmp_dir/backup-config-dir"
+printf 'active\n' >"$LOCALAI_FAKE_STATE_DIR/backend"
+printf 'state fixture\n' >"$tmp_dir/backup-state/database.db"
+chmod 0640 "$tmp_dir/backup-state/database.db"
+python3 - "$tmp_dir/backup-state/database.db" <<'PY'
+import os, sys
+try:
+    os.setxattr(sys.argv[1], 'user.localai-test', b'preserve-xattr')
+except OSError:
+    pass
+PY
+ln -s database.db "$tmp_dir/backup-state/database-current"
+printf 'tls fixture\n' >"$tmp_dir/backup-tls/ca.key"
+printf 'preserve this\n' >"$tmp_dir/backup-state/unrelated.txt"
+printf 'LOCALAI_STATE_DIR=%s\nLOCALAI_TLS_STATE_DIR=%s\nLOCALAI_MODELS_PATH=%s\nLOCALAI_TLS_ENABLED=false\n' \
+  "$tmp_dir/backup-state" "$tmp_dir/backup-tls" "$tmp_dir/backup-state/models" >"$tmp_dir/backup-config-dir/localai.conf"
+mkdir -p "$tmp_dir/backup-state/models"
+printf 'model fixture\n' >"$tmp_dir/backup-state/models/model.bin"
+export LOCALAI_CONFIG_FILE="$tmp_dir/backup-config-dir/localai.conf"
+export LOCALAI_TAR_BIN=/usr/bin/tar
+cat >"$tmp_dir/matchpathcon" <<'EOF'
+#!/usr/bin/env bash
+printf 'matchpathcon %s\n' "$*" >>"${LOCALAI_FAKE_LOG:?}"
+[[ "${LOCALAI_FAKE_FAIL_LABEL:-false}" != true ]]
+EOF
+chmod 0755 "$tmp_dir/matchpathcon"
+export LOCALAI_MATCHPATHCON_BIN="$tmp_dir/matchpathcon"
+: >"$tmp_dir/commands"
+backup_archive="$tmp_dir/backup.tar.gz"
+if ! "$repo_root/bin/localaictl" backup --exclude-models "$backup_archive" 2>"$tmp_dir/backup-warning"; then
+  cat "$tmp_dir/backup-warning" >&2
+  exit 1
+fi
+[[ "$(stat -c '%a' "$backup_archive")" == 600 ]]
+rg -q 'TLS CA private key' "$tmp_dir/backup-warning"
+archive_metadata="$(/usr/bin/tar -xOzf "$backup_archive" metadata)"
+rg -q '^backend_image=' <<<"$archive_metadata"
+rg -q '^backend_digest=' <<<"$archive_metadata"
+if /usr/bin/tar -tzf "$backup_archive" | rg -q 'models/model.bin'; then
+  printf 'models were included despite --exclude-models\n' >&2
+  exit 1
+fi
+if "$repo_root/bin/localaictl" backup "$tmp_dir/backup-state/inside.tar.gz" >/dev/null 2>&1; then
+  printf 'backup destination inside state was accepted\n' >&2
+  exit 1
+fi
+malicious_archive="$tmp_dir/malicious.tar.gz"
+python3 - "$malicious_archive" "$tmp_dir/backup-state" <<'PY'
+import io, sys, tarfile
+with tarfile.open(sys.argv[1], 'w:gz') as archive:
+    info = tarfile.TarInfo('metadata')
+    info.size = 3
+    archive.addfile(info, io.BytesIO(b'v=1'))
+    info = tarfile.TarInfo(sys.argv[2].lstrip('/') + '/escape')
+    info.type = tarfile.SYMTYPE
+    info.linkname = '../../../../etc/passwd'
+    archive.addfile(info)
+PY
+stop_count_before="$(rg -c ' stop localai.service$' "$tmp_dir/commands" || true)"
+if "$repo_root/bin/localaictl" restore --yes "$malicious_archive" >/dev/null 2>&1; then
+  printf 'restore accepted a traversal symbolic link\n' >&2
+  exit 1
+fi
+stop_count_after="$(rg -c ' stop localai.service$' "$tmp_dir/commands" || true)"
+[[ "$stop_count_before" == "$stop_count_after" ]]
+rm "$tmp_dir/backup-state/database-current"
+ln -s elsewhere "$tmp_dir/backup-state/database-current"
+if "$repo_root/bin/localaictl" restore --yes "$backup_archive" >/dev/null 2>&1; then
+  printf 'restore accepted a mismatched destination symlink\n' >&2
+  exit 1
+fi
+stop_count_after="$(rg -c ' stop localai.service$' "$tmp_dir/commands" || true)"
+[[ "$stop_count_before" == "$stop_count_after" ]]
+rm "$tmp_dir/backup-state/database-current"
+ln -s database.db "$tmp_dir/backup-state/database-current"
+rg -q '^systemctl .*stop localai.service$' "$tmp_dir/commands"
+rg -q '^systemctl .*start localai.service$' "$tmp_dir/commands"
+if "$repo_root/bin/localaictl" backup "$backup_archive" >/dev/null 2>&1; then
+  printf 'backup overwrote an existing destination\n' >&2
+  exit 1
+fi
+if "$repo_root/bin/localaictl" restore "$backup_archive" >/dev/null 2>&1; then
+  printf 'restore overwrote non-empty state without confirmation\n' >&2
+  exit 1
+fi
+printf 'damaged state\n' >"$tmp_dir/backup-state/database.db"
+"$repo_root/bin/localaictl" restore --yes "$backup_archive" >"$tmp_dir/restore-output"
+[[ "$(<"$tmp_dir/backup-state/database.db")" == 'state fixture' ]]
+[[ "$(stat -c '%a' "$tmp_dir/backup-state/database.db")" == 640 ]]
+python3 - "$tmp_dir/backup-state/database.db" <<'PY'
+import os, sys
+try:
+    assert os.getxattr(sys.argv[1], 'user.localai-test') == b'preserve-xattr'
+except OSError:
+    pass
+PY
+[[ "$(<"$tmp_dir/backup-tls/ca.key")" == 'tls fixture' ]]
+[[ "$(readlink "$tmp_dir/backup-state/database-current")" == database.db ]]
+rg -q '^matchpathcon -V ' "$tmp_dir/commands"
+if rg -q '^restorecon ' "$tmp_dir/commands"; then
+  printf 'restore recursively relabeled persistent state\n' >&2
+  exit 1
+fi
+rg -q 'start localai.service' "$tmp_dir/commands"
+[[ "$(<"$tmp_dir/backup-state/unrelated.txt")" == 'preserve this' ]]
+[[ "$(<"$LOCALAI_FAKE_STATE_DIR/backend")" == active ]]
+
+printf 'before rollback\n' >"$tmp_dir/backup-state/database.db"
+export LOCALAI_FAKE_FAIL_LABEL=true
+if "$repo_root/bin/localaictl" restore --yes "$backup_archive" >"$tmp_dir/rollback-output" 2>"$tmp_dir/rollback-error"; then
+  printf 'restore ignored a failed SELinux label verification\n' >&2
+  exit 1
+fi
+unset LOCALAI_FAKE_FAIL_LABEL
+[[ "$(<"$tmp_dir/backup-state/database.db")" == 'before rollback' ]]
+if [[ "$(<"$LOCALAI_FAKE_STATE_DIR/backend")" != active ]]; then
+  cat "$tmp_dir/rollback-output" "$tmp_dir/rollback-error" >&2
+  cat "$tmp_dir/commands" >&2
+  exit 1
+fi
 
 printf 'localaictl tests passed\n'

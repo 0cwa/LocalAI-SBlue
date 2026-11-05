@@ -43,6 +43,7 @@ manifest=(
   bin/localaictl
   config/localai.conf.example
   lib/config.sh
+  lib/backup_archive.py
   lib/acceptance.sh
   lib/bootstrap_guard.py
   lib/installer_safety.sh
