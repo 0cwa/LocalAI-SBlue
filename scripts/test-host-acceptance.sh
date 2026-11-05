@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# The test intentionally runs functions in subshells and calls sourced mocks indirectly.
+# shellcheck disable=SC1091,SC2030,SC2031,SC2269,SC2329
 set -euo pipefail
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -29,6 +31,7 @@ if rg -q 'secret-value' "$receipt"; then
 fi
 # Host-mode checkpoints skip completed steps but retry failed steps.
 (
+  # shellcheck disable=SC1090
   # shellcheck disable=SC1090
   source <(sed -n '/^step() {$/,/^}/p' "$repo_root/scripts/acceptance-guest.sh")
   # These values are read by the extracted production helper.
@@ -106,6 +109,85 @@ fi
   if ensure_unrelated_container "$run_id"; then exit 1; fi
   if unrelated_container_matches "$run_id"; then exit 1; fi
   if ensure_unrelated_container invalid; then exit 1; fi
+)
+# The VM-only backup acceptance step is bounded, silent, and verifies both
+# config metadata/labels and a persistent marker across a mocked round trip.
+(
+  # shellcheck disable=SC1090
+  source <(sed -n '/^step() {$/,/^}/p' "$repo_root/scripts/acceptance-guest.sh")
+  # shellcheck disable=SC1090
+  source <(sed -n '/^backup_restore_roundtrip() {$/,/^}/p' "$repo_root/scripts/acceptance-guest.sh")
+  test_work="$work/backup-restore"
+  mkdir -m 0700 "$test_work"
+  mkdir -m 0700 "$test_work/config" "$test_work/state"
+  mkdir -m 0700 "$test_work/state/data"
+  mkdir -p "$test_work/state/.local/share/containers/storage"
+  chmod 0700 "$test_work/state/.local/share/containers/storage"
+  config_path="$test_work/config/localai.conf"
+  printf 'LOCALAI_STATE_DIR=%s\nLOCALAI_MODELS_PATH=%s/models\nLOCALAI_BACKENDS_PATH=%s/backends\nLOCALAI_DOWNLOAD_STAGING_PATH=%s/downloading\nLOCALAI_BACKEND_TEMP_DIR=%s/tmp\nLOCALAI_DATA_PATH=%s/data\nLOCALAI_CONFIG_DIR=%s/config\nLOCALAI_GENERATED_CONTENT_PATH=%s/generated\nLOCALAI_UPLOAD_PATH=%s/uploads\nLOCALAI_CACHE_DIR=%s/cache\nLOCALAI_LOG_DIR=%s/logs\nLOCALAI_TLS_STATE_DIR=%s\nLOCALAI_TLS_CONFIG_DIR=%s/caddy\nLOCALAI_TLS_CACHE_DIR=%s/cache\nLOCALAI_TLS_CERT_DIR=%s/certs\nLOCALAI_TLS_COMPOSE_DIR=%s/compose\nLOCALAI_TLS_ENABLED=false\n' \
+    "$test_work/state" "$test_work/state" "$test_work/state" "$test_work/state" "$test_work/state" "$test_work/state" "$test_work/state" "$test_work/state" "$test_work/state" "$test_work/state" "$test_work/state" "$test_work/tls" "$test_work/tls" "$test_work/tls" "$test_work/tls" "$test_work/tls" >"$config_path"
+  chmod 0600 "$config_path"
+  printf 'original config\n' >"$test_work/config-original"
+  cp "$config_path" "$test_work/config-original"
+  cat >"$test_work/fake-locaictl" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+  backup)
+    cp -- "$TEST_CONFIG" "$TEST_WORK/saved-config"
+    cp -- "$TEST_MARKER" "$TEST_WORK/saved-marker"
+    cp -- "$TEST_GRAPH_MARKER" "$TEST_WORK/saved-graph-marker"
+    : >"$2"
+    chmod 0600 "$2"
+    printf 'suppressed fixture output\n'
+    ;;
+  restore)
+    cp -- "$TEST_WORK/saved-config" "$TEST_CONFIG"
+    cp -- "$TEST_WORK/saved-marker" "$TEST_MARKER"
+    cp -- "$TEST_WORK/saved-graph-marker" "$TEST_GRAPH_MARKER"
+    printf 'suppressed fixture output\n'
+    ;;
+  *) exit 2 ;;
+esac
+EOF
+  chmod 0755 "$test_work/fake-locaictl"
+  export TEST_WORK="$test_work" TEST_CONFIG="$config_path" TEST_MARKER="$test_work/state/data/.localaictl-backup-restore-marker" TEST_GRAPH_MARKER="$test_work/state/.local/share/containers/storage/.localaictl-backup-restore-marker"
+  # Functions and globals are consumed by the extracted production helpers.
+  # shellcheck disable=SC2034
+  repo_root="$repo_root" mode=vm receipt="$test_work/receipt" progress='' controller="$test_work/fake-locaictl" work="$test_work" host_receipt_ready=0
+  : >"$receipt"
+  fail() {
+    case "$*" in
+      *'cannot load configured persistent paths'*) printf 'test acceptance failure: config-load\n' >&2 ;;
+      *'config path'*) printf 'test acceptance failure: config-path\n' >&2 ;;
+      *'root-owned'*) printf 'test acceptance failure: config-owner\n' >&2 ;;
+      *'group/world writable'*) printf 'test acceptance failure: config-mode\n' >&2 ;;
+      *'SELinux label'*) printf 'test acceptance failure: config-label\n' >&2 ;;
+      *'data path'*) printf 'test acceptance failure: data-path\n' >&2 ;;
+      *'marker'*) printf 'test acceptance failure: marker\n' >&2 ;;
+      *'active state'*) printf 'test acceptance failure: service-state\n' >&2 ;;
+      *'backup'*) printf 'test acceptance failure: backup-step\n' >&2 ;;
+      *'restore'*) printf 'test acceptance failure: restore-step\n' >&2 ;;
+      *) printf 'test acceptance failure: fixture-check\n' >&2 ;;
+    esac
+    exit 1
+  }
+  check_unit() { [[ "$1:$2" == active:disabled ]]; }
+  matchpathcon() { [[ "$1" == -V ]]; }
+  stat() {
+    if [[ " $* " == *" $TEST_CONFIG "* ]]; then printf '0:600\n'; else command stat "$@"; fi
+  }
+  : >"$test_work/step-output"
+  # Use the actual shared step runner with its command output redirected.
+  source "$repo_root/lib/acceptance.sh"
+  if (backup_restore_roundtrip "$test_work" "$config_path") >"$test_work/step-output" 2>&1; then :; else cat "$test_work/step-output" >&2; exit 1; fi
+  [[ ! -e "$TEST_MARKER" ]] || { printf 'acceptance fixture marker was not cleaned\n' >&2; exit 1; }
+  [[ ! -e "$TEST_GRAPH_MARKER" ]] || { printf 'acceptance graph fixture marker was not cleaned\n' >&2; exit 1; }
+  cmp -s "$config_path" "$test_work/config-original" || { printf 'acceptance fixture config was not restored\n' >&2; exit 1; }
+  rg -q '^command backup-restore-backup:' "$receipt" || { printf 'backup acceptance command was not recorded\n' >&2; exit 1; }
+  rg -q '^waiting backup-restore-backup: timeout 1800s$' "$receipt" || { printf 'backup acceptance timeout was not recorded\n' >&2; exit 1; }
+  rg -q '^step backup-restore-backup: pass$' "$receipt" || { printf 'backup acceptance result was not recorded\n' >&2; exit 1; }
+  rg -q '^step backup-restore-restore: pass$' "$receipt" || { printf 'restore acceptance result was not recorded\n' >&2; exit 1; }
+  ! rg -q 'suppressed fixture output|/var/home|secret' "$receipt" "$test_work/step-output" || { printf 'acceptance output leaked fixture data\n' >&2; exit 1; }
 )
 # Health checks retry a briefly unavailable service without recording output.
 (
@@ -275,7 +357,8 @@ printf 'Acceptance host authorization tests passed\n'
   source "$repo_root/scripts/acceptance-host.sh"
   state="$work/host-state"
   unit="$work/host-acceptance.service"
-  unit_name=host-acceptance.service
+# shellcheck disable=SC2034
+unit_name=host-acceptance.service
   call_file="$work/host-systemctl.calls"
   : >"$call_file"
   getenforce() { printf 'Enforcing\n'; }

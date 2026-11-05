@@ -180,6 +180,8 @@ step() {
     disable-boot) description='systemctl --user disable localai.service' ;;
     preserve-config) description='compare installed config with pre-upgrade copy' ;;
     preserve-data|uninstall-preserves-data) description='check persistent test marker' ;;
+    backup-restore-backup) description='localaictl backup with root-owned config and persistent marker' ;;
+    backup-restore-restore) description='localaictl restore and verify config/SELinux and data markers' ;;
     conservative-uninstall) description='backend uninstaller --yes' ;;
     uninstall-preserves-unrelated-container) description='podman inspect unrelated test container ownership label' ;;
     *) fail 'unknown acceptance step.' ;;
@@ -235,6 +237,91 @@ check() {
     fi
   fi
   return 1
+}
+
+backup_restore_roundtrip() {
+  local test_work="$1" config_path="$2" backup_path
+  backup_path="$test_work/backup-restore.tar.gz"
+  local config_copy="$test_work/backup-restore-config.before" marker_path graph_marker marker_value graph_value config_stat marker_stat graph_stat config_mode
+  local path existing covered bytes source_bytes=0 needed available
+  local -a configured_paths backup_roots=()
+  # shellcheck disable=SC1091
+  source "$repo_root/lib/config.sh"
+  localai_config_load_compat "$config_path" "$repo_root/localai/localai.lock" || fail 'cannot load configured persistent paths for backup acceptance.'
+  [[ -f "$config_path" && ! -L "$config_path" && "$(realpath -m -- "$config_path")" == "$config_path" ]] || fail 'acceptance config path is not a regular canonical file.'
+  config_stat="$(stat -c '%u:%a' -- "$config_path")"
+  [[ "${config_stat%%:*}" == 0 ]] || fail 'acceptance config is not root-owned.'
+  config_mode="${config_stat#*:}"
+  (( (8#$config_mode & 8#22) == 0 )) || fail 'acceptance config is group/world writable.'
+  matchpathcon -V "$config_path" >/dev/null 2>&1 || fail 'acceptance config SELinux label does not match policy.'
+  [[ "$LOCALAI_DATA_PATH" == /* && "$(realpath -m -- "$LOCALAI_DATA_PATH")" == "$LOCALAI_DATA_PATH" ]] || fail 'acceptance data path is not canonical.'
+  configured_paths=(
+    "$LOCALAI_STATE_DIR" "$LOCALAI_MODELS_PATH" "$LOCALAI_BACKENDS_PATH"
+    "$LOCALAI_DOWNLOAD_STAGING_PATH" "$LOCALAI_BACKEND_TEMP_DIR" "$LOCALAI_DATA_PATH"
+    "$LOCALAI_CONFIG_DIR" "$LOCALAI_GENERATED_CONTENT_PATH" "$LOCALAI_UPLOAD_PATH"
+    "$LOCALAI_CACHE_DIR" "$LOCALAI_LOG_DIR" "$LOCALAI_TLS_STATE_DIR"
+    "$LOCALAI_TLS_CONFIG_DIR" "$LOCALAI_TLS_CACHE_DIR" "$LOCALAI_TLS_CERT_DIR"
+    "$LOCALAI_TLS_COMPOSE_DIR"
+  )
+  while IFS= read -r path; do
+    covered=0
+    for existing in "${backup_roots[@]}"; do
+      if [[ "$path" == "$existing" || "$path" == "$existing"/* ]]; then covered=1; break; fi
+    done
+    [[ "$covered" == 1 ]] || backup_roots+=("$path")
+  done < <(printf '%s\0' "${configured_paths[@]}" | /usr/bin/python3 -c 'import sys; p=[x for x in sys.stdin.buffer.read().split(b"\0") if x]; [sys.stdout.buffer.write(x+b"\0") for x in sorted(p,key=lambda x:(len(x),x))]' | while IFS= read -r -d '' path; do printf '%s\n' "$path"; done)
+  for path in "${backup_roots[@]}"; do
+    [[ ! -e "$path" ]] && continue
+    bytes="$(du -s -B1 --apparent-size -- "$path" 2>/dev/null | awk '{print $1}')" || fail 'cannot estimate configured data size for acceptance.'
+    [[ "$bytes" =~ ^[0-9]+$ ]] || fail 'cannot estimate configured data size for acceptance.'
+    source_bytes=$((source_bytes + bytes))
+  done
+  needed=$((source_bytes * 4 + 268435456))
+  for path in "$test_work" /var/lib; do
+    available="$(df -B1 --output=avail -- "$path" 2>/dev/null | tail -n 1)" || fail 'cannot check free disk space for acceptance.'
+    if [[ ! "$available" =~ ^[0-9]+$ ]] || (( available < needed )); then
+      fail 'insufficient disk space for the backup and restore acceptance run.'
+    fi
+  done
+  mkdir -p -- "$LOCALAI_DATA_PATH"
+  marker_path="$LOCALAI_DATA_PATH/.localaictl-backup-restore-marker"
+  graph_marker="$LOCALAI_STATE_DIR/.local/share/containers/storage/.localaictl-backup-restore-marker"
+  [[ ! -e "$marker_path" && ! -L "$marker_path" ]] || fail 'backup acceptance marker already exists.'
+  [[ ! -e "$graph_marker" && ! -L "$graph_marker" ]] || fail 'graph storage acceptance marker already exists.'
+  if grep -Fq '# localai backup restore acceptance marker' "$config_path"; then
+    fail 'backup acceptance config marker already exists.'
+  fi
+  cp -a -- "$config_path" "$config_copy" || fail 'cannot save acceptance config metadata.'
+  marker_value='localai backup restore acceptance marker'
+  printf '%s\n' "$marker_value" >"$marker_path"
+  chmod 0600 -- "$marker_path"
+  marker_stat="$(stat -c '%u:%a' -- "$marker_path")"
+  mkdir -p -- "${graph_marker%/*}"
+  graph_value='localai graph storage backup restore acceptance marker'
+  printf '%s\n' "$graph_value" >"$graph_marker"
+  chmod 0600 -- "$graph_marker"
+  graph_stat="$(stat -c '%u:%a' -- "$graph_marker")"
+  printf '# localai backup restore acceptance marker\n' >>"$config_path"
+  check_unit active disabled || fail 'backend was not active before backup acceptance.'
+  step backup-restore-backup 1800 "$controller" backup "$backup_path" || fail 'backup acceptance command failed.'
+  [[ -f "$backup_path" && ! -L "$backup_path" && "$(stat -c '%a' -- "$backup_path")" == 600 ]] || fail 'backup archive is not a private regular file.'
+  printf 'damaged marker\n' >"$marker_path"
+  printf 'damaged graph marker\n' >"$graph_marker"
+  printf '# damaged backup restore acceptance marker\n' >>"$config_path"
+  step backup-restore-restore 1800 "$controller" restore --yes "$backup_path" || fail 'restore acceptance command failed.'
+  check_unit active disabled || fail 'restore did not return the backend to its previous active state.'
+  [[ "$(<"$marker_path")" == "$marker_value" && "$(stat -c '%u:%a' -- "$marker_path")" == "$marker_stat" ]] || fail 'persistent data marker was not restored with its ownership and mode.'
+  [[ "$(<"$graph_marker")" == "$graph_value" && "$(stat -c '%u:%a' -- "$graph_marker")" == "$graph_stat" ]] || fail 'Podman graph storage marker was not restored with its ownership and mode.'
+  grep -Fqx '# localai backup restore acceptance marker' "$config_path" || fail 'configuration marker was not restored.'
+  if grep -Fq '# damaged backup restore acceptance marker' "$config_path"; then
+    fail 'damaged configuration marker survived restore.'
+  fi
+  [[ "$(stat -c '%u:%a' -- "$config_path")" == "$config_stat" ]] || fail 'restored config ownership or mode changed.'
+  matchpathcon -V "$config_path" >/dev/null 2>&1 || fail 'restored config SELinux label does not match policy.'
+  cp -a -- "$config_copy" "$config_path" || fail 'cannot restore acceptance config after the round trip.'
+  rm -f -- "$marker_path"
+  rm -f -- "$graph_marker"
+  matchpathcon -V "$config_path" >/dev/null 2>&1 || fail 'acceptance config label changed during cleanup.'
 }
 
 upgrade_step() {
@@ -374,6 +461,7 @@ else
   step doctor 90 "$0" --check-health "$controller"
   if [[ "$mode" == vm ]]; then
     step first-admin-bootstrap 120 env LOCALAI_ACCEPTANCE_RECEIPT="$receipt" bash "$repo_root/scripts/acceptance-bootstrap.sh"
+    backup_restore_roundtrip "$work" /etc/localai/localai.conf
   fi
   if [[ ! -e "$work/config-before" && ! -L "$work/config-before" ]]; then
     cp -- /etc/localai/localai.conf "$work/config-before"
