@@ -629,7 +629,17 @@ if status is None:
     os.waitpid(pid, 0)
     raise SystemExit('interactive restore timed out')
 if not sent or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
-    raise SystemExit('interactive restore did not accept the explicit y response')
+    text = bytes(output)
+    reason = 'unexpected'
+    for marker, label in ((b'insufficient free disk', 'space'), (b'memory-backed', 'filesystem'),
+                          (b'unsupported or unsafe', 'archive-validation'), (b'SELinux', 'label-check'),
+                          (b'rollback', 'rollback')):
+        if marker in text:
+            reason = label
+            break
+    exited = os.WIFEXITED(status)
+    code = os.WEXITSTATUS(status) if exited else -1
+    raise SystemExit(f'interactive restore failed: response-sent={int(sent)} exited={int(exited)} code={code} reason={reason}')
 PY
 [[ "$(<"$tmp_dir/backup-state/database.db")" == 'state fixture' ]]
 printf 'damaged state\n' >"$tmp_dir/backup-state/database.db"

@@ -124,25 +124,43 @@ def space_check(archive_path: str, stage: str, collision_file: str | None = None
     archive_size = os.stat(archive_path, follow_symlinks=False).st_size
     expanded = 0
     rollback = 0
+    extracted_entries = 0
+    collision_entries = 0
+    block_size = os.statvfs(stage).f_frsize
+
+    def allocated(size: int) -> int:
+        return max(block_size, ((size + block_size - 1) // block_size) * block_size)
+
     try:
         with tarfile.open(archive_path, "r:gz") as archive:
-            expanded = sum(info.size for info in archive if info.isfile())
+            for info in archive:
+                extracted_entries += 1
+                if info.isfile():
+                    expanded += allocated(info.size)
+                else:
+                    expanded += block_size
         if collision_file:
             for encoded in open(collision_file, "rb").read().split(b"\0"):
                 if not encoded:
                     continue
+                collision_entries += 1
                 try:
                     info = os.lstat(os.path.join("/", os.fsdecode(encoded)))
                 except FileNotFoundError:
                     continue
                 if stat.S_ISREG(info.st_mode):
-                    rollback += info.st_size
+                    rollback += allocated(info.st_size)
+                else:
+                    rollback += block_size
     except (OSError, tarfile.TarError) as error:
         fail(f"cannot estimate restore staging space ({type(error).__name__})")
     required = archive_size + expanded + rollback + 64 * 1024 * 1024
     available = shutil.disk_usage(stage).free
     if available < required:
         fail("insufficient free disk space for archive extraction and rollback")
+    filesystem = os.statvfs(stage)
+    if filesystem.f_files and filesystem.f_favail < extracted_entries + collision_entries + 16:
+        fail("insufficient free inodes for archive extraction and rollback")
 
 
 def validate_destinations(names: list[str], stage: str, config: str, roots: list[str]) -> list[str]:

@@ -131,7 +131,7 @@ prepare_backup_roots() {
       if [[ "$path" == "$existing" || "$path" == "$existing"/* ]]; then covered=1; break; fi
     done
     [[ "$covered" == 1 ]] || backup_roots+=("$path")
-  done < <(printf '%s\0' "${candidates[@]}" | python3 -c 'import sys; p=sys.stdin.buffer.read().split(b"\0"); p=[x for x in p if x]; [sys.stdout.buffer.write(x+b"\0") for x in sorted(p,key=lambda x:(len(x),x))]' | while IFS= read -r -d '' path; do printf '%s\n' "$path"; done)
+  done < <(printf '%s\0' "${candidates[@]}" | /usr/bin/python3 -c 'import sys; p=sys.stdin.buffer.read().split(b"\0"); p=[x for x in p if x]; [sys.stdout.buffer.write(x+b"\0") for x in sorted(p,key=lambda x:(len(x),x))]' | while IFS= read -r -d '' path; do printf '%s\n' "$path"; done)
   for path in "${backup_roots[@]}"; do
     [[ "$config_file" != "$path" && "$config_file" != "$path"/* && "$path" != "$config_file"/* ]] || die "configuration file must not overlap a persistent data path"
   done
