@@ -31,6 +31,7 @@ legacy_tls_service_name="${LOCALAI_TLS_LEGACY_SERVICE_NAME:-localai-tls.service}
 tls_compose_project_name="${LOCALAI_TLS_COMPOSE_PROJECT_NAME:-localai-tls}"
 tls_forward_service_name="${LOCALAI_TLS_FORWARD_SERVICE_NAME:-localai-tls-forward.service}"
 tls_forward_socket_name="${LOCALAI_TLS_FORWARD_SOCKET_NAME:-localai-tls-forward.socket}"
+tls_system_unit_dir="${LOCALAI_TLS_SYSTEM_UNIT_DIR:-/etc/systemd/system}"
 tls_legacy_selinux_module="${LOCALAI_TLS_LEGACY_SELINUX_MODULE:-localai_tls_forward}"
 tls_bind_selinux_module="${LOCALAI_TLS_BIND_SELINUX_MODULE:-localai_tls_forward_bind}"
 tls_bind_selinux_module_prefix="localai-tls-forward-bind."
@@ -249,23 +250,35 @@ run_tls_unit() {
 }
 
 stop_service() {
-  if [[ -f "/etc/systemd/system/$tls_forward_socket_name" ]]; then
+  if [[ -f "$tls_system_unit_dir/$tls_forward_socket_name" ]]; then
     log "Disabling and stopping public HTTPS socket proxy if present"
-    run0_pipe /usr/bin/systemctl disable --now "$tls_forward_socket_name" || true
+    if ! run0_pipe /usr/bin/systemctl disable --now "$tls_forward_socket_name"; then
+      localai_installer_error "Could not disable and stop the public HTTPS socket."
+      return 1
+    fi
   fi
-  if [[ -f "/etc/systemd/system/$tls_forward_service_name" ]]; then
-    run0_pipe /usr/bin/systemctl stop "$tls_forward_service_name" || true
+  if [[ -f "$tls_system_unit_dir/$tls_forward_service_name" ]]; then
+    if ! run0_pipe /usr/bin/systemctl stop "$tls_forward_service_name"; then
+      localai_installer_error "Could not stop the public HTTPS socket proxy."
+      return 1
+    fi
   fi
 
   if [[ -n "${tls_uid:-}" ]]; then
     if [[ -f "$tls_state_dir/.config/systemd/user/$tls_service_name" ]]; then
       log "Disabling and stopping $tls_service_name in the $tls_user user manager if present"
-      run_as_tls /usr/bin/systemctl --user disable --now "$tls_service_name" || true
+      if ! run_as_tls /usr/bin/systemctl --user disable --now "$tls_service_name"; then
+        localai_installer_error "Could not disable and stop the TLS user service."
+        return 1
+      fi
     fi
     if [[ "$legacy_tls_service_name" != "$tls_service_name" ]]; then
       if [[ -f "$tls_state_dir/.config/systemd/user/$legacy_tls_service_name" ]]; then
         log "Disabling legacy direct-Caddy unit $legacy_tls_service_name if present"
-        run_as_tls /usr/bin/systemctl --user disable --now "$legacy_tls_service_name" || true
+        if ! run_as_tls /usr/bin/systemctl --user disable --now "$legacy_tls_service_name"; then
+          localai_installer_error "Could not disable and stop the legacy TLS user service."
+          return 1
+        fi
       fi
     fi
   fi
@@ -318,15 +331,15 @@ remove_unit_and_config() {
     run_as_tls /usr/bin/systemctl --user daemon-reload || true
   fi
 
-  if [[ -e "/etc/systemd/system/$tls_forward_service_name" ]]; then
-    localai_installer_check_managed_file "/etc/systemd/system/$tls_forward_service_name" "TLS host socket-proxy unit" 0 \
+  if [[ -e "$tls_system_unit_dir/$tls_forward_service_name" ]]; then
+    localai_installer_check_managed_file "$tls_system_unit_dir/$tls_forward_service_name" "TLS host socket-proxy unit" 0 \
       '# Managed by LocalAI secureblue TLS installer.' 'Description=LocalAI HTTPS socket proxy' || die "Refusing to remove an unrelated host unit."
-    run0_pipe /usr/bin/rm -f -- "/etc/systemd/system/$tls_forward_service_name"
+    run0_pipe /usr/bin/rm -f -- "$tls_system_unit_dir/$tls_forward_service_name"
   fi
-  if [[ -e "/etc/systemd/system/$tls_forward_socket_name" ]]; then
-    localai_installer_check_managed_file "/etc/systemd/system/$tls_forward_socket_name" "TLS host socket unit" 0 \
+  if [[ -e "$tls_system_unit_dir/$tls_forward_socket_name" ]]; then
+    localai_installer_check_managed_file "$tls_system_unit_dir/$tls_forward_socket_name" "TLS host socket unit" 0 \
       '# Managed by LocalAI secureblue TLS installer.' 'Description=LocalAI HTTPS socket' || die "Refusing to remove an unrelated host unit."
-    run0_pipe /usr/bin/rm -f -- "/etc/systemd/system/$tls_forward_socket_name"
+    run0_pipe /usr/bin/rm -f -- "$tls_system_unit_dir/$tls_forward_socket_name"
   fi
   run0_pipe /usr/bin/systemctl daemon-reload
 }
@@ -360,7 +373,7 @@ tcp_port_type() {
 }
 
 restore_one_selinux_port_label() {
-  local role="$1"
+  local role="$1" local_override
   local state_file state action="" port="" previous_type="" new_type="" current_type
   state_file="$(selinux_port_state_file "$role")" || die "Invalid SELinux metadata role."
   [[ -e "$state_file" || -L "$state_file" ]] || return 0
@@ -369,7 +382,10 @@ restore_one_selinux_port_label() {
   state="$(localai_installer_read_selinux_port_state "$state_file")" || die "Refusing untrusted SELinux rollback metadata."
   IFS='|' read -r action port previous_type new_type <<< "$state"
   current_type="$(tcp_port_type "$port")" || die "Could not resolve SELinux type for TCP port $port."
-  if [[ "$current_type" == "$new_type" && "$action" == add ]]; then
+  local_override="$(tcp_port_local_override "$port")" || die "Could not inspect local SELinux port override for TCP port $port."
+  if [[ "$local_override" != "exact|$new_type" ]]; then
+    log "SELinux TCP port $port no longer has the tracked local exact override; leaving the administrator's change intact."
+  elif [[ "$current_type" == "$new_type" && "$action" == add ]]; then
     log "Removing SELinux TCP port label for $port"
     run0_pipe semanage port -d -p tcp "$port" || die "Could not remove tracked SELinux port label $port."
   elif [[ "$current_type" == "$new_type" && "$action" == modify ]]; then
@@ -408,6 +424,21 @@ remove_state() {
   [[ "$purge_state" == "1" ]] || return 0
   local expected_uid="${tls_uid:-0}"
   local path
+  if [[ -n "${tls_uid:-}" && "$remove_user" != 1 ]]; then
+    local process_status=0
+    tls_user_processes_running "$tls_uid" || process_status=$?
+    case "$process_status" in
+      0)
+        localai_installer_error "Refusing to purge TLS state while the service account still has running processes. Stop those processes or explicitly approve service-account removal."
+        return 1
+        ;;
+      1) ;;
+      *)
+        localai_installer_error "Could not verify whether the TLS service account still has running processes."
+        return 1
+        ;;
+    esac
+  fi
   local -a paths=(
     "$tls_state_dir" "$tls_cache_dir" "$tls_certs_dir" "$tls_config_dir"
     "$tls_compose_dir" "$tls_state_dir/data" "$tls_state_dir/config"
@@ -446,6 +477,54 @@ remove_state() {
   done
 }
 
+tcp_port_match_from_listing() {
+  local listing="$1" port="$2"
+  printf '%s\n' "$listing" | awk -v port="$port" '
+    $2 == "tcp" {
+      for (i = 3; i <= NF; i++) {
+        item_count = split($i, items, ",")
+        for (j = 1; j <= item_count; j++) {
+          count = split(items[j], bounds, "-")
+          if (count == 1 && bounds[1] == port) exact = $1
+          else if (count == 2 && bounds[1] <= port && port <= bounds[2] && range == "") range = $1
+        }
+      }
+    }
+    END { if (exact != "") print "exact|" exact; else if (range != "") print "range|" range }
+  '
+}
+
+tcp_port_local_override() {
+  local port="$1" listing
+  listing="$(semanage port -l -C)" || return 1
+  tcp_port_match_from_listing "$listing" "$port"
+}
+
+tls_user_processes_running() {
+  local uid="$1" status=0
+  /usr/bin/pgrep -u "$uid" >/dev/null 2>&1 || status=$?
+  case "$status" in
+    0) return 0 ;;
+    1) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
+wait_for_tls_user_processes() {
+  local attempt status
+  [[ -n "${tls_uid:-}" ]] || return 0
+  for ((attempt = 1; attempt <= 30; attempt += 1)); do
+    status=0
+    tls_user_processes_running "$tls_uid" || status=$?
+    case "$status" in
+      1) return 0 ;;
+      2) die "Could not verify whether the TLS service account processes have exited." ;;
+    esac
+    if [[ "$attempt" -lt 30 ]]; then sleep 1; fi
+  done
+  die "Could not stop every process for the TLS service account."
+}
+
 disable_tls_lifecycle_config() {
   [[ -f "$canonical_config" ]] || return 0
   localai_installer_update_config "$canonical_config" LOCALAI_TLS_ENABLED false || die "Could not update TLS lifecycle config."
@@ -460,22 +539,22 @@ disable_tls_user_linger() {
   run0_pipe /usr/bin/loginctl disable-linger "$tls_user" || true
   log "Terminating all processes for the explicitly approved TLS service account removal"
   run0_pipe /usr/bin/loginctl terminate-user "$tls_user" || true
+  wait_for_tls_user_processes
 }
 
 remove_tls_user() {
-  local userdel_output userdel_status attempt
+  local userdel_status attempt
   [[ "$remove_user" == "1" ]] || return 0
   if getent passwd "$tls_user" >/dev/null; then
     [[ "$remove_user_confirmed" == "1" ]] || die "Refusing TLS service-account deletion without prior confirmation."
     log "Removing service user $tls_user"
     for ((attempt = 1; attempt <= 30; attempt += 1)); do
-      userdel_output=''
       userdel_status=0
-      userdel_output="$(run0_pipe /usr/sbin/userdel "$tls_user" 2>&1)" || userdel_status=$?
+      LC_ALL=C run0_pipe /usr/sbin/userdel "$tls_user" >/dev/null 2>&1 || userdel_status=$?
       if ! getent passwd "$tls_user" >/dev/null; then
         return 0
       fi
-      if [[ "$userdel_status" != 8 || "$userdel_output" != *"currently used by process"* ]]; then
+      if [[ "$userdel_status" != 8 ]]; then
         die "Could not remove the TLS service account."
       fi
       if [[ "$attempt" -lt 30 ]]; then sleep 1; fi
@@ -521,7 +600,7 @@ remove_container
 remove_unit_and_config
 restore_selinux_port_labels
 disable_tls_lifecycle_config
-remove_state
 disable_tls_user_linger
 remove_tls_user
+remove_state
 log "Compose-based TLS proxy uninstall complete."

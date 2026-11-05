@@ -124,9 +124,9 @@ expect_reject_with_message() {
 
 assert_call_order() {
   local file="$1" first="$2" second="$3" third="$4" first_line second_line third_line
-  first_line="$(/usr/bin/grep -n -x "$first" "$file" | /usr/bin/head -n 1 | /usr/bin/cut -d: -f1)"
-  second_line="$(/usr/bin/grep -n -x "$second" "$file" | /usr/bin/head -n 1 | /usr/bin/cut -d: -f1)"
-  third_line="$(/usr/bin/grep -n -x "$third" "$file" | /usr/bin/head -n 1 | /usr/bin/cut -d: -f1)"
+  first_line="$(/usr/bin/grep -n -E "^[[:space:]]*$first([[:space:]]|$)" "$file" | /usr/bin/head -n 1 | /usr/bin/cut -d: -f1)"
+  second_line="$(/usr/bin/grep -n -E "^[[:space:]]*$second([[:space:]]|$)" "$file" | /usr/bin/head -n 1 | /usr/bin/cut -d: -f1)"
+  third_line="$(/usr/bin/grep -n -E "^[[:space:]]*$third([[:space:]]|$)" "$file" | /usr/bin/head -n 1 | /usr/bin/cut -d: -f1)"
   [[ -n "$first_line" && -n "$second_line" && -n "$third_line" ]] || fail "missing lifecycle guard call in $file"
   (( first_line < second_line && second_line < third_line )) || fail "unsafe lifecycle guard order in $file"
 }
@@ -218,6 +218,8 @@ assert_call_order "$repo_root/secureblue-localai-install/install.sh" \
 assert_call_order "$repo_root/localai-podman-compose/install.sh" \
   preflight_localai_backend_state ensure_user_manager ensure_container_userns
 assert_call_order "$repo_root/localai-podman-compose/install.sh" \
+  preflight_tls_podman_parents localai_installer_prepare_config ensure_tls_user
+assert_call_order "$repo_root/localai-podman-compose/install.sh" \
   pull_image write_caddyfile label_container_state
 assert_call_order "$repo_root/localai-podman-compose/install.sh" \
   write_caddyfile label_container_state validate_caddyfile
@@ -230,7 +232,9 @@ assert_call_order "$repo_root/secureblue-localai-install/uninstall.sh" \
 assert_call_order "$repo_root/localai-podman-compose/uninstall.sh" \
   preflight_removal_targets confirm_tls_service_account_removal stop_service
 assert_call_order "$repo_root/localai-podman-compose/uninstall.sh" \
-  remove_state disable_tls_user_linger remove_tls_user
+  stop_service remove_container remove_unit_and_config
+assert_call_order "$repo_root/localai-podman-compose/uninstall.sh" \
+  disable_tls_user_linger remove_tls_user remove_state
 ! rg -q 'podman_migrate\(\)|/usr/bin/podman system migrate' \
   "$repo_root/secureblue-localai-install/install.sh" "$repo_root/localai-podman-compose/install.sh" || fail "installer still runs automatic account-wide Podman migration"
 ! rg -q 'podman image rm -f' "$repo_root/secureblue-localai-install/uninstall.sh" || fail "image removal still force-removes containers that use the image"
@@ -635,11 +639,16 @@ printf 'SELinux port rollback preserves local override state checks\n'
   # shellcheck disable=SC2329
   tcp_port_type() { [[ -n "$mock_local_override" ]] && printf '%s\n' "$mock_local_override" || printf '%s\n' "$mock_base_type"; }
   # shellcheck disable=SC2329
+  tcp_port_local_override() {
+    if [[ -n "$mock_local_override" ]]; then printf 'exact|%s\n' "$mock_local_override"; fi
+    return 0
+  }
+  # shellcheck disable=SC2329
   require_cmd() { :; }
   # shellcheck disable=SC2329
   log() { :; }
   # shellcheck disable=SC2329
-  die() { fail "$*"; }
+  die() { printf 'ERROR: %s\n' "$*" >&2; return 1; }
   # shellcheck disable=SC2329
   run0_pipe() {
     printf '%s\n' "$*" >> "$scratch/selinux-port-rollback-calls"
@@ -662,15 +671,27 @@ printf 'SELinux port rollback preserves local override state checks\n'
   restore_forward_selinux_port_if_tracked internal
   [[ "$mock_local_override" == admin_port_t ]]
   rg -q '^semanage port -m -t admin_port_t -p tcp 18444$' "$scratch/selinux-port-rollback-calls"
+
+  : > "$scratch/selinux-port-rollback-calls"
+  : > "$scratch/selinux-port-removed"
+  mock_local_override=''
+  mock_base_type=systemd_socket_proxyd_port_t
+  mock_state='modify|8443|reserved_port_t|systemd_socket_proxyd_port_t'
+  restore_forward_selinux_port_if_tracked public
+  [[ ! -s "$scratch/selinux-port-rollback-calls" ]] || fail "SELinux rollback recreated an override deleted by an administrator"
+  [[ -e "$scratch/selinux-port-removed" ]] || fail "SELinux rollback retained metadata after an administrator removed its override"
 ) || fail "SELinux port rollback did not restore the original local override state"
 
 printf 'Uninstall rollback prefers exact SELinux entries over ranges checks\n'
 (
   source_production_function "$repo_root/localai-podman-compose/uninstall.sh" tcp_port_type
+  source_production_function "$repo_root/localai-podman-compose/uninstall.sh" tcp_port_match_from_listing
+  source_production_function "$repo_root/localai-podman-compose/uninstall.sh" tcp_port_local_override
   source_production_function "$repo_root/localai-podman-compose/uninstall.sh" restore_one_selinux_port_label
   mock_state_file="$scratch/uninstall-selinux-port-state"
   mock_base_listing='unreserved_port_t tcp 1024-65535'
   mock_listing=$'unreserved_port_t tcp 1024-65535\nsystemd_socket_proxyd_port_t tcp 8443'
+  mock_local_listing='systemd_socket_proxyd_port_t tcp 8443'
   touch "$mock_state_file"
   # shellcheck disable=SC2329
   selinux_port_state_file() { printf '%s\n' "$mock_state_file"; }
@@ -681,7 +702,8 @@ printf 'Uninstall rollback prefers exact SELinux entries over ranges checks\n'
   # shellcheck disable=SC2329
   semanage() {
     [[ "$1" == port && "$2" == -l ]] || return 90
-    printf '%s\n' "$mock_listing"
+    if [[ "${3:-}" == -C ]]; then printf '%s\n' "$mock_local_listing"
+    else printf '%s\n' "$mock_listing"; fi
   }
   # shellcheck disable=SC2329
   run0_pipe() {
@@ -692,13 +714,81 @@ printf 'Uninstall rollback prefers exact SELinux entries over ranges checks\n'
   # shellcheck disable=SC2329
   log() { :; }
   # shellcheck disable=SC2329
-  die() { fail "$*"; }
+  die() { printf 'ERROR: %s\n' "$*" >&2; return 1; }
   [[ "$(tcp_port_type 8443)" == systemd_socket_proxyd_port_t ]]
   restore_one_selinux_port_label internal
   [[ "$mock_listing" == "$mock_base_listing" ]]
   rg -q '^semanage port -d -p tcp 8443$' "$scratch/uninstall-selinux-port-calls"
   [[ -e "$scratch/uninstall-selinux-port-removed" ]]
+
+  : > "$scratch/uninstall-selinux-port-calls"
+  rm -f "$scratch/uninstall-selinux-port-removed"
+  mock_listing=$'unreserved_port_t tcp 1024-65535\nsystemd_socket_proxyd_port_t tcp 8443'
+  mock_local_listing=''
+  # shellcheck disable=SC2329
+  localai_installer_read_selinux_port_state() { printf 'modify|8443|reserved_port_t|systemd_socket_proxyd_port_t\n'; }
+  restore_one_selinux_port_label internal
+  [[ ! -s "$scratch/uninstall-selinux-port-calls" ]] || fail "uninstall rollback recreated an override deleted by an administrator"
+  [[ -e "$scratch/uninstall-selinux-port-removed" ]] || fail "uninstall rollback retained metadata after administrator override deletion"
 ) || fail "uninstall rollback removed metadata while leaving a local exact port override"
+
+printf 'TLS uninstall stops managed units before removing them checks\n'
+(
+  source_production_function "$repo_root/localai-podman-compose/uninstall.sh" stop_service
+  tls_system_unit_dir="$scratch/system-units"
+  tls_forward_socket_name=localai-tls-forward.socket
+  tls_forward_service_name=localai-tls-forward.service
+  tls_service_name=localai-tls-compose.service
+  legacy_tls_service_name=localai-tls.service
+  tls_state_dir="$scratch/tls-state"
+  tls_uid=''
+  mkdir -p "$tls_system_unit_dir"
+  : > "$tls_system_unit_dir/$tls_forward_socket_name"
+  : > "$tls_system_unit_dir/$tls_forward_service_name"
+  # shellcheck disable=SC2329
+  log() { :; }
+  # shellcheck disable=SC2329
+  die() { printf 'ERROR: %s\n' "$*" >&2; return 1; }
+  # shellcheck disable=SC2329
+  run0_pipe() {
+    printf '%s\n' "$*" >> "$scratch/tls-stop-calls"
+    if [[ "${TEST_FAIL_SOCKET_STOP:-0}" == 1 && "$*" == *"$tls_forward_socket_name" ]]; then return 1; fi
+  }
+  export TEST_FAIL_SOCKET_STOP=1
+  if stop_service 2>/dev/null; then fail "failed HTTPS socket stop was ignored"; fi
+  [[ "$(wc -l < "$scratch/tls-stop-calls")" -eq 1 ]] || fail "uninstall continued stopping units after socket stop failure"
+  unset TEST_FAIL_SOCKET_STOP
+  : > "$scratch/tls-stop-calls"
+  stop_service
+  [[ "$(wc -l < "$scratch/tls-stop-calls")" -eq 2 ]] || fail "managed host units were not stopped"
+
+  rm -f "$tls_system_unit_dir/$tls_forward_socket_name" "$tls_system_unit_dir/$tls_forward_service_name"
+  : > "$scratch/tls-stop-calls"
+  stop_service
+  [[ ! -s "$scratch/tls-stop-calls" ]] || fail "absent managed units caused stop commands"
+) || fail "TLS uninstall ignored a managed service stop failure"
+
+printf 'TLS state purge requires service-account quiescence checks\n'
+(
+  source_production_function "$repo_root/localai-podman-compose/uninstall.sh" remove_state
+  tls_state_dir="$scratch/purge-tls-state"
+  tls_cache_dir="$scratch/purge-tls-cache"
+  tls_certs_dir="$scratch/purge-tls-certs"
+  tls_config_dir="$scratch/purge-tls-config"
+  tls_compose_dir="$scratch/purge-tls-compose"
+  tls_uid=956
+  purge_state=1 remove_user=0
+  # shellcheck disable=SC2329
+  tls_user_processes_running() { return 0; }
+  # shellcheck disable=SC2329
+  confirm() { return 0; }
+  # shellcheck disable=SC2329
+  run0_pipe() { printf 'purge-command\n' >> "$scratch/purge-commands"; }
+  # shellcheck disable=SC2329
+  die() { printf 'ERROR: %s\n' "$*" >&2; return 1; }
+  if remove_state 2>/dev/null; then fail "state purge proceeded while TLS account processes were active"; fi
+  [[ ! -e "$scratch/purge-commands" ]] || fail "state purge removed files before checking TLS account quiescence"
+) || fail "TLS state purge did not fail closed while service processes remained"
 
 printf 'TLS Podman parent directory ownership checks\n'
 (
@@ -749,6 +839,23 @@ else
   [[ "$?" == 75 ]] || fail "TLS directory setup returned an unexpected refusal status"
   [[ "$(wc -l <"$scratch/tls-parent-failure-calls")" == 3 ]] || fail "TLS directory setup continued after a parent refusal"
 fi
+
+printf 'TLS Podman parent paths are preflighted before account/config changes checks\n'
+(
+  source_production_function "$repo_root/localai-podman-compose/install.sh" preflight_tls_podman_parents
+  tls_user=localai-tls
+  tls_state_dir="$scratch/preflight-tls-state"
+  # shellcheck disable=SC2329
+  getent() { return 2; }
+  # shellcheck disable=SC2329
+  localai_installer_preflight_service_directory() {
+    printf '%s\n' "$1" >> "$scratch/early-tls-preflight-paths"
+    [[ "$1" != "$tls_state_dir/.local/share" ]]
+  }
+  if preflight_tls_podman_parents; then fail "unsafe Podman share parent passed early preflight"; fi
+  [[ "$(wc -l < "$scratch/early-tls-preflight-paths")" -eq 3 ]] || fail "early preflight did not inspect each Podman parent"
+  [[ "$(tail -n 1 "$scratch/early-tls-preflight-paths")" == "$tls_state_dir/.local/share" ]] || fail "early preflight missed the graphroot parent"
+) || fail "unsafe TLS Podman parents were not rejected before setup mutations"
 
 (
   source_production_function "$repo_root/localai-podman-compose/install.sh" retire_forward_units
@@ -1437,6 +1544,7 @@ run_backend_unapproved_user_removal() (
 
 run_tls_approved_user_removal() (
   source_production_function "$repo_root/localai-podman-compose/uninstall.sh" disable_tls_user_linger
+  source_production_function "$repo_root/localai-podman-compose/uninstall.sh" wait_for_tls_user_processes
   tls_uid=956
   tls_user=localai-tls
   remove_user=1
@@ -1444,6 +1552,8 @@ run_tls_approved_user_removal() (
   # The function is called indirectly by a helper or test.
   # shellcheck disable=SC2329
   log() { :; }
+  # shellcheck disable=SC2329
+  tls_user_processes_running() { return 1; }
   # The function is called indirectly by a helper or test.
   # shellcheck disable=SC2329
   run0_pipe() { printf '%s\n' "$*" >>"$TEST_ACCOUNT_CALLS"; }
@@ -1536,7 +1646,7 @@ run_tls_user_delete_after_in_use_race() (
     if [[ "${1:-}" == /usr/sbin/userdel ]]; then
       call_count="$(rg -c '^/usr/sbin/userdel localai-tls$' "$TEST_ACCOUNT_CALLS")"
       if [[ "$call_count" == 1 ]]; then
-        printf 'user currently used by process 12345\n' >&2
+        printf 'Compte en cours d utilisation par processus 12345\n' >&2
         return 8
       fi
       rm -f -- "$scratch/tls-user-exists"

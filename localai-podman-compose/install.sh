@@ -347,6 +347,17 @@ ensure_tls_user() {
   log "TLS proxy user UID: $tls_uid"
 }
 
+preflight_tls_podman_parents() {
+  local expected_uid=-1
+  if getent passwd "$tls_user" >/dev/null; then
+    expected_uid="$(getent passwd "$tls_user" | cut -d: -f3)" || return 1
+    [[ "$expected_uid" =~ ^[0-9]+$ ]] || return 1
+  fi
+  localai_installer_preflight_service_directory "$tls_state_dir" "TLS state directory" "$expected_uid" || return 1
+  localai_installer_preflight_service_directory "$tls_state_dir/.local" "TLS Podman home directory" "$expected_uid" || return 1
+  localai_installer_preflight_service_directory "$tls_state_dir/.local/share" "TLS Podman share directory" "$expected_uid" || return 1
+}
+
 tls_runtime_dir() {
   printf '/run/user/%s\n' "$tls_uid"
 }
@@ -1092,7 +1103,7 @@ EOF
 
 restore_forward_selinux_port_if_tracked() {
   local role="$1"
-  local state_file state action="" port="" previous_type="" new_type="" current_type
+  local state_file state action="" port="" previous_type="" new_type="" current_type local_override
   state_file="$(selinux_port_state_file "$role")" || die "Invalid SELinux port role."
 
   [[ -e "$state_file" || -L "$state_file" ]] || return 0
@@ -1100,7 +1111,10 @@ restore_forward_selinux_port_if_tracked() {
   state="$(localai_installer_read_selinux_port_state "$state_file")" || die "Refusing untrusted SELinux rollback metadata."
   IFS='|' read -r action port previous_type new_type <<< "$state"
   current_type="$(tcp_port_type "$port")" || die "Could not resolve SELinux type for TCP port $port."
-  if [[ "$current_type" == "$new_type" && "$action" == add ]]; then
+  local_override="$(tcp_port_local_override "$port")" || die "Could not inspect local SELinux port override for TCP port $port."
+  if [[ "$local_override" != "exact|$new_type" ]]; then
+    log "SELinux TCP port $port no longer has the tracked local exact override; leaving the administrator's change intact."
+  elif [[ "$current_type" == "$new_type" && "$action" == add ]]; then
     log "Removing SELinux TCP port label for $port"
     run0_pipe semanage port -d -p tcp "$port" || die "Could not remove tracked SELinux port label $port."
   elif [[ "$current_type" == "$new_type" && "$action" == modify ]]; then
@@ -1303,11 +1317,13 @@ elevate_once
 validate_names
 resolve_localai_user
 preflight_first_admin
+preflight_tls_podman_parents
 localai_installer_prepare_config "$canonical_config" "$LOCALAI_INSTALLER_CONFIG_SOURCE" "$LOCALAI_INSTALLER_CONFIG_FORMAT" || die "Could not safely persist the shared LocalAI configuration."
 localai_installer_persist_environment_overrides "$canonical_config" || die "Could not safely persist explicit configuration overrides."
 load_localai_lock
 require_cmd run0
 validate_names
+preflight_tls_podman_parents || die "Unsafe existing TLS Podman parent directories."
 ensure_tls_user
 preflight_user_systemd_parent
 guard_tls_manager_start
