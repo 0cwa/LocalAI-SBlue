@@ -454,6 +454,20 @@ assert_qemu_log_category input-open 'Could not open firmware input'
 assert_qemu_log_category permission 'Permission denied during device setup'
 assert_qemu_log_category qemu-unclassified 'synthetic qemu startup failure'
 printf 'QEMU startup log classifier tests passed.\n'
+assert_qemu_exit_category() {
+  local status="$1" expected="$2" actual
+  actual="$(qemu_exit_category "$status")"
+  [[ "$actual" == "$expected" ]] || { printf 'QEMU exit classifier mismatch\n' >&2; exit 1; }
+}
+assert_qemu_exit_category 0 qemu-exit-success
+assert_qemu_exit_category 1 qemu-startup-error
+assert_qemu_exit_category 2 qemu-startup-error
+assert_qemu_exit_category 126 qemu-exec-failure
+assert_qemu_exit_category 127 qemu-exec-failure
+assert_qemu_exit_category 137 qemu-killed
+assert_qemu_exit_category 139 qemu-crash
+assert_qemu_exit_category 143 qemu-exit-unknown
+printf 'QEMU exit status classifier tests passed.\n'
 read -r diagnostic_key_type diagnostic_key_data _ <"$vm_mock_dir/hostkey.pub"
 printf '[127.0.0.1]:23456 %s %s\n' "$diagnostic_key_type" "$diagnostic_key_data" >"$diagnostic_run/known_hosts"
 chmod 0600 "$diagnostic_run/known_hosts" "$vm_mock_dir/key"

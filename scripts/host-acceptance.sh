@@ -102,6 +102,24 @@ qemu_log_category() {
   fi
 }
 
+qemu_exit_category() {
+  case "$1" in
+    0) printf 'qemu-exit-success\n' ;;
+    126|127) printf 'qemu-exec-failure\n' ;;
+    137) printf 'qemu-killed\n' ;;
+    139) printf 'qemu-crash\n' ;;
+    1|2) printf 'qemu-startup-error\n' ;;
+    *) printf 'qemu-exit-unknown\n' ;;
+  esac
+}
+
+report_qemu_exit() {
+  local status=0
+  if wait "$qemu_pid" 2>/dev/null; then status=0; else status=$?; fi
+  qemu_pid=''
+  printf 'vm-qemu-exit-category: %s\n' "$(qemu_exit_category "$status")"
+}
+
 diagnose_vm_backup_with_proc_root() {
   local key_arg="$1" proc_root="$2"
   local scratch canonical_scratch active connection port key known_hosts known_hosts_dir run_name canonical_known_hosts qemu_pid qemu_start expected_exe worker output line status=0 reason
@@ -297,11 +315,13 @@ wait_for_guest() {
   printf 'Waiting for the disposable VM to accept SSH (timeout 300s)...\n' >&2
   if ! kill -0 "$qemu_pid" 2>/dev/null; then
     printf 'vm-qemu-log-category: %s\n' "$(qemu_log_category "$work/qemu.log")"
+    report_qemu_exit
     fail 'VM exited before SSH was ready.'
   fi
   until timeout 5s ssh "${ssh_args[@]}" root@127.0.0.1 true >/dev/null 2>&1; do
     if ! kill -0 "$qemu_pid" 2>/dev/null; then
       printf 'vm-qemu-log-category: %s\n' "$(qemu_log_category "$work/qemu.log")"
+      report_qemu_exit
       fail 'VM exited before SSH was ready.'
     fi
     (( SECONDS < deadline )) || fail 'timed out waiting for VM SSH.'
