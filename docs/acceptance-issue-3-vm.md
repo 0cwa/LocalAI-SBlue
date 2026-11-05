@@ -27,8 +27,9 @@ a throwaway overlay. Each step had a timeout. The following checks passed:
    using the production guard was blocked before registration and active after.
 4. Installer `--yes --no-pull` with service disabled/running, enabled/running,
    enabled/stopped, and disabled/stopped; service state was preserved in each.
-5. Configuration and persistent test data remained unchanged; conservative
-   backend uninstall `--yes` retained data and an unrelated test container.
+5. Upgrades preserved the configuration and a persistent test marker;
+   conservative backend uninstall `--yes` retained the marker and an unrelated
+   test container.
 
 No step failed in this run. TLS installation and Caddy listener behavior were
 not exercised. Logs were discarded and no credential was recorded.
