@@ -437,6 +437,23 @@ fi
 rm "$proc_fixture/$fake_qemu_pid/exe"
 ln -s "$fake_qemu_exe" "$proc_fixture/$fake_qemu_pid/exe"
 printf 'QEMU process identity mock cases passed.\n'
+qemu_log_test_file="$work/qemu-startup.log"
+assert_qemu_log_category() {
+  local expected="$1" sample="$2" actual
+  if [[ -z "$sample" ]]; then : >"$qemu_log_test_file"; else printf '%s\n' "$sample" >"$qemu_log_test_file"; fi
+  actual="$(qemu_log_category "$qemu_log_test_file")"
+  [[ "$actual" == "$expected" ]] || { printf 'QEMU startup log classifier mismatch\n' >&2; exit 1; }
+}
+assert_qemu_log_category qemu-empty-log ''
+assert_qemu_log_category kvm-unavailable 'Could not access KVM kernel module: Permission denied'
+assert_qemu_log_category kvm-device 'failed to open /dev/kvm'
+assert_qemu_log_category memory-allocation 'Cannot allocate memory'
+assert_qemu_log_category disk-capacity 'No space left on device'
+assert_qemu_log_category host-forward 'failed to set up hostfwd rule'
+assert_qemu_log_category input-open 'Could not open firmware input'
+assert_qemu_log_category permission 'Permission denied during device setup'
+assert_qemu_log_category qemu-unclassified 'synthetic qemu startup failure'
+printf 'QEMU startup log classifier tests passed.\n'
 read -r diagnostic_key_type diagnostic_key_data _ <"$vm_mock_dir/hostkey.pub"
 printf '[127.0.0.1]:23456 %s %s\n' "$diagnostic_key_type" "$diagnostic_key_data" >"$diagnostic_run/known_hosts"
 chmod 0600 "$diagnostic_run/known_hosts" "$vm_mock_dir/key"

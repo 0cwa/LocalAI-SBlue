@@ -74,6 +74,34 @@ isolated_ssh_args() {
     -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$known_hosts")
 }
 
+qemu_log_category() {
+  local log_path="$1"
+  if [[ ! -s "$log_path" ]]; then
+    printf 'qemu-empty-log\n'
+  elif grep -Fqi -- 'Could not access KVM kernel module' "$log_path" ||
+       grep -Fqi -- 'failed to initialize kvm' "$log_path" ||
+       grep -Fqi -- 'KVM is not available' "$log_path"; then
+    printf 'kvm-unavailable\n'
+  elif grep -Fqi -- '/dev/kvm' "$log_path"; then
+    printf 'kvm-device\n'
+  elif grep -Fqi -- 'Cannot allocate memory' "$log_path" ||
+       grep -Fqi -- 'cannot allocate memory' "$log_path"; then
+    printf 'memory-allocation\n'
+  elif grep -Fqi -- 'No space left on device' "$log_path"; then
+    printf 'disk-capacity\n'
+  elif grep -Fqi -- 'host forwarding rule' "$log_path" ||
+       grep -Fqi -- 'hostfwd' "$log_path"; then
+    printf 'host-forward\n'
+  elif grep -Fqi -- 'Could not open' "$log_path" ||
+       grep -Fqi -- 'No such file or directory' "$log_path"; then
+    printf 'input-open\n'
+  elif grep -Fqi -- 'Permission denied' "$log_path"; then
+    printf 'permission\n'
+  else
+    printf 'qemu-unclassified\n'
+  fi
+}
+
 diagnose_vm_backup_with_proc_root() {
   local key_arg="$1" proc_root="$2"
   local scratch canonical_scratch active connection port key known_hosts known_hosts_dir run_name canonical_known_hosts qemu_pid qemu_start expected_exe worker output line status=0 reason
@@ -267,9 +295,15 @@ isolated_ssh_args ssh_args "$key" "$port" "$work/known_hosts" 3
 wait_for_guest() {
   local deadline=$((SECONDS + 300))
   printf 'Waiting for the disposable VM to accept SSH (timeout 300s)...\n' >&2
-  kill -0 "$qemu_pid" 2>/dev/null || fail 'VM exited before SSH was ready.'
+  if ! kill -0 "$qemu_pid" 2>/dev/null; then
+    printf 'vm-qemu-log-category: %s\n' "$(qemu_log_category "$work/qemu.log")"
+    fail 'VM exited before SSH was ready.'
+  fi
   until timeout 5s ssh "${ssh_args[@]}" root@127.0.0.1 true >/dev/null 2>&1; do
-    kill -0 "$qemu_pid" 2>/dev/null || fail 'VM exited before SSH was ready.'
+    if ! kill -0 "$qemu_pid" 2>/dev/null; then
+      printf 'vm-qemu-log-category: %s\n' "$(qemu_log_category "$work/qemu.log")"
+      fail 'VM exited before SSH was ready.'
+    fi
     (( SECONDS < deadline )) || fail 'timed out waiting for VM SSH.'
     sleep 2
   done
