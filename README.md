@@ -257,12 +257,18 @@ cd localai-tray
 ./install.sh
 ```
 
-The tray reports backend, TLS Compose, and HTTPS socket status, opens the
-current configured endpoint, and provides start/stop controls. It reads the
-shared configuration through `localaictl` each time it checks status. Tray
-polling never requests elevation. If a manager state is unavailable, run the
-controller's `status --elevated` command from a terminal for details. Remove
-the launcher with `localai-tray/uninstall.sh`.
+The tray reports backend, TLS Compose, and HTTPS socket status independently,
+opens or copies the current effective endpoint, and provides start/stop
+controls. Endpoint values containing user information, query strings,
+fragments, or paths are rejected before display or copying. **Run endpoint
+health check** reports whether the endpoint answered, requires authentication,
+or was unreachable. The tray reads shared configuration through `localaictl`
+each time it checks status; polling never requests elevation. If a manager
+state is unavailable, the tray suggests `localaictl status --elevated` in a
+terminal. Backend and TLS log actions require confirmation first and then open
+the logs in a terminal; logs may contain secrets and must be reviewed and
+sanitized before sharing. Remove the launcher with
+`localai-tray/uninstall.sh`.
 
 ## Lifecycle acceptance
 
