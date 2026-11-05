@@ -3,12 +3,11 @@
 
 from __future__ import annotations
 
-import argparse
 import os
 import sys
 from pathlib import Path
 
-from PyQt6.QtCore import QObject, QProcess, QTimer, QUrl, pyqtSignal
+from PyQt6.QtCore import QObject, QProcess, QStandardPaths, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QAction, QDesktopServices, QIcon
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
@@ -16,9 +15,16 @@ from PyQt6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
 from adapter import (
     command_args,
     display_state,
+    doctor_summary,
     endpoint,
     has_unavailable_manager,
+    log_terminal_args,
+    LOG_TERMINALS,
+    menu_entries,
+    open_logs_after_confirmation,
+    parse_start_requested,
     parse_status,
+    should_start_after_status,
     stack_healthy,
 )
 
@@ -56,8 +62,8 @@ class ServiceController(QObject):
         self._operation = operation
         try:
             args = command_args(operation)
-        except ValueError as error:
-            self._finish(False, None, str(error))
+        except ValueError:
+            self._finish(False, None, "Unsupported LocalAI control action.")
             return False
         process.start(self.control, args)
         self._timer.start(COMMAND_TIMEOUT_MS)
@@ -84,18 +90,23 @@ class ServiceController(QObject):
         if self._operation == "status":
             try:
                 parsed = parse_status(stdout)
-            except (ValueError, TypeError) as error:
-                self._finish(False, None, str(error) if not output else output)
+            except (ValueError, TypeError):
+                self._finish(False, None, "The LocalAI control command returned invalid status data.")
             else:
                 # status intentionally remains usable when localaictl exits 1
                 # because a component is unhealthy; its JSON is still useful.
-                self._finish(True, parsed, output)
+                self._finish(True, parsed, "")
             return
-        self._finish(exit_code == 0, None, output or ("ok" if exit_code == 0 else "command failed"))
+        if self._operation == "doctor":
+            # doctor output can include the effective endpoint. Reduce it to
+            # a small classification before it reaches any tray presentation.
+            self._finish(exit_code == 0, None, doctor_summary(output))
+            return
+        self._finish(exit_code == 0, None, "ok" if exit_code == 0 else "The LocalAI control command failed.")
 
     def _error(self, error: QProcess.ProcessError) -> None:
         if error == QProcess.ProcessError.FailedToStart:
-            self._finish(False, None, f"Could not start {self.control}.")
+            self._finish(False, None, "Could not start the LocalAI control command.")
 
     def _timed_out(self) -> None:
         process = self._process
@@ -118,26 +129,47 @@ class LocalAITray(QSystemTrayIcon):
 
         self._status_action = QAction("LocalAI: Checking…", self)
         self._status_action.setEnabled(False)
+        self._manager_action = QAction("", self)
+        self._manager_action.setEnabled(False)
+        self._manager_action.setVisible(False)
+        self._doctor_action = QAction("Run endpoint health check", self)
+        self._doctor_action.triggered.connect(self.run_doctor)
+        self._open_action = QAction("Open LocalAI Web UI", self)
+        self._open_action.triggered.connect(self.open_web_ui)
+        self._copy_action = QAction("Copy effective endpoint", self)
+        self._copy_action.triggered.connect(self.copy_endpoint)
+        self._backend_logs_action = QAction("View backend logs…", self)
+        self._backend_logs_action.triggered.connect(lambda: self.open_logs("backend"))
+        self._tls_logs_action = QAction("View TLS logs…", self)
+        self._tls_logs_action.triggered.connect(lambda: self.open_logs("tls"))
         self._start_action = QAction("Start LocalAI stack", self)
         self._start_action.triggered.connect(self.start_service)
         self._stop_action = QAction("Stop LocalAI stack", self)
         self._stop_action.triggered.connect(self.stop_service)
-        self._open_action = QAction("Open LocalAI Web UI", self)
-        self._open_action.triggered.connect(self.open_web_ui)
         self._quit_stop_action = QAction("Quit and stop LocalAI stack", self)
         self._quit_stop_action.triggered.connect(self.quit_and_stop)
         self._exit_action = QAction("Exit tray (leave services running)", self)
         self._exit_action.triggered.connect(self._app.quit)
 
         menu = QMenu()
-        menu.addAction(self._status_action)
-        menu.addSeparator()
-        menu.addAction(self._start_action)
-        menu.addAction(self._stop_action)
-        menu.addAction(self._open_action)
-        menu.addSeparator()
-        menu.addAction(self._quit_stop_action)
-        menu.addAction(self._exit_action)
+        actions = {
+            "status": self._status_action,
+            "manager_help": self._manager_action,
+            "doctor": self._doctor_action,
+            "open_endpoint": self._open_action,
+            "copy_endpoint": self._copy_action,
+            "backend_logs": self._backend_logs_action,
+            "tls_logs": self._tls_logs_action,
+            "start": self._start_action,
+            "stop": self._stop_action,
+            "quit_stop": self._quit_stop_action,
+            "exit": self._exit_action,
+        }
+        for item in menu_entries(actions):
+            if item is None:
+                menu.addSeparator()
+            else:
+                menu.addAction(item)
         self.setContextMenu(menu)
 
         self._poll_timer = QTimer(self)
@@ -154,19 +186,24 @@ class LocalAITray(QSystemTrayIcon):
             healthy = False
             endpoint_text = "configuration unavailable"
             access_hint = ""
+            self._manager_action.setVisible(False)
         else:
             backend = display_state(status.get("backend", "unknown"))
             tls = display_state(status.get("tls_compose", "disabled"))
             socket = display_state(status.get("https_socket", "disabled"))
             text = f"Backend: {backend} · TLS: {tls} · HTTPS: {socket}"
             healthy = stack_healthy(status)
-            endpoint_text = str(status.get("endpoint", "unavailable"))
+            try:
+                endpoint_text = endpoint(status)
+            except ValueError:
+                endpoint_text = "configuration unavailable"
             access_hint = ""
             if has_unavailable_manager(status):
-                access_hint = (
-                    f"\nService-manager status is unavailable to the tray. "
-                    f"Run {self._controller.control} status --elevated in a terminal for details."
-                )
+                access_hint = "\nRun localaictl status --elevated in a terminal for manager details."
+                self._manager_action.setText("Manager status unavailable · run localaictl status --elevated in a terminal")
+                self._manager_action.setVisible(True)
+            else:
+                self._manager_action.setVisible(False)
         self._status_action.setText(text)
         self.setToolTip(f"LocalAI — {text}\n{endpoint_text}{access_hint}")
         self._start_action.setEnabled(not self._controller.busy and not healthy)
@@ -199,6 +236,43 @@ class LocalAITray(QSystemTrayIcon):
             return
         QDesktopServices.openUrl(QUrl(url))
 
+    def copy_endpoint(self) -> None:
+        try:
+            url = endpoint(self._status or {})
+        except ValueError:
+            self._show_error("LocalAI endpoint unavailable", "The configured endpoint is not safe to display or copy.")
+            return
+        self._app.clipboard().setText(url)
+
+    def run_doctor(self) -> None:
+        self._controller.run("doctor")
+
+    def open_logs(self, component: str) -> None:
+        def confirm() -> bool:
+            answer = QMessageBox.warning(
+                None,
+                f"Open {component} logs?",
+                "Logs may contain secrets. They will be opened in a terminal and will not be shown in the tray. Review and sanitize them before sharing.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            return answer == QMessageBox.StandardButton.Yes
+
+        open_logs_after_confirmation(component, confirm, self._launch_logs_in_terminal)
+
+    def _launch_logs_in_terminal(self, component: str) -> None:
+        for terminal in LOG_TERMINALS:
+            executable = QStandardPaths.findExecutable(terminal)
+            if not executable:
+                continue
+            args = log_terminal_args(terminal, self._controller.control, component)
+            started = QProcess.startDetached(executable, args)
+            if isinstance(started, tuple):
+                started = started[0]
+            if started:
+                return
+        self._show_error("No terminal available", "Install or configure a supported terminal to view LocalAI logs.")
+
     def handle_message(self, message: bytes) -> None:
         if message.strip() == b"start":
             self._start_requested = True
@@ -209,9 +283,12 @@ class LocalAITray(QSystemTrayIcon):
         if operation == "status":
             parsed = status if isinstance(status, dict) else None
             self._set_status(parsed)
-            if self._start_requested and parsed is not None and not stack_healthy(parsed):
+            if should_start_after_status(self._start_requested, parsed):
                 self._start_requested = False
                 self.start_service()
+            return
+        if operation == "doctor":
+            self._show_information("LocalAI endpoint health", output)
             return
         if ok:
             if operation == "stop" and getattr(self, "_quit_after_stop", False):
@@ -223,6 +300,9 @@ class LocalAITray(QSystemTrayIcon):
 
     def _show_error(self, title: str, detail: str) -> None:
         QMessageBox.critical(None, title, detail)
+
+    def _show_information(self, title: str, detail: str) -> None:
+        QMessageBox.information(None, title, detail)
 
 
 def signal_existing(name: str, command: bytes) -> bool:
@@ -248,9 +328,7 @@ def single_instance(name: str, command: bytes) -> QLocalServer | None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Control the configured LocalAI stack from the system tray.")
-    parser.add_argument("--start", action="store_true", help="start the LocalAI stack after the tray appears")
-    args = parser.parse_args()
+    start_requested = parse_start_requested(sys.argv[1:])
 
     app = QApplication(sys.argv)
     app.setApplicationName("LocalAI Tray")
@@ -260,13 +338,13 @@ def main() -> int:
         return 1
 
     name = f"localai-tray-{os.getuid()}"
-    server = single_instance(name, b"start\n" if args.start else b"")
+    server = single_instance(name, b"start\n" if start_requested else b"")
     if server is None:
         return 0
     try:
-        tray = LocalAITray(app, args.start)
-    except (OSError, RuntimeError) as error:
-        QMessageBox.critical(None, "LocalAI", str(error))
+        tray = LocalAITray(app, start_requested)
+    except (OSError, RuntimeError):
+        QMessageBox.critical(None, "LocalAI", "The LocalAI tray could not be initialized.")
         return 1
 
     def receive_message() -> None:

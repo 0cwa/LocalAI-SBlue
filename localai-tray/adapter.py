@@ -3,6 +3,52 @@
 from __future__ import annotations
 
 import json
+import re
+from collections.abc import Callable
+from urllib.parse import urlsplit
+
+
+MENU_STRUCTURE = (
+    "status",
+    "manager_help",
+    None,
+    "doctor",
+    "open_endpoint",
+    "copy_endpoint",
+    None,
+    "backend_logs",
+    "tls_logs",
+    None,
+    "start",
+    "stop",
+    None,
+    "quit_stop",
+    "exit",
+)
+
+_SERVICE_STATES = {
+    "active",
+    "inactive",
+    "failed",
+    "activating",
+    "deactivating",
+    "unknown",
+    "disabled",
+}
+
+_LOG_TERMINALS = {
+    "konsole": ("-e",),
+    "kgx": ("--",),
+    "gnome-terminal": ("--wait", "--"),
+    "xterm": ("-e",),
+}
+LOG_TERMINALS = tuple(_LOG_TERMINALS)
+_LOGS_WAIT_SCRIPT = (
+    '"$1" logs "$2"; result=$?; '
+    'printf "\\nLog command exited with status %s.\\nPress Enter to close this terminal...\\n" "$result" >&2; '
+    'IFS= read -r _; '
+    'exit "$result"'
+)
 
 
 def command_args(action: str) -> list[str]:
@@ -17,7 +63,17 @@ def parse_status(payload: str) -> dict[str, object]:
     required = {"backend", "tls_compose", "https_socket", "tls_enabled", "endpoint"}
     if not isinstance(value, dict) or not required.issubset(value):
         raise ValueError("incomplete LocalAI status response")
-    return value
+    result: dict[str, object] = {}
+    for key in ("backend", "tls_compose", "https_socket"):
+        state = value[key]
+        if not isinstance(state, str) or state not in _SERVICE_STATES:
+            raise ValueError("invalid LocalAI service state")
+        result[key] = state
+    if not isinstance(value["tls_enabled"], bool):
+        raise ValueError("invalid LocalAI TLS state")
+    result["tls_enabled"] = value["tls_enabled"]
+    result["endpoint"] = endpoint(value)
+    return result
 
 
 def stack_healthy(status: dict[str, object]) -> bool:
@@ -38,6 +94,94 @@ def has_unavailable_manager(status: dict[str, object]) -> bool:
 
 def endpoint(status: dict[str, object]) -> str:
     value = status.get("endpoint")
-    if not isinstance(value, str) or not (value.startswith("http://") or value.startswith("https://")):
+    if not isinstance(value, str) or any(char.isspace() or ord(char) < 32 for char in value):
+        raise ValueError("LocalAI status has no safe HTTP(S) endpoint")
+    if "\\" in value or "%" in value:
+        raise ValueError("LocalAI status has no safe HTTP(S) endpoint")
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("LocalAI status has no safe HTTP(S) endpoint") from error
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or "?" in value
+        or "#" in value
+        or parsed.path not in {"", "/"}
+        or (port is not None and not 1 <= port <= 65535)
+        or "@" in parsed.netloc
+    ):
         raise ValueError("LocalAI status has no safe HTTP(S) endpoint")
     return value
+
+
+def doctor_result(output: str) -> tuple[str, int | None]:
+    """Reduce untrusted doctor output to a safe result and optional HTTP code."""
+    codes = re.findall(r"^health result: HTTP ([1-5][0-9]{2})$", output, re.MULTILINE)
+    if codes:
+        code = int(codes[-1])
+        if code in {401, 403}:
+            return "authentication-required", code
+        return "reachable", code
+    if re.search(r"^health result: transport or TLS validation failed \(no HTTP response\)$", output, re.MULTILINE):
+        return "unreachable", None
+    return "unknown", None
+
+
+def doctor_summary(output: str) -> str:
+    result, code = doctor_result(output)
+    if result == "authentication-required":
+        return f"Endpoint reachable; authentication required (HTTP {code})."
+    if result == "reachable":
+        return f"Endpoint reachable (HTTP {code})."
+    if result == "unreachable":
+        return "Endpoint unreachable (no HTTP response)."
+    return "Health check could not determine endpoint status."
+
+
+def parse_start_requested(argv: list[str]) -> bool:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Control the configured LocalAI stack from the system tray.")
+    parser.add_argument("--start", action="store_true", help="start the LocalAI stack after the tray appears")
+    return parser.parse_args(argv).start
+
+
+def should_start_after_status(start_requested: bool, status: dict[str, object] | None) -> bool:
+    return start_requested and status is not None and not stack_healthy(status)
+
+
+def menu_entries(actions: dict[str, object]) -> tuple[object | None, ...]:
+    return tuple(None if name is None else actions[name] for name in MENU_STRUCTURE)
+
+
+def log_terminal_args(terminal: str, control: str, component: str) -> list[str]:
+    if component not in {"backend", "tls"}:
+        raise ValueError("unsupported LocalAI log component")
+    try:
+        prefix = _LOG_TERMINALS[terminal]
+    except KeyError as error:
+        raise ValueError("unsupported terminal") from error
+    return [
+        *prefix,
+        "/usr/bin/bash",
+        "-c",
+        _LOGS_WAIT_SCRIPT,
+        "localai-tray-logs",
+        control,
+        component,
+    ]
+
+
+def open_logs_after_confirmation(
+    component: str,
+    confirm: Callable[[], bool],
+    launch: Callable[[str], None],
+) -> bool:
+    if component not in {"backend", "tls"} or not confirm():
+        return False
+    launch(component)
+    return True
