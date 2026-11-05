@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+trap 'printf "localaictl test assertion failed at line %s\\n" "$LINENO" >&2' ERR
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 # Sourced test support reads this variable indirectly.
@@ -9,6 +10,7 @@ source "$repo_root/scripts/test-support.sh"
 test_sanitize_localai_environment
 tmp_dir="$(test_mktemp_dir localaictl-test)"
 trap 'rm -rf "$tmp_dir"' EXIT
+export TMPDIR="$tmp_dir"
 
 cat >"$tmp_dir/config" <<'EOF'
 LOCALAI_TLS_ENABLED=true
@@ -41,6 +43,30 @@ if [[ "${1:-}" == /usr/bin/flock ]]; then
   exec /usr/bin/flock -n "${LOCALAI_FAKE_LOCK_FILE:?}" "$@"
 fi
 if [[ "${1:-}" == /usr/bin/python3 && "${2:-}" == /etc/localai/bootstrap-guard.py ]]; then
+  exit 0
+fi
+if [[ "${1:-}" == /usr/bin/python3 && "${2:-}" == "${LOCALAI_FAKE_BACKUP_HELPER:?}" ]]; then
+  case "${3:-}" in
+    restore-marker-check)
+      [[ ! -e "${LOCALAI_FAKE_TRANSACTION_MARKER:?}" ]] || exit 1
+      exit 0
+      ;;
+    restore-marker-create)
+      [[ ! -e "${LOCALAI_FAKE_TRANSACTION_MARKER:?}" ]] || exit 1
+      printf 'synthetic pending transaction\n' >"$LOCALAI_FAKE_TRANSACTION_MARKER"
+      exit 0
+      ;;
+    restore-marker-clear)
+      rm -f -- "${LOCALAI_FAKE_TRANSACTION_MARKER:?}"
+      exit 0
+      ;;
+    rollback-new)
+      [[ "${LOCALAI_FAKE_FAIL_ROLLBACK:-false}" != true ]] || exit 1
+      ;;
+  esac
+fi
+if [[ "${1:-}" == /usr/bin/getent && "${2:-}" == passwd ]]; then
+  printf '%s:x:1001:1001::%s/service-home:/bin/bash\n' "$3" "${LOCALAI_FAKE_STATE_DIR:?}"
   exit 0
 fi
 if [[ "${1:-}" == /usr/bin/systemd-run ]]; then
@@ -121,6 +147,9 @@ if [[ -n "${LOCALAI_DOCTOR_TOKEN+x}" ]]; then
   printf 'doctor token leaked to systemctl environment\n' >&2
   exit 97
 fi
+if [[ -e "${LOCALAI_FAKE_TRANSACTION_MARKER:-}" && " $* " == *" start localai.service "* ]]; then
+  exit 1
+fi
 if [[ " $* " == *" is-active "* ]]; then
   case " $* " in
     *" is-active localai.service "*)
@@ -153,7 +182,7 @@ chmod 0755 "$tmp_dir/systemctl"
 cat >"$tmp_dir/id" <<'EOF'
 #!/usr/bin/env bash
 case "${2:-}" in
-  localai) printf '1001\n' ;;
+  localai|localai.backup-test-1) printf '1001\n' ;;
   localai-tls) printf '1002\n' ;;
   *) exit 1 ;;
 esac
@@ -185,6 +214,8 @@ export LOCALAI_SYSTEMCTL_BIN="$tmp_dir/systemctl"
 export LOCALAI_AUDIT_DIR="$tmp_dir/audit"
 export LOCALAI_FAKE_LOG="$tmp_dir/commands"
 export LOCALAI_FAKE_STATE_DIR="$tmp_dir/service-state"
+export LOCALAI_FAKE_TRANSACTION_MARKER="$tmp_dir/service-state/restore.pending"
+export LOCALAI_FAKE_BACKUP_HELPER="$repo_root/lib/backup_archive.py"
 export LOCALAI_FAKE_LOCK_FILE="$tmp_dir/backup.lock"
 export XDG_RUNTIME_DIR="$tmp_dir"
 export LOCALAI_RESTORE_STAGE_BASE="$tmp_dir/restore-stage"
@@ -503,6 +534,18 @@ if ! "$repo_root/bin/localaictl" backup --exclude-models "$backup_archive" 2>"$t
   cat "$tmp_dir/commands" >&2
   exit 1
 fi
+custom_user_archive="$tmp_dir/custom-service-user.tar.gz"
+: >"$LOCALAI_FAKE_LOG"
+if ! LOCALAI_SERVICE_USER=localai.backup-test-1 "$repo_root/bin/localaictl" backup "$custom_user_archive" >/dev/null 2>&1; then
+  printf 'backup failed for a supported custom service-account name\n' >&2
+  exit 1
+fi
+rg -q -- '--machine=localai\.backup-test-1@\.host' "$LOCALAI_FAKE_LOG"
+rg -q 'getent passwd localai\.backup-test-1' "$LOCALAI_FAKE_LOG"
+rg -q '^ExecStartPre=/usr/bin/test ! -e /var/lib/\.localaictl-backup-restore\.pending$' \
+  "$repo_root/secureblue-localai-install/localai.service.in"
+rg -q '^ExecStartPre=/usr/bin/test ! -e /var/lib/\.localaictl-backup-restore\.pending$' \
+  "$repo_root/localai-podman-compose/localai-tls-compose.service.in"
 archive_listing="$tmp_dir/backup-members"
 /usr/bin/tar -tzf "$backup_archive" >"$archive_listing"
 # A configured-off public socket can still be active from an earlier setup.
@@ -606,6 +649,11 @@ import backup_archive as helper
 uid_map = "0:1001:1;1:200000:65536"
 gid_map = "0:1001:1;1:300000:65536"
 rootless_path = "/var/lib/localai/.local/share/containers/storage"
+if not helper.valid_service_account_name("localai.backup-test-1"):
+    raise SystemExit("valid service-account punctuation was rejected")
+for invalid_service_account in ("root", "0", "bad/name", "ümlaut"):
+    if helper.valid_service_account_name(invalid_service_account):
+        raise SystemExit("invalid service-account name was accepted")
 original_open = builtins.open
 
 def fixture_open(filename, *args, **kwargs):
@@ -643,7 +691,8 @@ def regular(name, payload=b"fixture", mode=0o600, uid=1, gid=1, pax=None):
 def validate(raw, uid_value=uid_map, gid_value=gid_map):
     with patch.object(pwd, "getpwnam", return_value=SimpleNamespace(pw_uid=1001)), \
          patch.object(grp, "getgrnam", return_value=SimpleNamespace(gr_gid=1001)), \
-         patch.object(builtins, "open", side_effect=fixture_open):
+         patch.object(builtins, "open", side_effect=fixture_open), \
+         patch.object(helper.os.path, "lexists", return_value=False):
         return helper.validate_graphroot_tar(io.BytesIO(raw), rootless_path, uid_map, gid_map,
                                              uid_value, gid_value, "localai")
 
@@ -661,6 +710,8 @@ valid = make_archive([
 ])
 if "storage/overlay/layer/diff/tool" not in validate(valid):
     raise SystemExit("nested graphroot archive member was not validated")
+for unsafe_root_mode in (0o000, 0o500, 0o1700, 0o2700):
+    rejects(make_archive([directory("storage/", mode=unsafe_root_mode)]))
 rejects(valid, "0:1002:1;1:200000:65536")
 rejects(make_archive([directory("storage/"), regular("storage/../outside")]))
 rejects(make_archive([directory("storage/"), regular("storage/cap", pax={"SCHILY.xattr.security.capability": "synthetic"})]))
@@ -674,6 +725,139 @@ hardlink.linkname = "storage/overlay/layer/diff/tool"
 hardlink.uid, hardlink.gid, hardlink.mode = 1, 1, 0o2750
 rejects(make_archive([directory("storage/"), regular("storage/overlay/layer/diff/tool", mode=0o2750), (hardlink, None)]))
 rejects(valid + b"unvalidated")
+
+oversized_pax = helper.tarfile.TarInfo("PaxHeaders/member")
+oversized_pax.type = helper.tarfile.XHDTYPE
+oversized_pax.size = helper.MAX_PAX_HEADER_BYTES + 1
+with contextlib.redirect_stderr(io.StringIO()):
+    try:
+        helper.preflight_tar_stream(io.BytesIO(oversized_pax.tobuf()))
+    except SystemExit:
+        pass
+    else:
+        raise SystemExit("archive preflight accepted an oversized pax header")
+
+empty_member = helper.tarfile.TarInfo("member").tobuf()
+class RepeatedHeaders:
+    def __init__(self):
+        self.count = 0
+    def seek(self, _offset):
+        self.count = 0
+    def read(self, size):
+        if size != 512 or self.count >= helper.MAX_ARCHIVE_MEMBERS + 1:
+            return b""
+        self.count += 1
+        return empty_member
+
+with contextlib.redirect_stderr(io.StringIO()):
+    try:
+        helper.preflight_tar_stream(RepeatedHeaders())
+    except SystemExit:
+        pass
+    else:
+        raise SystemExit("archive preflight accepted too many members")
+
+long_path = b"x" * (helper.MAX_MEMBER_NAME_BYTES + 1)
+record = f"{len(long_path) + 20} path=".encode() + long_path + b"\n"
+while True:
+    record = f"{len(record)} path=".encode() + long_path + b"\n"
+    declared = int(record.split(b" ", 1)[0])
+    if declared == len(record):
+        break
+long_pax = helper.tarfile.TarInfo("PaxHeaders/member")
+long_pax.type = helper.tarfile.XHDTYPE
+long_pax.size = len(record)
+long_raw = long_pax.tobuf() + record + b"\0" * ((-len(record)) % 512)
+with contextlib.redirect_stderr(io.StringIO()):
+    try:
+        helper.preflight_tar_stream(io.BytesIO(long_raw))
+    except SystemExit:
+        pass
+    else:
+        raise SystemExit("archive preflight accepted an overlong pax path")
+
+with tempfile.TemporaryDirectory(prefix="restore-marker-test-", dir=os.environ["TMPDIR"]) as parent:
+    marker_path = os.path.join(parent, "restore.pending")
+    graphroot = os.path.join(parent, "storage")
+    rollback = graphroot + ".rollback"
+    helper.create_transaction_marker(graphroot, rollback, "1:42", marker_path)
+    marker = helper.read_transaction_marker(marker_path)
+    if marker["graphroot"] != graphroot or marker["rollback_path"] != rollback or marker["graphroot_inode"] != "1:42":
+        raise SystemExit("durable restore marker did not preserve the recovery identity")
+    if os.stat(marker_path).st_mode & 0o777 != 0o644:
+        raise SystemExit("durable restore marker is not readable by the service startup guard")
+    with contextlib.redirect_stderr(io.StringIO()):
+        try:
+            helper.check_transaction_marker(marker_path)
+        except SystemExit:
+            pass
+        else:
+            raise SystemExit("restore marker did not block a subsequent operation")
+    helper.clear_transaction_marker(marker_path)
+    helper.check_transaction_marker(marker_path)
+    sentinel = os.path.join(parent, "sentinel")
+    with open(sentinel, "w", encoding="ascii") as stream:
+        stream.write("synthetic")
+    os.symlink(sentinel, marker_path)
+    with contextlib.redirect_stderr(io.StringIO()):
+        try:
+            helper.check_transaction_marker(marker_path)
+        except SystemExit:
+            pass
+        else:
+            raise SystemExit("restore marker followed a symbolic link")
+    os.unlink(marker_path)
+    if open(sentinel, encoding="ascii").read() != "synthetic":
+        raise SystemExit("restore marker cleanup followed a symbolic link")
+
+with tempfile.TemporaryDirectory(prefix="graphroot-home-mode-", dir=os.environ["TMPDIR"]) as parent:
+    service_home = os.path.join(parent, "service-home")
+    private = os.path.join(service_home, "private")
+    graphroot = os.path.join(private, "storage")
+    os.mkdir(service_home, 0o750)
+    os.mkdir(private, 0o700)
+    os.mkdir(graphroot, 0o700)
+    uid, gid = os.getuid(), os.getgid()
+    real_lstat = os.lstat
+
+    def ancestry_lstat(path, *args, **kwargs):
+        path = os.fspath(path)
+        if path in {service_home, private, graphroot}:
+            return real_lstat(path, *args, **kwargs)
+        fields = list(real_lstat("/", *args, **kwargs))
+        fields[0] = stat.S_IFDIR | 0o755
+        fields[4], fields[5] = 0, 0
+        return os.stat_result(fields)
+
+    with patch.object(helper.os, "lstat", side_effect=ancestry_lstat), \
+         patch.object(helper.os, "listxattr", return_value=[]), \
+         patch.object(helper, "graphroot_mounts", return_value=[]):
+        helper.validate_graphroot_path(graphroot, service_home, uid, gid, [service_home])
+        os.chmod(private, 0o750)
+        with contextlib.redirect_stderr(io.StringIO()):
+            try:
+                helper.validate_graphroot_path(graphroot, service_home, uid, gid, [service_home])
+            except SystemExit:
+                pass
+            else:
+                raise SystemExit("graphroot accepted a public descendant directory")
+        os.chmod(private, 0o700)
+        os.chmod(graphroot, 0o500)
+        with contextlib.redirect_stderr(io.StringIO()):
+            try:
+                helper.validate_graphroot_path(graphroot, service_home, uid, gid, [service_home])
+            except SystemExit:
+                pass
+            else:
+                raise SystemExit("graphroot accepted a non-writable root directory")
+        os.chmod(graphroot, 0o2700)
+        with contextlib.redirect_stderr(io.StringIO()):
+            try:
+                helper.validate_graphroot_path(graphroot, service_home, uid, gid, [service_home])
+            except SystemExit:
+                pass
+            else:
+                raise SystemExit("graphroot accepted special root mode bits")
 
 with tempfile.TemporaryDirectory(prefix="graphroot-rename-", dir=os.environ["TMPDIR"]) as parent:
     source = os.path.join(parent, "store")
@@ -753,12 +937,39 @@ with tempfile.TemporaryDirectory(prefix="graphroot-outer-", dir=os.environ["TMPD
          patch.object(builtins, "open", side_effect=fixture_open), \
          patch.object(helper.os, "lstat", side_effect=fixture_lstat), \
          patch.object(helper.os, "listxattr", return_value=[]), \
+         patch.object(helper.os, "getxattr", side_effect=OSError(helper.errno.ENODATA, "synthetic label absent")), \
          patch.object(helper, "graphroot_mounts", return_value=[]):
         names = helper.validate_archive(archive_path, config, [outer], require_root_config=False,
                                         rootless_context=context)
         if helper.ROOTLESS_GRAPHROOT_MEMBER in names:
             raise SystemExit("nested graphroot tar was included in ordinary restore paths")
         helper.space_check(archive_path, outer, destinations=[outer], rootless_context=context)
+
+        def archive_with_config_change(changed_path, mutate, destination_name):
+            with helper.tarfile.open(archive_path, "r:gz") as source, \
+                 helper.tarfile.open(destination_name, "w:gz") as destination:
+                for member in source:
+                    if member.name == changed_path:
+                        mutate(member)
+                    destination.addfile(member, source.extractfile(member) if member.isfile() else None)
+
+        for case, mutate in (
+            ("foreign-owner", lambda member: setattr(member, "uid", uid + 10000)),
+            ("foreign-group", lambda member: setattr(member, "gid", gid + 10000)),
+            ("unsafe-acl", lambda member: member.pax_headers.update({"SCHILY.acl.access": "other::rw-"})),
+            ("unsafe-selinux", lambda member: member.pax_headers.update({"SCHILY.xattr.security.selinux": "untrusted_t:s0"})),
+        ):
+            changed_archive = os.path.join(outer, f"{case}.tar.gz")
+            archive_with_config_change(config.lstrip("/"), mutate, changed_archive)
+            with contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    helper.validate_archive(changed_archive, config, [outer], require_root_config=False,
+                                            rootless_context=context)
+                except SystemExit:
+                    pass
+                else:
+                    raise SystemExit(f"outer archive accepted {case}")
+
         bad_context = dict(context, graphroot=os.path.join(outer, "other-storage"))
         with contextlib.redirect_stderr(io.StringIO()):
             try:
@@ -1145,10 +1356,9 @@ PY
 rg -q '^matchpathcon -V ' "$tmp_dir/commands"
 rg -q "^restorecon -F -- $restore_config_path$" "$tmp_dir/commands"
 rg -q "^matchpathcon -V $restore_config_path$" "$tmp_dir/commands"
-if rg -q '^restorecon .*backup-(state|tls|cache)' "$tmp_dir/commands"; then
-  printf 'restore recursively relabeled persistent state\n' >&2
-  exit 1
-fi
+rg -q "^restorecon -F -R -- $tmp_dir/backup-state$" "$tmp_dir/commands"
+rg -q "^restorecon -F -R -- $tmp_dir/backup-tls$" "$tmp_dir/commands"
+rg -q "^restorecon -F -R -- $tmp_dir/backup-cache$" "$tmp_dir/commands"
 rg -q 'start localai.service' "$tmp_dir/commands"
 [[ "$(<"$tmp_dir/backup-state/unrelated.txt")" == 'preserve this' ]]
 [[ "$(<"$LOCALAI_FAKE_STATE_DIR/backend")" == active ]]
@@ -1209,6 +1419,37 @@ if [[ "$(<"$LOCALAI_FAKE_STATE_DIR/backend")" != active ]]; then
   cat "$tmp_dir/commands" >&2
   exit 1
 fi
+
+printf 'before incomplete rollback\n' >"$tmp_dir/backup-state/database.db"
+export LOCALAI_FAKE_FAIL_LABEL=true
+export LOCALAI_FAKE_FAIL_ROLLBACK=true
+if "$repo_root/bin/localaictl" restore --yes "$backup_archive" >"$tmp_dir/incomplete-output" 2>"$tmp_dir/incomplete-error"; then
+  printf 'restore ignored an incomplete rollback\n' >&2
+  exit 1
+fi
+unset LOCALAI_FAKE_FAIL_LABEL LOCALAI_FAKE_FAIL_ROLLBACK
+[[ -e "$LOCALAI_FAKE_TRANSACTION_MARKER" ]]
+if [[ "$(<"$LOCALAI_FAKE_STATE_DIR/backend")" == active ]]; then
+  printf 'services restarted with an unresolved restore marker\n' >&2
+  exit 1
+fi
+if "$LOCALAI_SYSTEMCTL_BIN" --user --machine=localai@.host start localai.service >/dev/null 2>&1; then
+  printf 'service startup ignored the durable restore marker\n' >&2
+  exit 1
+fi
+: >"$tmp_dir/commands"
+if "$repo_root/bin/localaictl" backup "$tmp_dir/blocked-backup.tar.gz" >/dev/null 2>&1; then
+  printf 'backup proceeded with an unresolved restore marker\n' >&2
+  exit 1
+fi
+if rg -q ' stop localai.service$' "$tmp_dir/commands"; then
+  printf 'backup stopped services before checking the unresolved marker\n' >&2
+  exit 1
+fi
+rm -f -- "$LOCALAI_FAKE_TRANSACTION_MARKER"
+printf 'active\n' >"$LOCALAI_FAKE_STATE_DIR/backend"
+printf 'active\n' >"$LOCALAI_FAKE_STATE_DIR/tls"
+printf 'active\n' >"$LOCALAI_FAKE_STATE_DIR/socket"
 
 # TLS is disabled in config, but previously installed managed units remain
 # part of the state snapshot. Refuse unowned units before stopping anything.

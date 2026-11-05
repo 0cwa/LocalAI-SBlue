@@ -25,6 +25,13 @@ has been runtime-qualified on secureblue or on a GPU.
 - Include configured external GraphRoots, check backup/restore capacity on
   their actual filesystems, and refuse restores when the installed graph path
   or subordinate UID/GID mappings differ from the archive.
+- Allow the installer's private 0750 service home while keeping GraphRoot
+  descendants private, and require writable non-special GraphRoot root modes.
+- Use the configured service account for rootless Podman inspection and add a
+  durable restore marker that blocks backend startup after uncertain rollback.
+- Bound archive member, path, pax metadata, and expanded-size processing; reject
+  unsafe ownership, ACLs, and archived SELinux labels, and account for xattr/ACL
+  bytes in destination and rollback capacity checks.
 
 ## 0.2.0
 

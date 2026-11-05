@@ -95,18 +95,18 @@ ROOTLESS_GRAPHROOT_MEMBER=rootless-graphroot.tar
 query_rootless_context() {
   local context_file="$1" check_quiescent="${2:-1}" uid gid home info maps running map_pattern='^[0-9:;]+$'
   local -a map_lines=()
-  uid="$(service_uid localai)" || die "cannot verify the LocalAI service account"
-  gid="$(service_gid localai)" || die "cannot verify the LocalAI service group"
-  home="$(run_elevated /usr/bin/getent passwd localai | /usr/bin/cut -d: -f6)" || die "cannot verify the LocalAI service home"
+  uid="$(service_uid "$LOCALAI_SERVICE_USER")" || die "cannot verify the LocalAI service account"
+  gid="$(service_gid "$LOCALAI_SERVICE_USER")" || die "cannot verify the LocalAI service group"
+  home="$(run_elevated /usr/bin/getent passwd "$LOCALAI_SERVICE_USER" | /usr/bin/cut -d: -f6)" || die "cannot verify the LocalAI service home"
   rootless_service_home="$home"
   [[ "$home" == /* && "$home" != / && "$home" != *$'\n'* && "$home" != *$'\r'* && "$(realpath -m -- "$home")" == "$home" ]] || die "LocalAI service home is not canonical"
-  info="$(run_elevated /usr/bin/systemd-run --user --machine=localai@.host --wait --pipe --collect --quiet \
+  info="$(run_elevated /usr/bin/systemd-run --user --machine="${LOCALAI_SERVICE_USER}@.host" --wait --pipe --collect --quiet \
     --setenv="HOME=$home" --setenv="XDG_RUNTIME_DIR=/run/user/$uid" \
     --setenv="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" --setenv=PATH=/usr/bin:/bin \
     -- /usr/bin/podman info --format '{{.Store.GraphRoot}}' 2>/dev/null)" || die "cannot verify the LocalAI rootless container store"
   rootless_graphroot="$info"
   [[ "$rootless_graphroot" == /* && "$rootless_graphroot" != / && "$rootless_graphroot" != *$'\n'* && "$rootless_graphroot" != *$'\r'* && "$(realpath -m -- "$rootless_graphroot")" == "$rootless_graphroot" ]] || die "LocalAI rootless graphroot is not canonical"
-  maps="$(run_elevated /usr/bin/systemd-run --user --machine=localai@.host --wait --pipe --collect --quiet \
+  maps="$(run_elevated /usr/bin/systemd-run --user --machine="${LOCALAI_SERVICE_USER}@.host" --wait --pipe --collect --quiet \
     --setenv="HOME=$home" --setenv="XDG_RUNTIME_DIR=/run/user/$uid" \
     --setenv="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" --setenv=PATH=/usr/bin:/bin \
     -- /usr/bin/podman unshare /usr/bin/python3 -c 'from pathlib import Path; print(";".join(":".join(row.split()) for row in Path("/proc/self/uid_map").read_text().splitlines())); print(";".join(":".join(row.split()) for row in Path("/proc/self/gid_map").read_text().splitlines()))' 2>/dev/null)" || die "cannot verify the LocalAI user namespace mappings"
@@ -116,7 +116,7 @@ query_rootless_context() {
   rootless_gid_map="${map_lines[1]}"
   [[ "$rootless_uid_map" =~ $map_pattern && "$rootless_gid_map" =~ $map_pattern ]] || die "LocalAI user namespace mappings are invalid"
   if [[ "$check_quiescent" == 1 ]]; then
-    running="$(run_elevated /usr/bin/systemd-run --user --machine=localai@.host --wait --pipe --collect --quiet \
+    running="$(run_elevated /usr/bin/systemd-run --user --machine="${LOCALAI_SERVICE_USER}@.host" --wait --pipe --collect --quiet \
       --setenv="HOME=$home" --setenv="XDG_RUNTIME_DIR=/run/user/$uid" \
       --setenv="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" --setenv=PATH=/usr/bin:/bin \
       -- /usr/bin/podman ps --format '{{.ID}}' 2>/dev/null)" || die "cannot verify LocalAI container state"
@@ -125,7 +125,7 @@ query_rootless_context() {
   [[ ! -e "$rootless_graphroot" || -d "$rootless_graphroot" ]] || die "LocalAI rootless graphroot is not a directory"
   rootless_context_file="$context_file"
   run_elevated /usr/bin/python3 - "$context_file" "$rootless_graphroot" "$rootless_uid_map" \
-    "$rootless_gid_map" "$home" "$uid" "$gid" localai <<'PY'
+    "$rootless_gid_map" "$home" "$uid" "$gid" "$LOCALAI_SERVICE_USER" <<'PY'
 import json
 import os
 import sys
@@ -240,7 +240,7 @@ include_rootless_graphroot() {
       die "configuration file must not overlap the rootless graphroot"
   done
   run_elevated /usr/bin/python3 "$backup_archive_helper" graphroot-check \
-    "$rootless_graphroot" "$rootless_service_home" "$(service_uid localai)" "$(service_gid localai)" \
+    "$rootless_graphroot" "$rootless_service_home" "$(service_uid "$LOCALAI_SERVICE_USER")" "$(service_gid "$LOCALAI_SERVICE_USER")" \
     "${backup_roots[@]}" || die "LocalAI rootless graphroot path is unsafe"
 }
 
@@ -264,8 +264,8 @@ run_elevated_pipe() {
 
 run_rootless_podman() {
   local uid
-  uid="$(service_uid localai)" || return 1
-  run_elevated /usr/bin/systemd-run --user --machine=localai@.host --wait --pipe --collect --quiet \
+  uid="$(service_uid "$LOCALAI_SERVICE_USER")" || return 1
+  run_elevated /usr/bin/systemd-run --user --machine="${LOCALAI_SERVICE_USER}@.host" --wait --pipe --collect --quiet \
     --setenv="HOME=$rootless_service_home" --setenv="XDG_RUNTIME_DIR=/run/user/$uid" \
     --setenv="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" --setenv=PATH=/usr/bin:/bin \
     -- /usr/bin/podman unshare "$@"
@@ -816,6 +816,7 @@ backup_locked() {
   [[ "${1:-}" == --archive-file && "$#" == 2 ]] || die "internal backup requires an archive stream target"
   archive_file="$2"
   prepare_backup_roots
+  run_elevated /usr/bin/python3 "$backup_archive_helper" restore-marker-check || die "a previous backup restore is incomplete; managed services remain blocked pending recovery"
   if [[ -e "$config_file" ]] && is_effectively_root; then
     [[ -f "$config_file" && ! -L "$config_file" && "$(stat -c %u -- "$config_file")" == 0 ]] || die "configuration file must be a root-owned regular file to back up"
     (( (8#$(stat -c %a -- "$config_file") & 8#22) == 0 )) || die "configuration file must not be group/world writable to back up"
@@ -857,7 +858,7 @@ backup_locked() {
     fi
   } >"$metadata_dir/metadata"
   chmod 0600 "$metadata_dir/metadata"
-  archive_args=(--create --gzip --file - --xattrs --acls --selinux --numeric-owner)
+  archive_args=(--create --gzip --file - --xattrs --xattrs-exclude=security.selinux --acls --no-selinux --numeric-owner)
   if [[ "$exclude_models" == 1 ]]; then
     path="${LOCALAI_MODELS_PATH#/}"
     archive_args+=(--exclude="$path" --exclude="$path/*")
@@ -908,10 +909,13 @@ restore_archive() {
 restore_locked() {
   local source="$1" stage source_copy members collisions snapshot skip_links target answer item had_target=0 stage_base needs_confirmation=0
   local rootless_present=0 rootless_archive rootless_old_path='' rootless_source_inode='' rootless_initial_inode=''
+  local marker_graphroot='' marker_rollback=''
   local rootless_graphroot_had_old=0 rootless_graphroot_mutated=0
   local restore_mutation_started=0 restore_completed=0
+  local restore_marker_created=0
   local helper="$backup_archive_helper"
   [[ -f "$source" && ! -L "$source" ]] || die "restore source must be a regular, non-linked archive file"
+  run_elevated /usr/bin/python3 "$helper" restore-marker-check || die "a previous backup restore is incomplete; managed services remain blocked pending recovery"
   prepare_backup_roots
   source="$(realpath -e -- "$source")"
   stage_base="$(backup_stage_base)"
@@ -937,7 +941,7 @@ restore_locked() {
   run_elevated /usr/bin/python3 "$helper" copy-source "$source" "$config_file" "${backup_roots[@]}" "$source_copy" || die "could not safely copy restore archive"
   source="$source_copy"
   run_backup_helper validate "$source" "$config_file" "${backup_roots[@]}" || die "backup contains unsupported or unsafe filesystem entries"
-  run_elevated "$tar_bin" --extract --gzip --file "$source" --directory "$stage" --xattrs --acls --selinux --numeric-owner --same-owner || die "could not extract backup into private staging"
+  run_elevated "$tar_bin" --extract --gzip --file "$source" --directory "$stage" --xattrs --acls --no-selinux --numeric-owner --same-owner || die "could not extract backup into private staging"
   run_backup_helper destinations "$source" "$config_file" "${backup_roots[@]}" "$stage" || die "restore paths are unsafe"
   run_backup_helper skip-links0 "$source" "$config_file" "${backup_roots[@]}" "$stage" >"$skip_links"
   run_backup_helper members0 "$source" "$config_file" "${backup_roots[@]}" >"$members"
@@ -1002,16 +1006,23 @@ restore_locked() {
   for item in "${links_to_keep[@]}"; do
     run_elevated /usr/bin/rm -rf -- "${stage:?}/$item"
   done
-  restore_mutation_started=1
   if [[ "$rootless_present" == 1 ]]; then
     [[ -d "$rootless_graphroot" && ! -L "$rootless_graphroot" ]] || die "rootless graphroot disappeared before restore"
     rootless_old_path="$rootless_graphroot.localaictl-rollback.$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
     rootless_graphroot_had_old=1
     rootless_graphroot_mutated=1
+    marker_graphroot="$rootless_graphroot"
+    marker_rollback="$rootless_old_path"
+  fi
+  run_elevated /usr/bin/python3 "$helper" restore-marker-create \
+    "$marker_graphroot" "$marker_rollback" "$rootless_source_inode" || die "could not create the durable restore safety marker"
+  restore_marker_created=1
+  restore_mutation_started=1
+  if [[ "$rootless_present" == 1 ]]; then
     run_elevated /usr/bin/python3 "$helper" graphroot-rename "$rootless_graphroot" "$rootless_old_path" || die "could not reserve the rootless graphroot rollback path"
     local service_uid_value service_gid_value
-    service_uid_value="$(service_uid localai)"
-    service_gid_value="$(service_gid localai)"
+    service_uid_value="$(service_uid "$LOCALAI_SERVICE_USER")"
+    service_gid_value="$(service_gid "$LOCALAI_SERVICE_USER")"
     run_elevated /usr/bin/python3 "$helper" graphroot-create "$rootless_graphroot" "$service_uid_value" "$service_gid_value" || die "could not create the rootless graphroot restore destination"
     run_rootless_podman "$tar_bin" --extract --file - --directory "${rootless_graphroot%/*}" \
       --xattrs --acls --selinux --numeric-owner --same-owner --same-permissions \
@@ -1038,6 +1049,9 @@ restore_locked() {
   fi
   for target in "${backup_roots[@]}"; do
     [[ -e "$target" ]] || continue
+    if [[ "$rootless_present" != 1 || "$target" != "$rootless_graphroot" ]]; then
+      run_elevated "$restorecon_bin" -F -R -- "$target" || die "could not normalize persistent SELinux labels; rollback will run before services restart"
+    fi
     run_elevated "$matchpathcon_bin" -V "$target" || die "SELinux label verification failed; rollback will run before services restart"
   done
   restore_completed=1
@@ -1054,6 +1068,11 @@ restore_locked() {
     fi
   fi
   run_elevated /usr/bin/rm -rf -- "$stage"
+  if ! run_elevated /usr/bin/python3 "$helper" restore-marker-clear; then
+    RESTORE_ROLLBACK_FAILED=1
+    die "restore completed but the durable safety marker could not be cleared; managed services remain stopped"
+  fi
+  restore_marker_created=0
   restore_backup_service_state || die "restore completed but one or more previously active services could not be restarted"
   trap - EXIT HUP INT TERM
   log "Backup restored. State was overlaid, unrelated files were preserved, and configured root labels were verified."
@@ -1077,7 +1096,7 @@ restore_rollback() {
         IFS=: read -r current_device current_ino <<<"$current_inode"
         if [[ -L "$rootless_graphroot" || ! -d "$rootless_graphroot" ]] ||
            ! run_elevated /usr/bin/python3 "$backup_archive_helper" graphroot-check \
-             "$rootless_graphroot" "$rootless_service_home" "$(service_uid localai)" "$(service_gid localai)" "${backup_roots[@]}" ||
+             "$rootless_graphroot" "$rootless_service_home" "$(service_uid "$LOCALAI_SERVICE_USER")" "$(service_gid "$LOCALAI_SERVICE_USER")" "${backup_roots[@]}" ||
            ! run_elevated /usr/bin/python3 "$backup_archive_helper" graphroot-remove "$rootless_graphroot" "$current_device" "$current_ino"; then
           log "warning: could not safely remove the partially restored rootless graphroot"
           status=1
@@ -1113,6 +1132,9 @@ restore_exit_cleanup() {
   if [[ "${restore_mutation_started:-0}" == 1 && "${restore_completed:-0}" != 1 ]]; then
     restore_rollback "$members" "$collisions" "$snapshot" "$had_target" \
       "$rootless_graphroot" "$rootless_old_path" "$rootless_graphroot_had_old" "$rootless_graphroot_mutated" || RESTORE_ROLLBACK_FAILED=1
+    if [[ "$RESTORE_ROLLBACK_FAILED" == 0 && "${restore_marker_created:-0}" == 1 ]]; then
+      run_elevated /usr/bin/python3 "$backup_archive_helper" restore-marker-clear || RESTORE_ROLLBACK_FAILED=1
+    fi
   fi
   [[ -z "${stage:-}" ]] || run_elevated /usr/bin/rm -rf -- "$stage"
   if [[ "${RESTORE_ROLLBACK_FAILED:-0}" == 1 ]]; then

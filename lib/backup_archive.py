@@ -14,13 +14,137 @@ import pwd
 import grp
 import json
 import ctypes
+import re
+import gzip
+import errno
 
 ROOTLESS_GRAPHROOT_MEMBER = "rootless-graphroot.tar"
+BACKUP_RESTORE_MARKER = "/var/lib/.localaictl-backup-restore.pending"
+MAX_ARCHIVE_MEMBERS = 200_000
+MAX_MEMBER_NAME_BYTES = 4096
+MAX_PAX_HEADER_BYTES = 1024 * 1024
+MAX_TOTAL_PAX_BYTES = 64 * 1024 * 1024
+MAX_ARCHIVE_EXPANDED_BYTES = 16 * 1024**4
 
 
 def fail(message: str) -> None:
     print(f"localaictl: {message}", file=sys.stderr)
     raise SystemExit(1)
+
+
+def parse_tar_size(value: bytes) -> int:
+    if len(value) != 12:
+        fail("backup contains an invalid tar size field")
+    if value[0] & 0x80:
+        if value[0] & 0x40:
+            fail("backup contains a negative tar size")
+        return int.from_bytes(bytes((value[0] & 0x7f,)) + value[1:], "big")
+    try:
+        text = value.rstrip(b"\0 ").lstrip(b" ") or b"0"
+        if any(byte not in b"01234567" for byte in text):
+            fail("backup contains an invalid tar size field")
+        return int(text, 8)
+    except ValueError:
+        fail("backup contains an invalid tar size field")
+
+
+def validate_pax_payload(payload: bytes) -> None:
+    offset = 0
+    while offset < len(payload):
+        separator = payload.find(b" ", offset)
+        if separator < 0:
+            fail("backup contains malformed pax metadata")
+        try:
+            length = int(payload[offset:separator])
+        except ValueError:
+            fail("backup contains malformed pax metadata")
+        end = offset + length
+        if length <= separator - offset + 1 or end > len(payload) or payload[end - 1:end] != b"\n":
+            fail("backup contains malformed pax metadata")
+        record = payload[separator + 1:end - 1]
+        key, equals, value = record.partition(b"=")
+        if not equals:
+            fail("backup contains malformed pax metadata")
+        if key in {b"path", b"linkpath"} and len(value) > MAX_MEMBER_NAME_BYTES:
+            fail("backup contains an overlong archive member name")
+        if key in {b"size", b"GNU.sparse.realsize", b"GNU.sparse.size"}:
+            try:
+                size = int(value)
+            except ValueError:
+                fail("backup contains malformed pax size metadata")
+            if size < 0 or size > MAX_ARCHIVE_EXPANDED_BYTES:
+                fail("backup exceeds the supported expanded-size limit")
+        offset = end
+
+
+def preflight_tar_stream(stream: object) -> None:
+    try:
+        seek = getattr(stream, "seek", None)
+        if callable(seek):
+            seek(0)
+        count = 0
+        total_size = 0
+        total_pax = 0
+        while True:
+            header = stream.read(512)
+            if not header:
+                break
+            if len(header) != 512:
+                fail("backup contains a truncated tar header")
+            if not any(header):
+                break
+            count += 1
+            if count > MAX_ARCHIVE_MEMBERS:
+                fail("backup exceeds the supported member-count limit")
+            size = parse_tar_size(header[124:136])
+            typeflag = header[156:157]
+            name = header[:100].split(b"\0", 1)[0]
+            prefix = header[345:500].split(b"\0", 1)[0]
+            if prefix:
+                name = prefix + b"/" + name
+            if len(name) > MAX_MEMBER_NAME_BYTES:
+                fail("backup contains an overlong archive member name")
+            if typeflag in {b"x", b"g", b"L", b"K"}:
+                if size > MAX_PAX_HEADER_BYTES:
+                    fail("backup contains an oversized pax or long-name header")
+                total_pax += size
+                if total_pax > MAX_TOTAL_PAX_BYTES:
+                    fail("backup exceeds the supported metadata-size limit")
+                payload = stream.read(size)
+                if len(payload) != size:
+                    fail("backup contains a truncated pax or long-name header")
+                if typeflag in {b"x", b"g"}:
+                    validate_pax_payload(payload)
+                elif len(payload.rstrip(b"\0")) > MAX_MEMBER_NAME_BYTES:
+                    fail("backup contains an overlong archive member name")
+            else:
+                total_size += size
+                if total_size > MAX_ARCHIVE_EXPANDED_BYTES:
+                    fail("backup exceeds the supported expanded-size limit")
+                remaining = size
+                while remaining:
+                    chunk = stream.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        fail("backup contains truncated member data")
+                    remaining -= len(chunk)
+            padding = (-size) % 512
+            while padding:
+                chunk = stream.read(min(512, padding))
+                if not chunk:
+                    fail("backup contains truncated member padding")
+                padding -= len(chunk)
+        if callable(seek):
+            seek(0)
+    except (OSError, EOFError, gzip.BadGzipFile):
+        fail("backup preflight could not read archive data")
+
+
+def preflight_gzip_archive(filename: str) -> None:
+    try:
+        with gzip.open(filename, "rb") as stream:
+            preflight_tar_stream(stream)
+    except (OSError, EOFError, gzip.BadGzipFile):
+        fail("backup preflight could not read archive data")
 
 
 def clean_member_name(name: str) -> str:
@@ -35,6 +159,52 @@ def clean_member_name(name: str) -> str:
 def member_root(name: str, roots: list[str]) -> str | None:
     matches = [root for root in roots if name == root or name.startswith(root + "/")]
     return max(matches, key=len) if matches else None
+
+
+def owner_id_policy(root_path: str) -> tuple[int, int, str, list[tuple[int, int]], list[tuple[int, int]]]:
+    try:
+        root = os.stat(root_path, follow_symlinks=False)
+        if not stat.S_ISDIR(root.st_mode):
+            fail("configured persistent root is not a directory")
+        username = pwd.getpwuid(root.st_uid).pw_name
+    except (OSError, KeyError):
+        fail("cannot verify configured persistent root ownership")
+    uid_ranges: list[tuple[int, int]] = []
+    gid_ranges: list[tuple[int, int]] = []
+    for filename, ranges in (("/etc/subuid", uid_ranges), ("/etc/subgid", gid_ranges)):
+        try:
+            with open(filename, encoding="ascii") as stream:
+                for line in stream:
+                    fields = line.rstrip("\n").split(":")
+                    if len(fields) == 3 and fields[0] in {username, str(root.st_uid)} and fields[1].isdigit() and fields[2].isdigit():
+                        start, length = int(fields[1]), int(fields[2])
+                        if length > 0 and start + length <= 2**32:
+                            ranges.append((start, start + length))
+        except (OSError, UnicodeError):
+            fail("cannot verify persistent root subordinate ID ranges")
+    return root.st_uid, root.st_gid, username, uid_ranges, gid_ranges
+
+
+def in_owner_policy(value: int, owner: int, ranges: list[tuple[int, int]]) -> bool:
+    return value == owner or any(start <= value < end for start, end in ranges)
+
+
+def sensitive_member(name: str) -> bool:
+    basename = posixpath.basename(name).lower()
+    return basename == "database.db" or basename.endswith((".key", ".p12", ".pfx")) or (
+        "key" in basename and basename.endswith(".pem")
+    )
+
+
+def unsafe_archive_attributes(info: tarfile.TarInfo) -> bool:
+    for key, value in info.pax_headers.items():
+        normalized = key.lower()
+        if (".acl." in normalized or "posix_acl" in normalized or
+                normalized.startswith("schily.acl") or normalized.startswith("libarchive.acl")):
+            return True
+        if normalized.endswith("security.selinux") and value:
+            return True
+    return False
 
 
 def read_metadata(archive: tarfile.TarFile) -> dict[str, str]:
@@ -85,9 +255,14 @@ def read_rootless_context(filename: str) -> dict[str, str | int]:
         value = str(context[key])
         if not value.startswith("/") or os.path.normpath(value) != value or "\n" in value or "\r" in value:
             fail("verified rootless service context is invalid")
-    if not str(context["service_user"]).isidentifier():
+    if (not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*", str(context["service_user"])) or
+            context["service_user"] in {"root", "0"}):
         fail("verified rootless service context is invalid")
     return context
+
+
+def valid_service_account_name(value: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*", value)) and value not in {"root", "0"}
 
 
 def parse_id_map(value: str) -> list[tuple[int, int, int]]:
@@ -238,7 +413,15 @@ def validate_graphroot_path(
         if path == graphroot:
             continue
         if path in home_chain or path in private_chain:
-            if info.st_uid != service_uid or stat.S_IMODE(info.st_mode) & 0o077:
+            mode = stat.S_IMODE(info.st_mode)
+            if path == service_home:
+                # The installer creates the service home as 0750; group read
+                # and search are safe only for the dedicated service group.
+                unsafe_mode = (mode & 0o700 != 0o700 or mode & 0o027 != 0 or
+                               info.st_mode & 0o7000 != 0)
+                if (info.st_uid != service_uid or info.st_gid != service_gid or unsafe_mode):
+                    fail("configured rootless graphroot service home is public or has unexpected ownership")
+            elif info.st_uid != service_uid or mode & 0o077 or info.st_mode & 0o7000:
                 fail("configured rootless graphroot service-home ancestry is public")
         elif path != "/" and info.st_uid != 0:
             fail("configured rootless graphroot ancestry has an unexpected owner")
@@ -247,7 +430,10 @@ def validate_graphroot_path(
             root_info = os.lstat(graphroot)
         except OSError:
             fail("configured rootless graphroot is unavailable")
-        if not stat.S_ISDIR(root_info.st_mode) or (root_info.st_uid, root_info.st_gid) != (service_uid, service_gid) or stat.S_IMODE(root_info.st_mode) & 0o077:
+        root_mode = stat.S_IMODE(root_info.st_mode)
+        if (not stat.S_ISDIR(root_info.st_mode) or
+                (root_info.st_uid, root_info.st_gid) != (service_uid, service_gid) or
+                root_mode & 0o700 != 0o700 or root_mode & 0o077 or root_info.st_mode & 0o7000):
             fail("configured rootless graphroot has unsafe owner or mode")
     if graphroot_mounts(graphroot):
         fail("configured rootless graphroot contains a mount point")
@@ -386,6 +572,7 @@ def validate_graphroot_tar(
     live_gid_map_value: str,
     service_user: str,
 ) -> list[str]:
+    preflight_tar_stream(archive_file)
     try:
         passwd_entry = pwd.getpwnam(service_user)
         group_entry = grp.getgrnam(service_user)
@@ -418,6 +605,8 @@ def validate_graphroot_tar(
                     fail("rootless archive has setgid ownership mapped to the service group")
                 if any(key.lower().endswith("security.capability") and value for key, value in info.pax_headers.items()):
                     fail("rootless archive contains a file capability xattr")
+                if any("acl" in key.lower() and value for key, value in info.pax_headers.items()):
+                    fail("rootless archive contains an unverified ACL")
                 if info.issym():
                     link = info.linkname
                     if "\x00" in link or "\n" in link or "\r" in link:
@@ -433,8 +622,31 @@ def validate_graphroot_tar(
     except (OSError, tarfile.TarError) as error:
         fail(f"cannot read rootless graphroot archive ({type(error).__name__})")
     root = members.get(prefix)
-    if root is None or not root.isdir() or root.uid != 0 or root.gid != 0 or root.mode & 0o077:
+    if (root is None or not root.isdir() or root.uid != 0 or root.gid != 0 or
+            root.mode & 0o700 != 0o700 or root.mode & 0o077 or root.mode & 0o7000):
         fail("rootless archive graphroot root is missing or not a directory")
+    for name, info in members.items():
+        label_values = [value.encode("utf-8", "surrogateescape").rstrip(b"\0")
+                        for key, value in info.pax_headers.items()
+                        if key.lower().endswith("security.selinux")]
+        if len(label_values) > 1:
+            fail("rootless archive contains duplicate SELinux labels")
+        relative = name[len(prefix):].lstrip("/")
+        live_path = graphroot if not relative else os.path.join(graphroot, *relative.split("/"))
+        if not os.path.lexists(live_path):
+            if label_values:
+                fail("rootless archive SELinux label has no installed baseline")
+            continue
+        try:
+            live_label = os.getxattr(live_path, "security.selinux", follow_symlinks=False).rstrip(b"\0")
+        except OSError as error:
+            if error.errno in {getattr(errno, "ENODATA", 61), getattr(errno, "ENOATTR", 61)}:
+                live_label = b""
+            else:
+                fail("cannot verify rootless archive SELinux labels")
+        archived_label = label_values[0] if label_values else b""
+        if archived_label != live_label:
+            fail("rootless archive SELinux label differs from its installed baseline")
     for name, info in members.items():
         if info.islnk():
             target = clean_member_name(info.linkname)
@@ -461,12 +673,14 @@ def validate_archive(
     require_root_config: bool = True,
     rootless_context: dict[str, str | int] | None = None,
 ) -> list[str]:
+    preflight_gzip_archive(archive)
     config_name = config.lstrip("/")
     prefixes = [p.lstrip("/").rstrip("/") for p in roots]
     if any(not p for p in prefixes) or len(set(prefixes)) != len(prefixes):
         fail("configured backup paths must be distinct absolute paths")
     graphroot_prefix = None if rootless_context is None else str(rootless_context["graphroot"]).lstrip("/").rstrip("/")
     members: dict[str, tarfile.TarInfo] = {}
+    persistent_owner_policies: dict[str, tuple[int, int, str, list[tuple[int, int]], list[tuple[int, int]]]] = {}
     nested_member: tarfile.TarInfo | None = None
     try:
         fd = os.open(archive, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
@@ -493,15 +707,35 @@ def validate_archive(
                     fail("backup contains an unsupported special file")
                 if info.mode & 0o6000:
                     fail("backup contains setuid or setgid permission bits")
+                if not info.issym() and info.mode & 0o022:
+                    fail("backup contains group/world-writable permissions")
                 if any(key.lower().endswith("security.capability") and value for key, value in info.pax_headers.items()):
                     fail("backup contains a file capability xattr")
+                if unsafe_archive_attributes(info):
+                    fail("backup contains an unsupported ACL or SELinux label")
                 if name == config_name:
                     expected_uid = 0 if require_root_config else os.stat(config, follow_symlinks=False).st_uid
-                    if not info.isfile() or info.uid != expected_uid or info.mode & 0o022:
+                    expected_gid = 0 if require_root_config else os.stat(config, follow_symlinks=False).st_gid
+                    if (not info.isfile() or info.uid != expected_uid or info.gid != expected_gid or
+                            info.mode & 0o022 or info.mode & 0o007):
                         ownership = "root-owned" if require_root_config else "owned by its source file owner"
-                        fail(f"backup configuration member must be a {ownership} regular file without group or world write permission")
+                        fail(f"backup configuration member must be a {ownership} regular file without public permissions")
                 if name in prefixes and not info.isdir():
                     fail("configured persistent path must be archived as a directory")
+                if name != config_name and name != "metadata":
+                    root_name = member_root(name, prefixes)
+                    if root_name is None:
+                        fail("backup contains a path outside configured LocalAI paths")
+                    if root_name not in persistent_owner_policies:
+                        persistent_owner_policies[root_name] = owner_id_policy("/" + root_name)
+                    expected_uid, expected_gid, _username, uid_ranges, gid_ranges = persistent_owner_policies[root_name]
+                    if name == root_name and (info.uid, info.gid) != (expected_uid, expected_gid):
+                        fail("backup persistent root ownership differs from the installed root")
+                    if (not in_owner_policy(info.uid, expected_uid, uid_ranges) or
+                            not in_owner_policy(info.gid, expected_gid, gid_ranges)):
+                        fail("backup member ownership is outside the configured service account")
+                    if sensitive_member(name) and info.mode & 0o027:
+                        fail("backup contains public or writable permissions on sensitive state")
                 members[name] = info
     except (OSError, tarfile.TarError) as error:
         fail(f"cannot read backup archive ({type(error).__name__})")
@@ -596,6 +830,108 @@ def stage_check(stage: str) -> None:
         fail("cannot verify restore staging filesystem")
     if best_type in {"tmpfs", "ramfs"}:
         fail("restore staging filesystem is memory-backed")
+
+
+def transaction_marker_open_parent(path: str) -> tuple[int, str]:
+    if not path.startswith("/") or os.path.normpath(path) != path:
+        fail("backup restore transaction marker path is invalid")
+    parent_path, name = os.path.dirname(path), os.path.basename(path)
+    if name in {"", ".", ".."}:
+        fail("backup restore transaction marker path is invalid")
+    try:
+        parent_fd = open_directory_nofollow(parent_path)
+        parent_info = os.fstat(parent_fd)
+    except OSError:
+        fail("backup restore transaction marker parent is unsafe")
+    if (parent_info.st_uid != os.geteuid() or parent_info.st_mode & 0o022 or
+            not stat.S_ISDIR(parent_info.st_mode)):
+        os.close(parent_fd)
+        fail("backup restore transaction marker parent is unsafe")
+    return parent_fd, name
+
+
+def read_transaction_marker(path: str = BACKUP_RESTORE_MARKER) -> dict[str, str]:
+    parent_fd, name = transaction_marker_open_parent(path)
+    try:
+        try:
+            fd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0), dir_fd=parent_fd)
+        except FileNotFoundError:
+            return {}
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or
+                stat.S_IMODE(info.st_mode) != 0o644 or info.st_mode & 0o022):
+            os.close(fd)
+            fail("backup restore transaction marker has unsafe ownership or mode")
+        with os.fdopen(fd, "r", encoding="ascii") as stream:
+            marker = json.load(stream)
+        if (not isinstance(marker, dict) or
+                set(marker) != {"format", "graphroot", "rollback_path", "graphroot_inode"} or
+                marker.get("format") != 1 or
+                any(not isinstance(marker[key], str) for key in ("graphroot", "rollback_path", "graphroot_inode"))):
+            fail("backup restore transaction marker is malformed")
+        return marker
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        fail("cannot read backup restore transaction marker")
+    finally:
+        os.close(parent_fd)
+
+
+def check_transaction_marker(path: str = BACKUP_RESTORE_MARKER) -> None:
+    if read_transaction_marker(path):
+        fail("a previous backup restore is incomplete; managed services remain blocked pending recovery")
+
+
+def create_transaction_marker(graphroot: str, rollback_path: str, graphroot_inode: str,
+                              path: str = BACKUP_RESTORE_MARKER) -> None:
+    if bool(graphroot) != bool(rollback_path) or bool(graphroot) != bool(graphroot_inode):
+        fail("backup restore transaction marker arguments are incomplete")
+    for value in (graphroot, rollback_path):
+        if value and (not value.startswith("/") or os.path.normpath(value) != value):
+            fail("backup restore transaction marker paths are invalid")
+    if graphroot and os.path.dirname(graphroot) != os.path.dirname(rollback_path):
+        fail("backup restore transaction marker paths are invalid")
+    parent_fd, name = transaction_marker_open_parent(path)
+    payload = json.dumps({"format": 1, "graphroot": graphroot,
+                          "rollback_path": rollback_path,
+                          "graphroot_inode": graphroot_inode}, separators=(",", ":")).encode("ascii") + b"\n"
+    try:
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) |
+                     getattr(os, "O_CLOEXEC", 0), 0o644, dir_fd=parent_fd)
+        try:
+            os.fchown(fd, os.geteuid(), os.getegid())
+            os.fchmod(fd, 0o644)
+            with os.fdopen(fd, "wb", closefd=False) as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.fsync(parent_fd)
+    except FileExistsError:
+        fail("a previous backup restore is incomplete; managed services remain blocked pending recovery")
+    except OSError:
+        fail("could not create a durable backup restore transaction marker")
+    finally:
+        os.close(parent_fd)
+    read_transaction_marker(path)
+
+
+def clear_transaction_marker(path: str = BACKUP_RESTORE_MARKER) -> None:
+    parent_fd, name = transaction_marker_open_parent(path)
+    try:
+        try:
+            info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or
+                stat.S_IMODE(info.st_mode) != 0o644 or info.st_mode & 0o022):
+            fail("backup restore transaction marker has unsafe ownership or mode")
+        os.unlink(name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    except OSError:
+        fail("could not clear backup restore transaction marker safely")
+    finally:
+        os.close(parent_fd)
 
 
 def systemd_tree_prefix(name: str, tree: str, roots: list[str]) -> str | None:
@@ -848,6 +1184,7 @@ def space_check(
     staged: bool = False,
     rootless_context: dict[str, str | int] | None = None,
 ) -> None:
+    preflight_gzip_archive(archive_path)
     archive_size = os.stat(archive_path, follow_symlinks=False).st_size
     expanded = 0
     rollback = 0
@@ -859,14 +1196,25 @@ def space_check(
     def allocated(size: int, block_size: int) -> int:
         return max(block_size, ((size + block_size - 1) // block_size) * block_size)
 
+    def archive_metadata_bytes(info: tarfile.TarInfo) -> int:
+        return sum(len(key.encode("utf-8", "surrogateescape")) +
+                   len(value.encode("utf-8", "surrogateescape")) + 256
+                   for key, value in info.pax_headers.items())
+
+    def filesystem_metadata_bytes(path: str) -> int:
+        total = 0
+        for name in os.listxattr(path, follow_symlinks=False):
+            total += len(os.fsencode(name)) + len(os.getxattr(path, name, follow_symlinks=False)) + 256
+        return total
+
     try:
         with tarfile.open(archive_path, "r:gz") as archive:
             for info in archive:
                 extracted_entries += 1
                 if info.isfile():
-                    expanded += allocated(info.size, max(1, stage_filesystem.f_frsize))
+                    expanded += allocated(info.size + archive_metadata_bytes(info), max(1, stage_filesystem.f_frsize))
                 else:
-                    expanded += max(1, stage_filesystem.f_frsize)
+                    expanded += allocated(archive_metadata_bytes(info), max(1, stage_filesystem.f_frsize))
         if collision_file:
             for encoded in open(collision_file, "rb").read().split(b"\0"):
                 if not encoded:
@@ -877,9 +1225,10 @@ def space_check(
                 except FileNotFoundError:
                     continue
                 if stat.S_ISREG(info.st_mode):
-                    rollback += allocated(info.st_size, max(1, stage_filesystem.f_frsize))
+                    rollback += allocated(info.st_size + filesystem_metadata_bytes(os.path.join("/", os.fsdecode(encoded))), max(1, stage_filesystem.f_frsize))
                 else:
-                    rollback += max(1, stage_filesystem.f_frsize)
+                    rollback += allocated(filesystem_metadata_bytes(os.path.join("/", os.fsdecode(encoded))), max(1, stage_filesystem.f_frsize))
+            rollback += collision_entries * 1024 + 10240
     except (OSError, tarfile.TarError) as error:
         fail(f"cannot estimate restore staging space ({type(error).__name__})")
     usage_by_filesystem: dict[tuple[int, int], dict[str, int | str]] = {}
@@ -958,6 +1307,7 @@ def space_check(
                         nested_stream = outer.extractfile(info)
                         if nested_stream is None:
                             fail("cannot estimate rootless graphroot restore size")
+                        preflight_tar_stream(nested_stream)
                         with tarfile.open(fileobj=nested_stream, mode="r:") as nested:
                             graphroot = str(rootless_context["graphroot"])
                             prefix = posixpath.basename(graphroot.rstrip("/"))
@@ -967,12 +1317,13 @@ def space_check(
                                     fail("rootless archive contains a path outside its graphroot")
                                 relative = nested_name[len(prefix):].lstrip("/")
                                 target = graphroot if not relative else os.path.join(graphroot, *relative.split("/"))
-                                charge_tree(target.lstrip("/"), nested_info.size if nested_info.isfile() else None)
+                                nested_size = nested_info.size if nested_info.isfile() else 0
+                                charge_tree(target.lstrip("/"), nested_size + archive_metadata_bytes(nested_info))
                     continue
-                size = info.size if info.isfile() else None
+                size = (info.size if info.isfile() else 0) + archive_metadata_bytes(info)
                 if info.islnk():
                     target = archive_members.get(clean_member_name(info.linkname))
-                    size = target.size if target is not None and target.isfile() else None
+                    size = (target.size if target is not None and target.isfile() else 0) + archive_metadata_bytes(info)
                 charge_tree(name, size)
             for name, size in destination_nodes.items():
                 charge("/" + name, size)
@@ -985,7 +1336,7 @@ def space_check(
                         info = os.lstat(os.path.join("/", name))
                     except FileNotFoundError:
                         continue
-                    charge("/" + name, info.st_size if stat.S_ISREG(info.st_mode) else 0)
+                    charge("/" + name, (info.st_size if stat.S_ISREG(info.st_mode) else 0) + filesystem_metadata_bytes(os.path.join("/", name)))
         except (OSError, tarfile.TarError) as error:
             fail(f"cannot estimate destination filesystem requirements ({type(error).__name__})")
 
@@ -1147,6 +1498,21 @@ def main() -> None:
         if len(sys.argv) != 3:
             raise SystemExit(2)
         stage_check(sys.argv[2])
+        return
+    if sys.argv[1:2] == ["restore-marker-check"]:
+        if len(sys.argv) != 2:
+            raise SystemExit(2)
+        check_transaction_marker()
+        return
+    if sys.argv[1:2] == ["restore-marker-create"]:
+        if len(sys.argv) != 5:
+            raise SystemExit(2)
+        create_transaction_marker(sys.argv[2], sys.argv[3], sys.argv[4])
+        return
+    if sys.argv[1:2] == ["restore-marker-clear"]:
+        if len(sys.argv) != 2:
+            raise SystemExit(2)
+        clear_transaction_marker()
         return
     if sys.argv[1:2] == ["space-check"]:
         if len(sys.argv) < 4:

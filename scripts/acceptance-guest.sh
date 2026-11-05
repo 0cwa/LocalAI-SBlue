@@ -85,25 +85,28 @@ service_systemctl() {
 
 cpu_image=docker.io/localai/localai:latest
 service_podman() {
-  local uid
-  uid="$(id -u localai)" || return 1
-  systemd-run --user --machine=localai@.host --wait --pipe --collect \
-    --setenv=HOME=/var/lib/localai --setenv="XDG_RUNTIME_DIR=/run/user/$uid" \
+  local service_user="${LOCALAI_SERVICE_USER:-localai}" uid home
+  uid="$(id -u "$service_user")" || return 1
+  home="$(getent passwd "$service_user" | cut -d: -f6)" || return 1
+  [[ -n "$home" && "$home" == /* ]] || return 1
+  systemd-run --user --machine="${service_user}@.host" --wait --pipe --collect \
+    --setenv="HOME=$home" --setenv="XDG_RUNTIME_DIR=/run/user/$uid" \
     --setenv="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" \
     --setenv=PATH=/usr/bin:/bin -- /usr/bin/podman "$@"
 }
 
 rootless_archive_roundtrip_poc() {
-  local receipt_path="${LOCALAI_ACCEPTANCE_RECEIPT:-}" probe_script result status=0 uid
+  local receipt_path="${LOCALAI_ACCEPTANCE_RECEIPT:-}" probe_script result status=0 uid service_user
   [[ -n "$receipt_path" && -f "$receipt_path" && ! -L "$receipt_path" ]] || return 1
   # shellcheck disable=SC1091
   # shellcheck source=../lib/config.sh
   source "$repo_root/lib/config.sh"
   localai_config_load_compat /etc/localai/localai.conf "$repo_root/localai/localai.lock" || return 1
+  service_user="$LOCALAI_SERVICE_USER"
   [[ -d "$LOCALAI_STATE_DIR" && ! -L "$LOCALAI_STATE_DIR" ]] || return 1
   rootless_poc_dir="$(mktemp -d "$LOCALAI_STATE_DIR/.localaictl-unshare-poc.XXXXXX")" || return 1
-  uid="$(id -u localai)" || return 1
-  chown localai:localai "$rootless_poc_dir" || return 1
+  uid="$(id -u "$service_user")" || return 1
+  chown "$service_user:$service_user" "$rootless_poc_dir" || return 1
   chmod 0700 "$rootless_poc_dir" || return 1
   probe_script="$rootless_poc_dir/probe.py"
   cat >"$probe_script" <<'PY'
@@ -127,7 +130,7 @@ try:
     subgid_ranges = []
     for row in pathlib.Path("/etc/subgid").read_text(encoding="ascii").splitlines():
         fields = row.split(":")
-        if len(fields) == 3 and fields[0] == "localai" and fields[1].isdigit() and fields[2].isdigit():
+        if len(fields) == 3 and fields[0] == sys.argv[2] and fields[1].isdigit() and fields[2].isdigit():
             subgid_ranges.append((int(fields[1]), int(fields[1]) + int(fields[2])))
     mapped_gid = None
     for row in pathlib.Path("/proc/self/gid_map").read_text(encoding="ascii").splitlines():
@@ -184,7 +187,7 @@ except BaseException as error:
 PY
   chmod 0644 "$probe_script" || { rm -rf -- "$rootless_poc_dir"; return 1; }
   chown localai:localai "$probe_script" || { rm -rf -- "$rootless_poc_dir"; return 1; }
-  if result="$(service_podman unshare /usr/bin/python3 "$probe_script" "$rootless_poc_dir" 2>&1)"; then
+  if result="$(service_podman unshare /usr/bin/python3 "$probe_script" "$rootless_poc_dir" "$service_user" 2>&1)"; then
     status=0
   else
     status=$?
@@ -216,12 +219,12 @@ PY
   host_gid="$(stat -c %g -- "$rootless_poc_dir/target/setgid-fixture")" || status=1
   host_mode="$(stat -c %a -- "$rootless_poc_dir/target/setgid-fixture")" || status=1
   if (( status == 0 )) && [[ "$host_uid" == "$uid" && "$host_mode" == 2750 ]] &&
-     python3 - "$host_gid" <<'PY'
+     python3 - "$host_gid" "$service_user" <<'PY'
 import sys
 gid = int(sys.argv[1])
 for row in open("/etc/subgid", encoding="ascii"):
     fields = row.rstrip("\n").split(":")
-    if len(fields) == 3 and fields[0] == "localai" and fields[1].isdigit() and fields[2].isdigit():
+    if len(fields) == 3 and fields[0] == sys.argv[2] and fields[1].isdigit() and fields[2].isdigit():
         start, length = int(fields[1]), int(fields[2])
         if start <= gid < start + length:
             raise SystemExit(0)

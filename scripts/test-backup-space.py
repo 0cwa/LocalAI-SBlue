@@ -21,7 +21,14 @@ backup_archive = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(backup_archive)
 
 
-def make_archive(path: Path, root_a: Path, root_b: Path) -> None:
+def make_archive(
+    path: Path,
+    root_a: Path,
+    root_b: Path,
+    *,
+    member_xattr_size: int = 0,
+    nested_xattr_size: int = 0,
+) -> None:
     with tarfile.open(path, "w:gz") as archive:
         metadata = tarfile.TarInfo("metadata")
         metadata.size = 3
@@ -39,7 +46,24 @@ def make_archive(path: Path, root_a: Path, root_b: Path) -> None:
             archive.addfile(nested_directory)
             member = tarfile.TarInfo(f"{root_name}/{directory_name}/{child_name}")
             member.size = 128 * 1024
+            if root == root_b and member_xattr_size:
+                member.pax_headers["SCHILY.xattr.user.capacity-test"] = "x" * member_xattr_size
             archive.addfile(member, io.BytesIO(b"x" * member.size))
+        if nested_xattr_size:
+            nested_buffer = io.BytesIO()
+            with tarfile.open(fileobj=nested_buffer, mode="w:") as nested:
+                root_name = "models"
+                root_member = tarfile.TarInfo(root_name)
+                root_member.type = tarfile.DIRTYPE
+                nested.addfile(root_member)
+                member = tarfile.TarInfo(f"{root_name}/nested.bin")
+                member.size = 1
+                member.pax_headers["SCHILY.xattr.user.capacity-test"] = "x" * nested_xattr_size
+                nested.addfile(member, io.BytesIO(b"x"))
+            nested_bytes = nested_buffer.getvalue()
+            nested_member = tarfile.TarInfo(backup_archive.ROOTLESS_GRAPHROOT_MEMBER)
+            nested_member.size = len(nested_bytes)
+            archive.addfile(nested_member, io.BytesIO(nested_bytes))
 
 
 def run_case(
@@ -53,6 +77,9 @@ def run_case(
     free_nested: int = 512 * 1024 * 1024,
     shared_stage_a: bool = False,
     staged: bool = False,
+    member_xattr_size: int = 0,
+    nested_xattr_size: int = 0,
+    collision_xattr_size: int = 0,
 ) -> str:
     with tempfile.TemporaryDirectory(prefix="backup-space-test-") as temp:
         base = Path(temp)
@@ -65,7 +92,8 @@ def run_case(
         if nested_mount:
             (root_a / "models").mkdir()
         archive = base / "backup.tar.gz"
-        make_archive(archive, root_a, root_b)
+        make_archive(archive, root_a, root_b, member_xattr_size=member_xattr_size,
+                     nested_xattr_size=nested_xattr_size)
         collision_file = None
         if include_collision:
             old_file = root_a / "old.bin"
@@ -75,6 +103,8 @@ def run_case(
         disk_usage = shutil.disk_usage
         statvfs = os.statvfs
         stat = os.stat
+        listxattr = os.listxattr
+        getxattr = os.getxattr
 
         def fake_statvfs(path: str | os.PathLike[str]) -> SimpleNamespace:
             candidate = Path(path)
@@ -118,9 +148,21 @@ def run_case(
                 return os.stat_result(values)
             return result
 
+        def fake_listxattr(path: str | os.PathLike[str], *args: object, **kwargs: object) -> list[str]:
+            if collision_xattr_size and Path(path).name == "old.bin":
+                return ["user.capacity-test"]
+            return listxattr(path, *args, **kwargs)
+
+        def fake_getxattr(path: str | os.PathLike[str], name: str, *args: object, **kwargs: object) -> bytes:
+            if collision_xattr_size and Path(path).name == "old.bin":
+                return b"x" * collision_xattr_size
+            return getxattr(path, name, *args, **kwargs)
+
         os.statvfs = fake_statvfs
         os.stat = fake_stat
         shutil.disk_usage = fake_disk_usage
+        os.listxattr = fake_listxattr
+        os.getxattr = fake_getxattr
         error_output = io.StringIO()
         try:
             with contextlib.redirect_stderr(error_output):
@@ -130,6 +172,7 @@ def run_case(
                     str(collision_file) if collision_file else None,
                     [str(root_a), str(root_b)],
                     staged=staged,
+                    rootless_context={"graphroot": str(root_a / "models")} if nested_xattr_size else None,
                 )
         except SystemExit:
             return error_output.getvalue()
@@ -137,6 +180,8 @@ def run_case(
             os.statvfs = statvfs
             os.stat = stat
             shutil.disk_usage = disk_usage
+            os.listxattr = listxattr
+            os.getxattr = getxattr
         return ""
 
 
@@ -195,6 +240,28 @@ def main() -> None:
         staged=True,
     )
     assert "insufficient free disk space for restore and rollback on a filesystem" in shared_staged_rollback_too_small
+    member_xattr_too_small = run_case(
+        free_b=64 * 1024 * 1024 + 400 * 1024,
+        inodes_b=1000,
+        member_xattr_size=512 * 1024,
+    )
+    assert "insufficient free disk space for restore and rollback on a filesystem" in member_xattr_too_small
+    rollback_xattr_too_small = run_case(
+        free_a=64 * 1024 * 1024 + 700 * 1024,
+        free_b=512 * 1024 * 1024,
+        inodes_b=1000,
+        include_collision=True,
+        collision_xattr_size=512 * 1024,
+    )
+    assert "insufficient free disk space for restore and rollback on a filesystem" in rollback_xattr_too_small
+    nested_xattr_too_small = run_case(
+        free_b=512 * 1024 * 1024,
+        inodes_b=1000,
+        nested_mount=True,
+        free_nested=64 * 1024 * 1024 + 128 * 1024,
+        nested_xattr_size=512 * 1024,
+    )
+    assert "insufficient free disk space for restore and rollback on a filesystem" in nested_xattr_too_small
 
     print("backup archive destination capacity tests passed")
 

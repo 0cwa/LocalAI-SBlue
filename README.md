@@ -384,10 +384,20 @@ using `podman unshare`, and returns the old tree if restore fails. The inner
 archive is never extracted as host root. Existing service unit trees remain
 required on the destination host as described below.
 
-Restore preserves archived ownership and SELinux xattrs, normalizes and checks
-the configuration file label, verifies labels on configured persistent roots,
-and starts services in dependency order. It restores the services' previous
-active state. `--yes` does not remove unrelated files from state directories.
+Restore preserves validated ownership and non-SELinux xattrs. It rejects ACL
+metadata and archived SELinux labels on ordinary persistent paths, then applies
+and verifies the destination policy labels. Rootless GraphRoot SELinux labels
+are accepted only when they match the stopped installed store. It starts
+services in dependency order and restores their previous active state. `--yes`
+does not remove unrelated files from state directories.
+
+Before changing live state, restore writes a root-owned durable marker at
+`/var/lib/.localaictl-backup-restore.pending`. The backend unit refuses to start
+while the marker exists. A complete restore or verified rollback removes it. If
+the process or host stops during an uncertain restore, backup, restore, and
+backend startup stay blocked; keep the marker and the recorded original
+GraphRoot rollback path for administrator recovery. Do not remove the marker
+until the restored configuration, state, and GraphRoot have been verified.
 
 User service unit files are included in backups, but restore never installs or
 reloads archived unit definitions. Before changing any state, restore requires
