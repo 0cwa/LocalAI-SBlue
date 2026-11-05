@@ -77,7 +77,7 @@ backup_runtime_dir() {
 }
 
 backup_stage_base() {
-  local base="${LOCALAI_TEST_BACKUP_STAGE_DIR:-/var/lib/.localaictl-backup-staging}" current
+  local base="${LOCALAI_RESTORE_STAGE_BASE:-/var/lib/.localaictl-backup-staging}" current
   [[ "$base" == /* && "$base" != /run && "$base" != /run/* && "$base" != /tmp && "$base" != /tmp/* && "$base" != /var/tmp && "$base" != /var/tmp/* ]] || die "restore staging must use an absolute disk-backed directory outside temporary filesystems"
   [[ "$(realpath -m -- "$base")" == "$base" ]] || die "restore staging path must not contain symbolic links or traversal components"
   current="$base"
@@ -95,7 +95,7 @@ backup_stage_base() {
   if is_effectively_root; then
     [[ "$(stat -c %u -- "$base")" == 0 ]] || die "restore staging directory must be root-owned"
   else
-    [[ -n "${LOCALAI_TEST_BACKUP_STAGE_DIR:-}" && "$(stat -c %u -- "$base")" == "$EUID" ]] || die "restore staging must be root-owned"
+    [[ "$(stat -c %u -- "$base")" == 0 ]] || die "restore staging must be root-owned"
   fi
   printf '%s\n' "$base"
 }
@@ -208,22 +208,34 @@ tls_unit_managed() {
   [[ -f "$path" && ! -L "$path" ]] || die "cannot verify ownership of the configured TLS unit"
   expected_uid="$(service_uid "$LOCALAI_TLS_USER")" || die "cannot verify the TLS service account"
   owner="$(run_elevated /usr/bin/stat -c %u -- "$path")" || die "cannot verify ownership of the configured TLS unit"
-  [[ -z "${LOCALAI_TEST_BACKUP_STAGE_DIR:-}" || "$owner" == "$EUID" ]] || [[ "$owner" == "$expected_uid" ]] || die "configured TLS unit is not owned by the TLS service account"
+  [[ "$owner" == "$expected_uid" ]] || die "configured TLS unit is not owned by the TLS service account"
   run_elevated /usr/bin/grep -qx '# Managed by LocalAI secureblue TLS installer.' "$path" || die "configured TLS unit lacks the LocalAI ownership marker"
 }
 
 backend_unit_managed() {
-  local path="$LOCALAI_STATE_DIR/.config/systemd/user/localai.service" expected_uid owner
+  local path="$LOCALAI_STATE_DIR/.config/systemd/user/localai.service" expected_uid owner mode
   [[ -e "$path" || -L "$path" ]] || return 1
   [[ -f "$path" && ! -L "$path" ]] || die "cannot verify ownership of the configured backend unit"
   expected_uid="$(service_uid "$LOCALAI_SERVICE_USER")" || die "cannot verify the backend service account"
   owner="$(run_elevated /usr/bin/stat -c %u -- "$path")" || die "cannot verify ownership of the configured backend unit"
-  [[ -z "${LOCALAI_TEST_BACKUP_STAGE_DIR:-}" || "$owner" == "$EUID" ]] || [[ "$owner" == "$expected_uid" ]] || die "configured backend unit is not owned by the backend service account"
+  [[ "$owner" == "$expected_uid" ]] || die "configured backend unit is not owned by the backend service account"
   run_elevated /usr/bin/grep -qx '# Managed by LocalAI secureblue installer.' "$path" ||
     run_elevated /usr/bin/grep -qx 'Description=LocalAI OpenAI-compatible API and web UI container' "$path" ||
     die "configured backend unit lacks the LocalAI ownership marker"
-  [[ "$(run_elevated /usr/bin/stat -c %a -- "$path")" =~ ^[0-7]+$ ]] || die "cannot verify permissions of the configured backend unit"
-  (( (8#$(run_elevated /usr/bin/stat -c %a -- "$path") & 8#22) == 0 )) || die "configured backend unit is group/world writable"
+  mode="$(run_elevated /usr/bin/stat -c %a -- "$path")"
+  [[ "$mode" =~ ^[0-7]+$ ]] || die "cannot verify permissions of the configured backend unit"
+  (( (8#$mode & 8#22) == 0 )) || die "configured backend unit is group/world writable"
+}
+
+verify_restore_backend_unit() {
+  local restored_config="$1" unit="$LOCALAI_STATE_DIR/.config/systemd/user/localai.service" dropins environment
+  backend_unit_managed || return 1
+  run_elevated /usr/bin/python3 /etc/localai/bootstrap-guard.py --unit-restore-safe \
+    "$restored_config" "$unit" || return 1
+  dropins="$(backend_systemctl show localai.service --property=DropInPaths --value 2>/dev/null)" || return 1
+  printf '%s\n' "$dropins" | run_elevated_pipe /usr/bin/python3 /etc/localai/bootstrap-guard.py --dropins-safe || return 1
+  environment="$(backend_systemctl show localai.service --property=Environment --value 2>/dev/null)" || return 1
+  printf '%s\n' "$environment" | run_elevated_pipe /usr/bin/python3 /etc/localai/bootstrap-guard.py --unit-environment-restore-safe "$restored_config"
 }
 
 socket_units_managed() {
@@ -232,7 +244,7 @@ socket_units_managed() {
   for path in "$socket" "$service"; do
     [[ -f "$path" && ! -L "$path" ]] || die "cannot verify the configured TLS socket units"
     owner="$(run_elevated /usr/bin/stat -c %u -- "$path")" || die "cannot verify ownership of the configured TLS socket units"
-    [[ -z "${LOCALAI_TEST_BACKUP_STAGE_DIR:-}" || "$owner" == "$EUID" ]] || [[ "$owner" == 0 ]] || die "configured TLS socket unit is not root-owned"
+    [[ "$owner" == 0 ]] || die "configured TLS socket unit is not root-owned"
     run_elevated /usr/bin/grep -qx '# Managed by LocalAI secureblue TLS installer.' "$path" || die "configured TLS socket unit lacks the LocalAI ownership marker"
   done
 }
@@ -618,18 +630,6 @@ restore_backup_service_state() {
   return "$status"
 }
 
-reload_restored_user_units() {
-  if [[ "${RESTORE_RELOAD_BACKEND_UNIT:-0}" == 1 ]]; then
-    backend_unit_managed || die "restored backend unit failed ownership checks"
-    backend_systemctl daemon-reload || die "could not reload the backend user manager after restoring its unit"
-    verify_bootstrap_unit || die "restored backend unit failed bootstrap safety checks"
-  fi
-  if [[ "${RESTORE_RELOAD_TLS_UNIT:-0}" == 1 ]]; then
-    tls_unit_managed || die "restored TLS unit failed ownership checks"
-    tls_systemctl daemon-reload || die "could not reload the TLS user manager after restoring its unit"
-  fi
-}
-
 backup_stop_services() {
   local unit state
   backup_units
@@ -762,8 +762,6 @@ restore_archive() {
 restore_locked() {
   local source="$1" stage source_copy members collisions snapshot skip_links target answer item had_target=0 stage_base needs_confirmation=0
   local restore_mutation_started=0 restore_completed=0
-  RESTORE_RELOAD_BACKEND_UNIT=0
-  RESTORE_RELOAD_TLS_UNIT=0
   local helper="$repo_root/lib/backup_archive.py"
   [[ -f "$source" && ! -L "$source" ]] || die "restore source must be a regular, non-linked archive file"
   prepare_backup_roots
@@ -793,8 +791,10 @@ restore_locked() {
   run_elevated /usr/bin/python3 "$helper" skip-links0 "$source" "$config_file" "${backup_roots[@]}" "$stage" >"$skip_links"
   run_elevated /usr/bin/python3 "$helper" members0 "$source" "$config_file" "${backup_roots[@]}" >"$members"
   run_elevated /usr/bin/python3 "$helper" collisions0 "$source" "$config_file" "${backup_roots[@]}" >"$collisions"
-  if grep -zFxq "${LOCALAI_STATE_DIR#/}/.config/systemd/user/localai.service" "$members"; then RESTORE_RELOAD_BACKEND_UNIT=1; fi
-  if grep -zFxq "${LOCALAI_TLS_STATE_DIR#/}/.config/systemd/user/$LOCALAI_TLS_SERVICE_NAME" "$members"; then RESTORE_RELOAD_TLS_UNIT=1; fi
+  run_elevated /usr/bin/python3 "$helper" unit-trees0 "$source" "$config_file" "${backup_roots[@]}" "$stage" "$LOCALAI_STATE_DIR" "$LOCALAI_TLS_STATE_DIR" >"$stage/unit-trees0" || die "backup contains unsafe or changed systemd unit configuration"
+  if grep -zFxq "${LOCALAI_STATE_DIR#/}/.config/systemd/user/localai.service" "$members"; then
+    verify_restore_backend_unit "$stage/${config_file#/}" || die "restored config does not match the trusted installed backend unit and manager settings"
+  fi
   for target in "${backup_roots[@]}"; do
     if [[ -d "$target" ]] && [[ -n "$(run_elevated find "$target" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then needs_confirmation=1; fi
   done
@@ -826,7 +826,11 @@ restore_locked() {
   fi
   local -a links_to_keep=()
   mapfile -d '' -t links_to_keep <"$skip_links"
-  for item in "${links_to_keep[@]}"; do rm -f -- "$stage/$item"; done
+  for item in "${links_to_keep[@]}"; do run_elevated /usr/bin/rm -f -- "$stage/$item"; done
+  mapfile -d '' -t links_to_keep <"$stage/unit-trees0"
+  for item in "${links_to_keep[@]}"; do
+    run_elevated /usr/bin/rm -rf -- "${stage:?}/$item"
+  done
   restore_mutation_started=1
   for target in "${backup_roots[@]}"; do
     if [[ -d "$stage/${target#/}" ]]; then mkdir -p -- "$target"; fi
@@ -849,9 +853,8 @@ restore_locked() {
     [[ -e "$target" ]] || continue
     run_elevated "$matchpathcon_bin" -V "$target" || die "SELinux label verification failed; rollback will run before services restart"
   done
-  reload_restored_user_units || die "could not safely reload restored user service units; rollback will run before services restart"
   restore_completed=1
-  rm -rf -- "$stage"
+  run_elevated /usr/bin/rm -rf -- "$stage"
   restore_backup_service_state || die "restore completed but one or more previously active services could not be restarted"
   trap - EXIT HUP INT TERM
   log "Backup restored. State was overlaid, unrelated files were preserved, and configured root labels were verified."
@@ -878,19 +881,13 @@ restore_exit_cleanup() {
   if [[ "${restore_mutation_started:-0}" == 1 && "${restore_completed:-0}" != 1 ]]; then
     restore_rollback "$members" "$collisions" "$snapshot" "$had_target" || RESTORE_ROLLBACK_FAILED=1
   fi
-  rm -rf -- "${stage:-}"
+  [[ -z "${stage:-}" ]] || run_elevated /usr/bin/rm -rf -- "$stage"
   if [[ "${RESTORE_ROLLBACK_FAILED:-0}" == 1 ]]; then
     printf 'localaictl: warning: rollback was incomplete; previously active services remain stopped for manual recovery\n' >&2
     [[ "$exit_status" != 0 ]] || exit 1
     exit "$exit_status"
   fi
   if [[ "${RESTORE_SERVICES_STOPPED:-0}" == 1 ]]; then
-    if [[ "${restore_mutation_started:-0}" == 1 && "${restore_completed:-0}" != 1 ]]; then
-      reload_restored_user_units || {
-        printf 'localaictl: warning: restored unit rollback could not be reloaded; previously active services remain stopped for manual recovery\n' >&2
-        exit 1
-      }
-    fi
     restore_backup_service_state || exit 1
   fi
   exit "$exit_status"

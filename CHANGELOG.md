@@ -11,6 +11,9 @@ has been runtime-qualified on secureblue or on a GPU.
 - Add protected `localaictl backup` and explicitly confirmed overlay restore,
   covering configured persistent paths and preserving ownership, modes, xattrs,
   ACLs, and SELinux labels.
+- Include user service unit state in archives while requiring a byte-for-byte
+  match with already installed unit entries before restore; restore does not
+  install or reload unit definitions and refuses missing or changed entries.
 
 ## 0.2.0
 

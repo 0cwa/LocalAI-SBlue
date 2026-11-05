@@ -106,4 +106,40 @@ for output, expected in [("null", 0), ('{"/backends": {}, "/data": {}}', 0), ('{
 with patch.object(guard.subprocess, "run", side_effect=subprocess.TimeoutExpired("podman", 30)):
     assert guard.main() == 1
 PYTEST
+python3 - "$guard" "$scratch" <<'PYRESTORE'
+import importlib.util
+import os
+import pathlib
+import sys
+
+guard_path, scratch = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("bootstrap_guard", guard_path)
+guard = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(guard)
+config = pathlib.Path(scratch) / "restore.conf"
+unit = pathlib.Path(scratch) / "restore.service"
+expected = pathlib.Path(scratch) / "restore.expected"
+database = str(pathlib.Path(scratch) / "data" / "database.db")
+config.write_text(
+    f"LOCALAI_BIND_HOST=0.0.0.0\nLOCALAI_BIND_PORT=11455\nLOCALAI_AUTH=true\nLOCALAI_DATA_PATH={pathlib.Path(scratch) / 'data'}\n",
+    encoding="utf-8",
+)
+unit_text = (
+    f"Environment=LOCALAI_AUTH=true\nEnvironment=LOCALAI_AUTH_DATABASE_URL={database}\n"
+    "Environment=LOCALAI_ADDRESS=0.0.0.0:11455\n"
+    f"Environment=LOCALAI_DATA_PATH={pathlib.Path(scratch) / 'data'}\n"
+    f"ExecStartPre=/usr/bin/python3 /etc/localai/bootstrap-guard.py {database}\n"
+)
+unit.write_text(unit_text, encoding="utf-8")
+expected.write_text(unit_text, encoding="utf-8")
+assert guard.restore_unit_matches(str(config), str(unit), str(expected), os.getuid())
+environment = (
+    f"LOCALAI_AUTH=true LOCALAI_AUTH_DATABASE_URL={database} "
+    "LOCALAI_ADDRESS=0.0.0.0:11455"
+)
+assert guard.restore_environment_matches(environment, str(config))
+config.write_text(config.read_text(encoding="utf-8").replace("LOCALAI_AUTH=true", "LOCALAI_AUTH=false"), encoding="utf-8")
+assert not guard.restore_unit_matches(str(config), str(unit), str(expected), os.getuid())
+assert not guard.restore_environment_matches(environment, str(config))
+PYRESTORE
 printf 'Bootstrap guard tests passed.\n'

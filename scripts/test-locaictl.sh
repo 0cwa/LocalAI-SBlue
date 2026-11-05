@@ -43,6 +43,47 @@ fi
 if [[ "${1:-}" == /usr/bin/python3 && "${2:-}" == /etc/localai/bootstrap-guard.py ]]; then
   exit 0
 fi
+if [[ "${1:-}" == /usr/bin/rm ]]; then
+  for target in "$@"; do
+    if [[ "$target" == "$LOCALAI_RESTORE_STAGE_BASE"/* ]]; then
+      printf 'synthetic-stage-cleanup\n' >>"${LOCALAI_FAKE_LOG:?}"
+      python3 - "$target" <<'PY'
+import os, shutil, sys
+target = sys.argv[1]
+def retry(function, path, _error):
+    os.chmod(os.path.dirname(path), 0o700)
+    if os.path.lexists(path) and not os.path.islink(path):
+        os.chmod(path, 0o700)
+    function(path)
+if os.path.islink(target) or os.path.isfile(target):
+    try:
+        os.unlink(target)
+    except FileNotFoundError:
+        pass
+elif os.path.isdir(target):
+    shutil.rmtree(target, onerror=retry)
+PY
+      exit 0
+    fi
+  done
+  exec /usr/bin/rm "$@"
+fi
+if [[ "${1:-}" == /usr/bin/stat && "${2:-}" == -c && "${3:-}" == %u && "${4:-}" == -- ]]; then
+  case "${5:-}" in
+    */backup-tls/.config/systemd/user/*)
+      [[ "${LOCALAI_FAKE_WRONG_TLS_UNIT_OWNER:-false}" != true ]] && printf '1002\n' || printf '9999\n'
+      exit 0
+      ;;
+    */backup-state/.config/systemd/user/localai.service)
+      [[ "${LOCALAI_FAKE_WRONG_BACKEND_UNIT_OWNER:-false}" != true ]] && printf '1001\n' || printf '9999\n'
+      exit 0
+      ;;
+    */systemd/localai-tls-forward.*)
+      [[ "${LOCALAI_FAKE_WRONG_SOCKET_UNIT_OWNER:-false}" != true ]] && printf '0\n' || printf '9999\n'
+      exit 0
+      ;;
+  esac
+fi
 exec "$@"
 EOF
 chmod 0755 "$tmp_dir/run0"
@@ -123,14 +164,25 @@ export LOCALAI_FAKE_LOG="$tmp_dir/commands"
 export LOCALAI_FAKE_STATE_DIR="$tmp_dir/service-state"
 export LOCALAI_FAKE_LOCK_FILE="$tmp_dir/backup.lock"
 export XDG_RUNTIME_DIR="$tmp_dir"
-export LOCALAI_TEST_BACKUP_STAGE_DIR="$tmp_dir/restore-stage"
+export LOCALAI_RESTORE_STAGE_BASE="$tmp_dir/restore-stage"
+mkdir -p "$tmp_dir/fakebin"
+cat >"$tmp_dir/fakebin/stat" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$*" == "-c %u -- $LOCALAI_RESTORE_STAGE_BASE" ]]; then
+  printf '0\n'
+else
+  exec /usr/bin/stat "$@"
+fi
+EOF
+chmod 0755 "$tmp_dir/fakebin/stat"
+export PATH="$tmp_dir/fakebin:$PATH"
 mkdir -p "$LOCALAI_FAKE_STATE_DIR"
 export LOCALAI_ID_BIN="$tmp_dir/id"
 export LOCALAI_JOURNALCTL_BIN="$tmp_dir/journalctl"
 export LOCALAI_SYSTEM_UNIT_DIR="$tmp_dir/systemd"
 export HOME="$tmp_dir/home"
-mkdir -m 0700 "$LOCALAI_TEST_BACKUP_STAGE_DIR"
-python3 "$repo_root/lib/backup_archive.py" stage-check "$LOCALAI_TEST_BACKUP_STAGE_DIR"
+mkdir -m 0700 "$LOCALAI_RESTORE_STAGE_BASE"
+python3 "$repo_root/lib/backup_archive.py" stage-check "$LOCALAI_RESTORE_STAGE_BASE"
 if python3 "$repo_root/lib/backup_archive.py" stage-check /run >/dev/null 2>&1; then
   printf 'restore staging accepted a memory-backed filesystem\n' >&2
   exit 1
@@ -165,85 +217,6 @@ mkdir -p "$tmp_dir/systemd"
 printf '[Socket]\nFreeBind=true\n' >"$tmp_dir/systemd/localai-tls-forward.socket"
 
 [[ "$("$repo_root/bin/localaictl" --version)" == "localaictl $(<"$repo_root/VERSION")" ]]
-(
-  # Reload restored per-user unit files only after checking their ownership
-  # and bootstrap policy; a failed reload must not restart old services.
-  # shellcheck disable=SC1090
-  source <(sed -n '/^reload_restored_user_units() {$/,/^}/p' "$repo_root/bin/localaictl")
-  # shellcheck disable=SC1090
-  source <(sed -n '/^backup_unit_action() {$/,/^}/p' "$repo_root/bin/localaictl")
-  # shellcheck disable=SC1090
-  source <(sed -n '/^restore_backup_service_state() {$/,/^}/p' "$repo_root/bin/localaictl")
-  # shellcheck disable=SC1090
-  source <(sed -n '/^restore_exit_cleanup() {$/,/^}/p' "$repo_root/bin/localaictl")
-  events="$tmp_dir/unit-reload-events"
-  FAIL_RELOAD=0
-  LOCALAI_TLS_SERVICE_NAME=localai-tls-compose.service
-  LOCALAI_TLS_FORWARD_SOCKET_NAME=localai-tls-forward.socket
-  # Read indirectly by the extracted production service-action helper.
-  # shellcheck disable=SC2034
-  LOCALAI_TLS_FORWARD_SERVICE_NAME=localai-tls-forward.service
-  # The production helper invokes these checks indirectly.
-  # shellcheck disable=SC2329
-  backend_unit_managed() { printf 'backend-ownership\n' >>"$events"; }
-  # shellcheck disable=SC2329
-  verify_bootstrap_unit() { printf 'bootstrap-guard\n' >>"$events"; }
-  # shellcheck disable=SC2329
-  tls_unit_managed() { printf 'tls-ownership\n' >>"$events"; }
-  # shellcheck disable=SC2329
-  backend_systemctl() {
-    printf 'backend %s\n' "$*" >>"$events"
-    [[ "$FAIL_RELOAD:$*" != 1:daemon-reload ]]
-  }
-  # shellcheck disable=SC2329
-  tls_systemctl() { printf 'tls %s\n' "$*" >>"$events"; }
-  # shellcheck disable=SC2329
-  root_systemctl() { printf 'root %s\n' "$*" >>"$events"; }
-  # shellcheck disable=SC2329
-  die() { printf 'unit reload safety check failed\n' >&2; exit 1; }
-  RESTORE_RELOAD_BACKEND_UNIT=1 RESTORE_RELOAD_TLS_UNIT=1
-  backup_was_active=(backend tls socket)
-  reload_restored_user_units
-  restore_backup_service_state
-  [[ "$(<"$events")" == $'backend-ownership\nbackend daemon-reload\nbootstrap-guard\ntls-ownership\ntls daemon-reload\nbackend start localai.service\ntls start localai-tls-compose.service\nroot start localai-tls-forward.socket localai-tls-forward.service' ]]
-  : >"$events"
-  # These assignments are consumed by the dynamically sourced production functions.
-  # shellcheck disable=SC2034
-  if (FAIL_RELOAD=1; backup_was_active=(backend); RESTORE_RELOAD_BACKEND_UNIT=1; RESTORE_RELOAD_TLS_UNIT=0; reload_restored_user_units; restore_backup_service_state); then
-    printf 'services restarted after a failed unit-manager reload\n' >&2
-    exit 1
-  fi
-  if rg -q 'backend start' "$events"; then
-    printf 'backend restarted after a failed unit-manager reload\n' >&2
-    exit 1
-  fi
-  : >"$events"
-  mkdir -m 0700 "$tmp_dir/unit-reload-stage"
-  # shellcheck disable=SC2329
-  restore_rollback() { printf 'rollback\n' >>"$events"; }
-  # shellcheck disable=SC1007,SC2034
-  if (
-    FAIL_RELOAD=1
-    RESTORE_RELOAD_BACKEND_UNIT=1
-    RESTORE_RELOAD_TLS_UNIT=0
-    RESTORE_ROLLBACK_FAILED=0
-    RESTORE_SERVICES_STOPPED=1
-    restore_mutation_started=1
-    restore_completed=0
-    stage="$tmp_dir/unit-reload-stage"
-    members= collisions= snapshot= had_target=0
-    backup_was_active=(backend)
-    restore_exit_cleanup
-  ); then
-    printf 'services restarted after a failed rollback manager reload\n' >&2
-    exit 1
-  fi
-  rg -q '^rollback$' "$events"
-  if rg -q 'backend start' "$events"; then
-    printf 'backend restarted after a failed rollback manager reload\n' >&2
-    exit 1
-  fi
-)
 (
   # The function and its dependencies are exercised with isolated mocks.
   # shellcheck disable=SC1090
@@ -448,6 +421,9 @@ rg -q 'start localai-tls-forward.socket' "$tmp_dir/commands"
 # paths while service-manager commands remain mocked.
 unset LOCALAI_FAKE_FAIL_TLS
 mkdir -p "$tmp_dir/backup-state" "$tmp_dir/backup-tls" "$tmp_dir/backup-cache" "$tmp_dir/backup-config-dir"
+mkdir -p "$tmp_dir/backup-state/.config/systemd/user"
+printf '# Managed by LocalAI secureblue installer.\nDescription=LocalAI OpenAI-compatible API and web UI container\n' >"$tmp_dir/backup-state/.config/systemd/user/localai.service"
+chmod 0644 "$tmp_dir/backup-state/.config/systemd/user/localai.service"
 mkdir -p "$tmp_dir/backup-tls/.config/systemd/user"
 printf '# Managed by LocalAI secureblue TLS installer.\nDescription=LocalAI TLS reverse proxy compose stack\n' >"$tmp_dir/backup-tls/.config/systemd/user/localai-tls-compose.service"
 chmod 0644 "$tmp_dir/backup-tls/.config/systemd/user/localai-tls-compose.service"
@@ -543,6 +519,14 @@ rg -q 'TLS CA private key' "$tmp_dir/backup-warning"
 archive_metadata="$(/usr/bin/tar -xOzf "$backup_archive" metadata)"
 rg -q '^backend_image=' <<<"$archive_metadata"
 rg -q '^backend_digest=' <<<"$archive_metadata"
+if ! /usr/bin/tar -tzf "$backup_archive" | rg -q 'backup-state/.config/systemd/user/localai.service'; then
+  printf 'backup omitted the configured backend service unit state\n' >&2
+  exit 1
+fi
+if ! /usr/bin/tar -tzf "$backup_archive" | rg -q 'backup-tls/.config/systemd/user/localai-tls-compose.service'; then
+  printf 'backup omitted the configured TLS service unit state\n' >&2
+  exit 1
+fi
 if /usr/bin/tar -tzf "$backup_archive" | rg -q 'models/model.bin'; then
   printf 'models were included despite --exclude-models\n' >&2
   exit 1
@@ -551,6 +535,27 @@ if ! /usr/bin/tar -tzf "$backup_archive" | rg -q 'backup-cache/cache.db'; then
   printf 'configured persistent data outside the main state root was omitted\n' >&2
   exit 1
 fi
+stop_count_before="$(rg -c ' stop localai.service$' "$tmp_dir/commands" || true)"
+if LOCALAI_FAKE_WRONG_TLS_UNIT_OWNER=true "$repo_root/bin/localaictl" backup "$tmp_dir/wrong-tls-owner.tar.gz" >/dev/null 2>&1; then
+  printf 'backup accepted a TLS unit with the wrong owner\n' >&2
+  exit 1
+fi
+stop_count_after="$(rg -c ' stop localai.service$' "$tmp_dir/commands" || true)"
+[[ "$stop_count_before" == "$stop_count_after" ]]
+if LOCALAI_TEST_BACKUP_STAGE_DIR="$tmp_dir" LOCALAI_FAKE_WRONG_BACKEND_UNIT_OWNER=true \
+  "$repo_root/bin/localaictl" restore --yes "$backup_archive" >/dev/null 2>&1; then
+  printf 'restore accepted a backend unit with the wrong owner\n' >&2
+  exit 1
+fi
+stop_count_after="$(rg -c ' stop localai.service$' "$tmp_dir/commands" || true)"
+[[ "$stop_count_before" == "$stop_count_after" ]]
+if env -u LOCALAI_TEST_BACKUP_STAGE_DIR LOCALAI_FAKE_WRONG_BACKEND_UNIT_OWNER=true \
+  "$repo_root/bin/localaictl" restore --yes "$backup_archive" >/dev/null 2>&1; then
+  printf 'restore accepted a backend unit with the wrong owner when the test variable was unset\n' >&2
+  exit 1
+fi
+stop_count_after="$(rg -c ' stop localai.service$' "$tmp_dir/commands" || true)"
+[[ "$stop_count_before" == "$stop_count_after" ]]
 if "$repo_root/bin/localaictl" backup "$tmp_dir/backup-state/inside.tar.gz" >/dev/null 2>&1; then
   printf 'backup destination inside state was accepted\n' >&2
   exit 1
@@ -570,6 +575,24 @@ PY
 stop_count_before="$(rg -c ' stop localai.service$' "$tmp_dir/commands" || true)"
 if "$repo_root/bin/localaictl" restore --yes "$malicious_archive" >/dev/null 2>&1; then
   printf 'restore accepted a traversal symbolic link\n' >&2
+  exit 1
+fi
+stop_count_after="$(rg -c ' stop localai.service$' "$tmp_dir/commands" || true)"
+[[ "$stop_count_before" == "$stop_count_after" ]]
+omitted_units_archive="$tmp_dir/omitted-units.tar.gz"
+python3 - "$backup_archive" "$omitted_units_archive" <<'PY'
+import sys, tarfile
+source_path, target_path = sys.argv[1:]
+with tarfile.open(source_path, 'r:gz') as source, tarfile.open(target_path, 'w:gz') as target:
+    for member in source:
+        parts = member.name.rstrip('/').split('/')
+        if any(parts[index:index + 2] == ['systemd', 'user'] for index in range(len(parts) - 1)):
+            continue
+        target.addfile(member, source.extractfile(member) if member.isfile() else None)
+PY
+stop_count_before="$(rg -c ' stop localai.service$' "$tmp_dir/commands" || true)"
+if "$repo_root/bin/localaictl" restore --yes "$omitted_units_archive" >/dev/null 2>&1; then
+  printf 'restore accepted an archive that omitted installed user service units\n' >&2
   exit 1
 fi
 stop_count_after="$(rg -c ' stop localai.service$' "$tmp_dir/commands" || true)"
@@ -663,6 +686,42 @@ PY
     exit 1
   fi
 done
+for unit_case in tls-exec tls-dropin user-wants system-unit; do
+  unit_archive="$tmp_dir/unsafe-unit-$unit_case.tar.gz"
+  python3 - "$unit_archive" "$tmp_dir/backup-tls" "$unit_case" <<'PY'
+import io, sys, tarfile
+archive_path, tls_root, unit_case = sys.argv[1:]
+root_name = tls_root.lstrip('/')
+if unit_case == 'tls-exec':
+    member_name = root_name + '/.config/systemd/user/localai-tls-compose.service'
+    payload = b'[Service]\nExecStart=/usr/bin/touch /root/restore-unit-compromise\n'
+elif unit_case == 'tls-dropin':
+    member_name = root_name + '/.config/systemd/user/localai-tls-compose.service.d/override.conf'
+    payload = b'[Service]\nExecStart=/usr/bin/touch /root/restore-unit-compromise\n'
+elif unit_case == 'user-wants':
+    member_name = root_name + '/.config/systemd/user/default.target.wants/evil.service'
+    payload = b'[Service]\nExecStart=/usr/bin/touch /root/restore-unit-compromise\n'
+else:
+    member_name = root_name + '/.config/systemd/system/evil.service'
+    payload = b'[Service]\nExecStart=/usr/bin/touch /root/restore-unit-compromise\n'
+with tarfile.open(archive_path, 'w:gz') as archive:
+    metadata = tarfile.TarInfo('metadata')
+    metadata.size = 3
+    archive.addfile(metadata, io.BytesIO(b'v=1'))
+    root = tarfile.TarInfo(root_name)
+    root.type = tarfile.DIRTYPE
+    archive.addfile(root)
+    member = tarfile.TarInfo(member_name)
+    member.size = len(payload)
+    archive.addfile(member, io.BytesIO(payload))
+PY
+  if "$repo_root/bin/localaictl" restore --yes "$unit_archive" >/dev/null 2>&1; then
+    printf 'restore accepted changed or unsupported systemd unit content (%s)\n' "$unit_case" >&2
+    exit 1
+  fi
+  stop_count_after="$(rg -c ' stop localai.service$' "$tmp_dir/commands" || true)"
+  [[ "$stop_count_before" == "$stop_count_after" ]]
+done
 non_directory_root_archive="$tmp_dir/non-directory-root.tar.gz"
 python3 - "$non_directory_root_archive" "$tmp_dir/backup-state" <<'PY'
 import io, sys, tarfile
@@ -738,6 +797,17 @@ if not sent or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
                           (b'unsupported or unsafe', 'archive-validation'), (b'SELinux', 'label-check'),
                           (b'rollback', 'rollback'), (b'ownership checks', 'unit-ownership'),
                           (b'bootstrap safety', 'bootstrap-safety'), (b'daemon-reload', 'manager-reload'),
+                          (b'insufficient free inodes', 'inode-capacity'), (b'cannot create', 'copy-create'),
+                          (b'Permission denied', 'permission'), (b'Operation not permitted', 'ownership-operation'),
+                          (b'targets changed', 'target-race'), (b'could not prepare rollback', 'rollback-snapshot'),
+                          (b'No space left', 'space-exhausted'), (b'File exists', 'collision'),
+                          (b'failed to preserve', 'metadata-copy'), (b'chmod:', 'fixture-chmod'),
+                          (b'find:', 'fixture-find'), (b'rm:', 'fixture-rm'),
+                          (b'user unit file differs', 'unit-file-mismatch'),
+                          (b'user unit tree entries differ', 'unit-entry-set-mismatch'),
+                          (b'user unit link differs', 'unit-link-mismatch'),
+                          (b'user unit entry type differs', 'unit-type-mismatch'),
+                          (b'absent from the installed tree', 'unit-missing'),
                           (b'unit', 'unit-safety'), (b'bootstrap', 'bootstrap-safety')):
         if marker in text:
             reason = label
@@ -758,9 +828,9 @@ restore_config_path="$restore_config_dir/localai.conf"
 printf 'LOCALAI_STATE_DIR=%s\nLOCALAI_MODELS_PATH=%s/models\nLOCALAI_BACKENDS_PATH=%s/backends\nLOCALAI_DOWNLOAD_STAGING_PATH=%s/downloading\nLOCALAI_BACKEND_TEMP_DIR=%s/tmp\nLOCALAI_DATA_PATH=%s/data\nLOCALAI_CONFIG_DIR=%s/config\nLOCALAI_GENERATED_CONTENT_PATH=%s/generated\nLOCALAI_UPLOAD_PATH=%s/uploads\nLOCALAI_CACHE_DIR=%s\nLOCALAI_LOG_DIR=%s/logs\nLOCALAI_TLS_STATE_DIR=%s\nLOCALAI_TLS_CONFIG_DIR=%s/caddy\nLOCALAI_TLS_CACHE_DIR=%s/cache\nLOCALAI_TLS_CERT_DIR=%s/certs\nLOCALAI_TLS_COMPOSE_DIR=%s/compose\nLOCALAI_TLS_ENABLED=false\n' \
   "$tmp_dir/backup-state" "$tmp_dir/backup-state" "$tmp_dir/backup-state" "$tmp_dir/backup-state" "$tmp_dir/backup-state" "$tmp_dir/backup-state" "$tmp_dir/backup-state" "$tmp_dir/backup-state" "$tmp_dir/backup-state" "$tmp_dir/backup-cache" "$tmp_dir/backup-state" "$tmp_dir/backup-tls" "$tmp_dir/backup-tls" "$tmp_dir/backup-tls" "$tmp_dir/backup-tls" "$tmp_dir/backup-tls" >"$restore_config_path"
 config_archive="$tmp_dir/root-owned-config.tar.gz"
-python3 - "$config_archive" "$restore_config_path" <<'PY'
+python3 - "$config_archive" "$restore_config_path" "$backup_archive" <<'PY'
 import io, sys, tarfile
-archive_path, config_path = sys.argv[1:]
+archive_path, config_path, source_path = sys.argv[1:]
 with tarfile.open(archive_path, 'w:gz') as archive:
     metadata = tarfile.TarInfo('metadata')
     metadata.size = 3
@@ -769,8 +839,13 @@ with tarfile.open(archive_path, 'w:gz') as archive:
     config.uid = 0
     config.gid = 0
     config.mode = 0o600
-    config.size = 18
-    archive.addfile(config, io.BytesIO(b'LOCALAI_AUTH=false'))
+    config_data = b'LOCALAI_AUTH=true\n'
+    config.size = len(config_data)
+    archive.addfile(config, io.BytesIO(config_data))
+    with tarfile.open(source_path, 'r:gz') as source:
+        for member in source:
+            if '/systemd/user' in member.name:
+                archive.addfile(member, source.extractfile(member) if member.isfile() else None)
 PY
 cat >"$tmp_dir/cp-config-test" <<'EOF'
 #!/usr/bin/env bash

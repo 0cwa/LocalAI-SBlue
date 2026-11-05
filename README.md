@@ -363,6 +363,19 @@ the configuration file label, verifies labels on configured persistent roots,
 and starts services in dependency order. It restores the services' previous
 active state. `--yes` does not remove unrelated files from state directories.
 
+User service unit files are included in backups, but restore never installs or
+reloads archived unit definitions. Before changing any state, restore requires
+every archived user-unit entry to match the already installed entry exactly;
+missing or changed entries cause a refusal. On a new host, install the matching
+LocalAI backend and TLS service units first. Restore does not reconstruct unit
+definitions, and a unit tree excluded from the backup cannot be recovered by
+this command. When the backend unit is present, restore also checks the archived
+bind, authentication, and data database settings against the root-owned
+installed unit template and the user manager's effective settings. A public
+bind must retain authentication and the administrator bootstrap guard; restore
+does not use the first-administrator loopback-only check for an already
+configured public listener.
+
 For an upgrade, keep a copy of the previous release and shared config, unpack
 the new release, review changes to `config/localai.conf.example`, and rerun the
 backend and TLS installers as needed. The installers preserve service state

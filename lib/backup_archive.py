@@ -9,6 +9,7 @@ import shutil
 import stat
 import sys
 import tarfile
+import hashlib
 
 
 def fail(message: str) -> None:
@@ -46,6 +47,8 @@ def validate_archive(archive: str, config: str, roots: list[str], *, require_roo
                 name = clean_member_name(info.name)
                 if name in members:
                     fail("backup contains duplicate member names")
+                if has_systemd_tree(name, "system"):
+                    fail("backup contains system manager unit configuration")
                 if name != "metadata" and name != config_name and member_root(name, prefixes) is None:
                     fail("backup contains a path outside configured LocalAI paths")
                 if not (info.isfile() or info.isdir() or info.issym() or info.islnk()):
@@ -120,14 +123,113 @@ def stage_check(stage: str) -> None:
         fail("restore staging filesystem is memory-backed")
 
 
+def systemd_tree_prefix(name: str, tree: str) -> str | None:
+    parts = name.split("/")
+    for index in range(len(parts) - 1):
+        if parts[index] == "systemd" and parts[index + 1] == tree:
+            return "/".join(parts[: index + 2])
+    return None
+
+
+def has_systemd_tree(name: str, tree: str) -> bool:
+    return systemd_tree_prefix(name, tree) is not None
+
+
+def same_file_bytes(left: str, right: str) -> bool:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    left_fd = os.open(left, flags)
+    try:
+        right_fd = os.open(right, flags)
+    except BaseException:
+        os.close(left_fd)
+        raise
+    try:
+        if not stat.S_ISREG(os.fstat(left_fd).st_mode) or not stat.S_ISREG(os.fstat(right_fd).st_mode):
+            return False
+        left_hash = hashlib.file_digest(os.fdopen(left_fd, "rb", closefd=False), "sha256").digest()
+        right_hash = hashlib.file_digest(os.fdopen(right_fd, "rb", closefd=False), "sha256").digest()
+        return left_hash == right_hash
+    finally:
+        os.close(left_fd)
+        os.close(right_fd)
+
+
+def unit_trees(
+    archive_path: str, stage: str, config: str, roots: list[str], expected_roots: list[str]
+) -> list[str]:
+    names = validate_archive(archive_path, config, roots)
+    directories: dict[str, set[str]] = {}
+    archive_prefixes = {systemd_tree_prefix(name, "user") for name in names}
+    for index, root in enumerate(expected_roots):
+        prefix = os.path.abspath(root).lstrip("/").rstrip("/") + "/.config/systemd/user"
+        live_root = os.path.join("/", prefix)
+        if os.path.isdir(live_root) and not os.path.islink(live_root) and prefix not in archive_prefixes:
+            fail(f"backup omits an installed user service unit tree (configured root {index + 1})")
+    try:
+        with tarfile.open(archive_path, "r:gz") as archive:
+            archive_members = {clean_member_name(info.name): info for info in archive}
+        for name in names:
+            prefix = systemd_tree_prefix(name, "user")
+            if prefix is None:
+                continue
+            directories.setdefault(prefix, set()).add(name)
+            info = archive_members[name]
+            source = os.path.join(stage, name)
+            target = os.path.join("/", name)
+            try:
+                target_mode = os.lstat(target).st_mode
+            except FileNotFoundError:
+                fail("backup has a user unit absent from the installed tree")
+            if info.isdir():
+                if not stat.S_ISDIR(target_mode) or stat.S_ISLNK(target_mode):
+                    fail("backup user unit entry type differs from the installed tree")
+            elif info.isfile():
+                if not stat.S_ISREG(target_mode) or not same_file_bytes(source, target):
+                    fail("backup user unit file differs from the installed tree")
+            elif info.issym():
+                if not stat.S_ISLNK(target_mode) or os.readlink(target) != info.linkname:
+                    fail("backup user unit link differs from the installed tree")
+            else:
+                fail("backup contains an unsupported user service unit link")
+        for prefix, archived_names in directories.items():
+            target_root = os.path.join("/", prefix)
+            if not os.path.isdir(target_root) or os.path.islink(target_root):
+                fail("backup user unit tree is absent from the installed tree")
+            installed_names: set[str] = {prefix}
+            for current, dirs, files in os.walk(target_root, followlinks=False):
+                for entry in dirs + files:
+                    path = os.path.join(current, entry)
+                    relative = os.path.relpath(path, "/")
+                    installed_names.add(relative)
+                    if os.path.islink(path) and os.path.isdir(path):
+                        # os.walk will not recurse through a linked directory.
+                        continue
+            if installed_names != archived_names:
+                fail(f"backup user unit tree entries differ from the installed tree ({len(archived_names)} archived, {len(installed_names)} installed)")
+    except (OSError, tarfile.TarError) as error:
+        fail(f"cannot verify the installed user service unit tree ({type(error).__name__})")
+    return sorted(directories)
+
+
 def nearest_existing_path(path: str) -> str:
     current = os.path.abspath(path)
-    while not os.path.exists(current):
+    leaf = current
+    while True:
+        try:
+            metadata = os.lstat(current)
+            if stat.S_ISLNK(metadata.st_mode):
+                if current == leaf:
+                    current = os.path.dirname(current)
+                    leaf = ""
+                    continue
+                fail("restore destination contains a symbolic link")
+            return current
+        except FileNotFoundError:
+            pass
         parent = os.path.dirname(current)
         if parent == current:
             fail("cannot find a filesystem for a restore destination")
         current = parent
-    return current
 
 
 def space_check(
@@ -142,9 +244,9 @@ def space_check(
     extracted_entries = 0
     collision_entries = 0
     stage_filesystem = os.statvfs(stage)
-    block_size = stage_filesystem.f_frsize
+    stage_path = nearest_existing_path(stage)
 
-    def allocated(size: int) -> int:
+    def allocated(size: int, block_size: int) -> int:
         return max(block_size, ((size + block_size - 1) // block_size) * block_size)
 
     try:
@@ -152,9 +254,9 @@ def space_check(
             for info in archive:
                 extracted_entries += 1
                 if info.isfile():
-                    expanded += allocated(info.size)
+                    expanded += allocated(info.size, max(1, stage_filesystem.f_frsize))
                 else:
-                    expanded += block_size
+                    expanded += max(1, stage_filesystem.f_frsize)
         if collision_file:
             for encoded in open(collision_file, "rb").read().split(b"\0"):
                 if not encoded:
@@ -165,94 +267,104 @@ def space_check(
                 except FileNotFoundError:
                     continue
                 if stat.S_ISREG(info.st_mode):
-                    rollback += allocated(info.st_size)
+                    rollback += allocated(info.st_size, max(1, stage_filesystem.f_frsize))
                 else:
-                    rollback += block_size
+                    rollback += max(1, stage_filesystem.f_frsize)
     except (OSError, tarfile.TarError) as error:
         fail(f"cannot estimate restore staging space ({type(error).__name__})")
-    required = archive_size + expanded + rollback + 64 * 1024 * 1024
-    available = shutil.disk_usage(stage).free
-    if available < required:
-        fail("insufficient free disk space for archive extraction and rollback")
-    if stage_filesystem.f_files and stage_filesystem.f_favail < extracted_entries + collision_entries + 16:
-        fail("insufficient free inodes for archive extraction and rollback")
+    usage_by_filesystem: dict[tuple[int, int], dict[str, int | str]] = {}
 
-    if not destinations:
-        return
-
-    configured = [os.path.abspath(path).lstrip("/").rstrip("/") for path in destinations]
-    if any(not path for path in configured) or len(set(configured)) != len(configured):
-        fail("restore destination paths are invalid")
-    destination_usage: dict[tuple[int, int], dict[str, int | str]] = {}
-
-    def destination_filesystem(root: str) -> tuple[int, int]:
-        probe = nearest_existing_path("/" + root)
+    def filesystem_key(path: str) -> tuple[int, int]:
+        probe = nearest_existing_path(path)
         filesystem = os.statvfs(probe)
-        # f_fsid distinguishes mounts sharing a device number. Fall back to st_dev
-        # only on platforms whose statvfs result omits it.
-        try:
-            device = os.stat(probe).st_dev
-        except OSError as error:
-            fail(f"cannot inspect a restore destination filesystem ({type(error).__name__})")
-        fsid = int(getattr(filesystem, "f_fsid", device))
-        key = (device, fsid)
-        if key not in destination_usage:
-            destination_usage[key] = {
+        metadata = os.stat(probe, follow_symlinks=False)
+        fsid = int(getattr(filesystem, "f_fsid", metadata.st_dev))
+        key = (metadata.st_dev, fsid)
+        if key not in usage_by_filesystem:
+            usage_by_filesystem[key] = {
                 "path": probe,
                 "block_size": max(1, filesystem.f_frsize),
                 "bytes": 0,
                 "inodes": 0,
+                "inodes_free": filesystem.f_favail,
+                "inodes_total": filesystem.f_files,
             }
         return key
 
-    def destination_root(name: str) -> str | None:
-        matches = [root for root in configured if name == root or name.startswith(root + "/")]
-        return max(matches, key=len) if matches else None
+    def charge(path: str, size: int, inode_count: int = 1) -> None:
+        key = filesystem_key(path)
+        usage = usage_by_filesystem[key]
+        block_size = int(usage["block_size"])
+        usage["bytes"] = int(usage["bytes"]) + allocated(size, block_size)
+        usage["inodes"] = int(usage["inodes"]) + inode_count
 
-    def charge(name: str, size: int | None) -> None:
-        root = destination_root(name)
-        if root is None:
-            return
-        key = destination_filesystem(root)
-        usage = destination_usage[key]
-        per_fs_block = int(usage["block_size"])
-        amount = per_fs_block if size is None else max(per_fs_block, ((size + per_fs_block - 1) // per_fs_block) * per_fs_block)
-        usage["bytes"] = int(usage["bytes"]) + amount
-        usage["inodes"] = int(usage["inodes"]) + 1
+    stage_key = filesystem_key(stage_path)
+    stage_usage = usage_by_filesystem[stage_key]
+    stage_usage["bytes"] = int(stage_usage["bytes"]) + archive_size + expanded + rollback
+    stage_usage["inodes"] = int(stage_usage["inodes"]) + extracted_entries + collision_entries
 
-    try:
-        with tarfile.open(archive_path, "r:gz") as archive:
-            archive_members = {clean_member_name(info.name): info for info in archive}
-        for name, info in archive_members.items():
-            if name == "metadata":
-                continue
-            size = info.size if info.isfile() else None
-            if info.islnk():
-                target = archive_members.get(clean_member_name(info.linkname))
-                size = target.size if target is not None and target.isfile() else None
-            charge(name, size)
-        if collision_file:
-            for encoded in open(collision_file, "rb").read().split(b"\0"):
-                if not encoded:
+    if destinations:
+        configured = [os.path.abspath(path).lstrip("/").rstrip("/") for path in destinations]
+        if any(not path for path in configured) or len(set(configured)) != len(configured):
+            fail("restore destination paths are invalid")
+
+        def destination_root(name: str) -> str | None:
+            matches = [root for root in configured if name == root or name.startswith(root + "/")]
+            return max(matches, key=len) if matches else None
+
+        destination_nodes: dict[str, int] = {}
+
+        def charge_tree(name: str, size: int | None) -> None:
+            root = destination_root(name)
+            if root is None:
+                fail("cannot estimate an unconfigured restore destination")
+            current = name
+            destination_nodes[current] = 0 if size is None else size
+            while current != root:
+                parent = posixpath.dirname(current)
+                if not parent or (parent != root and not parent.startswith(root + "/")):
+                    fail("restore archive path is outside its configured destination")
+                # Account for implicit parent directories too; charging existing
+                # directories is conservative and covers tar-created ancestors.
+                destination_nodes.setdefault(parent, 0)
+                current = parent
+
+        try:
+            with tarfile.open(archive_path, "r:gz") as archive:
+                archive_members = {clean_member_name(info.name): info for info in archive}
+            for name, info in archive_members.items():
+                if name == "metadata":
                     continue
-                name = clean_member_name(os.fsdecode(encoded))
-                try:
-                    info = os.lstat(os.path.join("/", name))
-                except FileNotFoundError:
-                    continue
-                charge(name, info.st_size if stat.S_ISREG(info.st_mode) else None)
-    except (OSError, tarfile.TarError) as error:
-        fail(f"cannot estimate destination filesystem requirements ({type(error).__name__})")
+                size = info.size if info.isfile() else None
+                if info.islnk():
+                    target = archive_members.get(clean_member_name(info.linkname))
+                    size = target.size if target is not None and target.isfile() else None
+                charge_tree(name, size)
+            for name, size in destination_nodes.items():
+                charge("/" + name, size)
+            if collision_file:
+                for encoded in open(collision_file, "rb").read().split(b"\0"):
+                    if not encoded:
+                        continue
+                    name = clean_member_name(os.fsdecode(encoded))
+                    try:
+                        info = os.lstat(os.path.join("/", name))
+                    except FileNotFoundError:
+                        continue
+                    charge("/" + name, info.st_size if stat.S_ISREG(info.st_mode) else 0)
+        except (OSError, tarfile.TarError) as error:
+            fail(f"cannot estimate destination filesystem requirements ({type(error).__name__})")
 
-    for key, usage in destination_usage.items():
+    # Stage and destination requirements share one ledger so space and inode
+    # needs are summed when they land on the same filesystem or subvolume.
+    for usage in usage_by_filesystem.values():
         path = str(usage["path"])
-        filesystem = os.statvfs(path)
         free = shutil.disk_usage(path).free
         required = int(usage["bytes"]) + 64 * 1024 * 1024
         if free < required:
-            fail("insufficient free disk space on a restore destination filesystem")
-        if filesystem.f_files and filesystem.f_favail < int(usage["inodes"]) + 16:
-            fail("insufficient free inodes on a restore destination filesystem")
+            fail("insufficient free disk space for restore and rollback on a filesystem")
+        if int(usage["inodes_total"]) and int(usage["inodes_free"]) < int(usage["inodes"]) + 16:
+            fail("insufficient free inodes for restore and rollback on a filesystem")
 
 
 def validate_destinations(names: list[str], stage: str, config: str, roots: list[str]) -> list[str]:
@@ -377,7 +489,7 @@ def main() -> None:
             destinations = rest[1:]
         space_check(sys.argv[2], sys.argv[3], collision_file, destinations)
         return
-    if len(sys.argv) < 4 or sys.argv[1] not in {"validate", "validate-created", "members0", "collisions0", "destinations", "skip-links0", "rollback-new", "copy-source"}:
+    if len(sys.argv) < 4 or sys.argv[1] not in {"validate", "validate-created", "members0", "collisions0", "destinations", "skip-links0", "unit-trees0", "rollback-new", "copy-source"}:
         raise SystemExit(2)
     mode, archive, config = sys.argv[1:4]
     rest = sys.argv[4:]
@@ -390,7 +502,7 @@ def main() -> None:
         if len(rest) < 3:
             raise SystemExit(2)
         raise SystemExit(rollback_new(rest[-2], rest[-1], config, rest[:-2]))
-    roots = rest[:-1] if mode in {"destinations", "skip-links0"} else rest
+    roots = rest[:-3] if mode == "unit-trees0" else rest[:-1] if mode in {"destinations", "skip-links0"} else rest
     names = validate_archive(archive, config, roots, require_root_config=mode != "validate-created" or os.geteuid() == 0)
     if mode == "destinations":
         if not rest:
@@ -400,6 +512,11 @@ def main() -> None:
         if not rest:
             raise SystemExit(2)
         for name in validate_destinations(names, rest[-1], config, roots):
+            sys.stdout.buffer.write(os.fsencode(name) + b"\0")
+    if mode == "unit-trees0":
+        if len(rest) < 3:
+            raise SystemExit(2)
+        for name in unit_trees(archive, rest[-3], config, roots, rest[-2:]):
             sys.stdout.buffer.write(os.fsencode(name) + b"\0")
     if mode in {"members0", "collisions0"}:
         write_names(names, mode, config, roots)

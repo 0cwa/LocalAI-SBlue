@@ -49,6 +49,9 @@ def run_case(
     inodes_a: int = 1000,
     inodes_b: int,
     include_collision: bool = False,
+    nested_mount: bool = False,
+    free_nested: int = 512 * 1024 * 1024,
+    shared_stage_a: bool = False,
 ) -> str:
     with tempfile.TemporaryDirectory(prefix="backup-space-test-") as temp:
         base = Path(temp)
@@ -58,6 +61,8 @@ def run_case(
         stage.mkdir()
         root_a.mkdir()
         root_b.mkdir()
+        if nested_mount:
+            (root_a / "models").mkdir()
         archive = base / "backup.tar.gz"
         make_archive(archive, root_a, root_b)
         collision_file = None
@@ -68,9 +73,12 @@ def run_case(
             collision_file.write_bytes(os.fsencode(old_file.as_posix().lstrip("/")) + b"\0")
         disk_usage = shutil.disk_usage
         statvfs = os.statvfs
+        stat = os.stat
 
         def fake_statvfs(path: str | os.PathLike[str]) -> SimpleNamespace:
             candidate = Path(path)
+            if nested_mount and (candidate == root_a / "models" or root_a / "models" in candidate.parents):
+                return SimpleNamespace(f_frsize=4096, f_fsid=303, f_files=10000, f_favail=1000, f_bavail=free_nested // 4096)
             if candidate == root_a or root_a in candidate.parents:
                 return SimpleNamespace(f_frsize=4096, f_fsid=101, f_files=10000, f_favail=inodes_a, f_bavail=free_a // 4096)
             if candidate == root_b or root_b in candidate.parents:
@@ -78,7 +86,7 @@ def run_case(
             real = statvfs(path)
             return SimpleNamespace(
                 f_frsize=real.f_frsize,
-                f_fsid=getattr(real, "f_fsid", 0),
+                f_fsid=101 if shared_stage_a and candidate == stage else getattr(real, "f_fsid", 0),
                 f_files=real.f_files,
                 f_favail=real.f_favail,
                 f_bavail=real.f_bavail,
@@ -87,7 +95,11 @@ def run_case(
 
         def fake_disk_usage(path: str | os.PathLike[str]) -> shutil._ntuple_diskusage:
             candidate = Path(path)
+            if nested_mount and (candidate == root_a / "models" or root_a / "models" in candidate.parents):
+                return shutil._ntuple_diskusage(10**12, 0, free_nested)
             if candidate == stage:
+                if shared_stage_a:
+                    return shutil._ntuple_diskusage(10**12, 0, free_a)
                 return shutil._ntuple_diskusage(10**12, 0, 10**12)
             if candidate == root_a or root_a in candidate.parents:
                 return shutil._ntuple_diskusage(10**12, 0, free_a)
@@ -95,7 +107,18 @@ def run_case(
                 return shutil._ntuple_diskusage(10**12, 0, free_b)
             return disk_usage(path)
 
+        def fake_stat(path: str | os.PathLike[str], *args: object, **kwargs: object) -> os.stat_result:
+            result = stat(path, *args, **kwargs)
+            candidate = Path(path)
+            if shared_stage_a and candidate == stage:
+                # Model a stage and destination on the same device and mount.
+                values = list(result)
+                values[2] = os.stat(root_a).st_dev
+                return os.stat_result(values)
+            return result
+
         os.statvfs = fake_statvfs
+        os.stat = fake_stat
         shutil.disk_usage = fake_disk_usage
         error_output = io.StringIO()
         try:
@@ -110,6 +133,7 @@ def run_case(
             return error_output.getvalue()
         finally:
             os.statvfs = statvfs
+            os.stat = stat
             shutil.disk_usage = disk_usage
         return ""
 
@@ -118,16 +142,37 @@ def main() -> None:
     enough = run_case(free_b=512 * 1024 * 1024, inodes_b=1000)
     assert not enough, enough
     low_data = run_case(free_b=64 * 1024 * 1024, inodes_b=1000)
-    assert "insufficient free disk space on a restore destination filesystem" in low_data
+    assert "insufficient free disk space for restore and rollback on a filesystem" in low_data
     low_inodes = run_case(free_b=512 * 1024 * 1024, inodes_b=0)
-    assert "insufficient free inodes on a restore destination filesystem" in low_inodes
+    assert "insufficient free inodes for restore and rollback on a filesystem" in low_inodes
     low_rollback = run_case(
         free_a=64 * 1024 * 1024 + 300 * 1024,
         free_b=512 * 1024 * 1024,
         inodes_b=1000,
         include_collision=True,
     )
-    assert "insufficient free disk space on a restore destination filesystem" in low_rollback
+    assert "insufficient free disk space for restore and rollback on a filesystem" in low_rollback
+    low_nested = run_case(
+        free_b=512 * 1024 * 1024,
+        inodes_b=1000,
+        nested_mount=True,
+        free_nested=64 * 1024 * 1024,
+    )
+    assert "insufficient free disk space for restore and rollback on a filesystem" in low_nested
+    shared_too_small = run_case(
+        free_a=64 * 1024 * 1024 + 300 * 1024,
+        free_b=512 * 1024 * 1024,
+        inodes_b=1000,
+        shared_stage_a=True,
+    )
+    assert "insufficient free disk space for restore and rollback on a filesystem" in shared_too_small
+    shared_enough = run_case(
+        free_a=64 * 1024 * 1024 + 1024 * 1024,
+        free_b=512 * 1024 * 1024,
+        inodes_b=1000,
+        shared_stage_a=True,
+    )
+    assert not shared_enough, shared_enough
 
     print("backup archive destination capacity tests passed")
 
