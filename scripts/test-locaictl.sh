@@ -36,10 +36,19 @@ export TMPDIR="$tmp_dir"
 mkdir -p "$tmp_dir/storage"
 printf 'synthetic fixture\n' >"$tmp_dir/storage/member"
 chmod 0640 "$tmp_dir/storage/member"
-[[ "$(LOCALAI_DIAGNOSTIC_SERVICE_UID="$(id -u)" rootless_tar_member_metadata_category "$tmp_dir/storage" 'tar: storage/member: Cannot open: Permission denied')" == member-regular-owner-service-mode-0640-path-other-root-entry ]]
+[[ "$(LOCALAI_DIAGNOSTIC_SERVICE_UID="$(id -u)" rootless_tar_member_metadata_category "$tmp_dir/storage" 'tar: storage/member: Cannot open: Permission denied')" == member-regular-owner-service-mode-0640-family-other-persistence-unknown ]]
 printf 'synthetic lock\n' >"$tmp_dir/storage/storage.lock"
 chmod 0600 "$tmp_dir/storage/storage.lock"
-[[ "$(LOCALAI_DIAGNOSTIC_SERVICE_UID="$(id -u)" rootless_tar_member_metadata_category "$tmp_dir/storage" 'tar: storage/storage.lock: Cannot open: Permission denied')" == member-regular-owner-service-mode-0600-path-storage-lock ]]
+[[ "$(LOCALAI_DIAGNOSTIC_SERVICE_UID="$(id -u)" rootless_tar_member_metadata_category "$tmp_dir/storage" 'tar: storage/storage.lock: Cannot open: Permission denied')" == member-regular-owner-service-mode-0600-family-lock-persistence-unknown ]]
+printf 'synthetic database\n' >"$tmp_dir/storage/state.db"
+chmod 0600 "$tmp_dir/storage/state.db"
+[[ "$(LOCALAI_DIAGNOSTIC_SERVICE_UID="$(id -u)" rootless_tar_member_metadata_category "$tmp_dir/storage" 'tar: storage/state.db: Cannot open: Permission denied')" == member-regular-owner-service-mode-0600-family-db-persistence-persistent ]]
+printf 'synthetic index\n' >"$tmp_dir/storage/index"
+chmod 0600 "$tmp_dir/storage/index"
+[[ "$(LOCALAI_DIAGNOSTIC_SERVICE_UID="$(id -u)" rootless_tar_member_metadata_category "$tmp_dir/storage" 'tar: storage/index: Cannot open: Permission denied')" == member-regular-owner-service-mode-0600-family-index-persistence-persistent ]]
+printf 'synthetic config\n' >"$tmp_dir/storage/storage.conf"
+chmod 0600 "$tmp_dir/storage/storage.conf"
+[[ "$(LOCALAI_DIAGNOSTIC_SERVICE_UID="$(id -u)" rootless_tar_member_metadata_category "$tmp_dir/storage" 'tar: storage/storage.conf: Cannot open: Permission denied')" == member-regular-owner-service-mode-0600-family-config-persistence-persistent ]]
 [[ "$(LOCALAI_DIAGNOSTIC_SERVICE_UID="$(id -u)" rootless_tar_member_metadata_category "$tmp_dir/storage" 'synthetic diagnostic with no path')" == member-unidentified ]]
 [[ "$(LOCALAI_DIAGNOSTIC_SERVICE_UID="$(id -u)" rootless_tar_member_metadata_category "$tmp_dir/storage" 'tar: ../outside: Cannot open: Permission denied')" == member-outside-graphroot ]]
 mkdir -p "$tmp_dir/outside"

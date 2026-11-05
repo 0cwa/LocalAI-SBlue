@@ -1021,18 +1021,21 @@ try:
         "overlay.lock": "storage-lock",
     }.get(first)
     if path_class is None:
-        if os.sep in relative:
-            path_class = "other-root-subtree"
-        elif first.startswith("."):
-            path_class = "hidden-root-entry"
-        elif first.endswith(".lock"):
-            path_class = "root-lock-entry"
-        elif first.endswith(".db"):
-            path_class = "root-database-entry"
-        elif first.endswith((".json", ".conf", ".yaml", ".yml")):
-            path_class = "root-metadata-entry"
+        path_class = "other-root-subtree" if os.sep in relative else "other-root-entry"
+    if os.sep not in relative:
+        name = first.casefold()
+        if "lock" in name:
+            family, persistence = "lock", "unknown"
+        elif name.endswith((".db", ".sqlite", ".sqlite3")) or name == "db.sql":
+            family, persistence = "db", "persistent"
+        elif "index" in name:
+            family, persistence = "index", "persistent"
+        elif name.endswith((".conf", ".json", ".toml", ".yaml", ".yml")):
+            family, persistence = "config", "persistent"
         else:
-            path_class = "other-root-entry"
+            family, persistence = "other", "unknown"
+    else:
+        family, persistence = "other", "unknown"
     service_uid = int(os.environ.get("LOCALAI_DIAGNOSTIC_SERVICE_UID", "-1"))
     service_name = pwd.getpwuid(service_uid).pw_name
     if info.st_uid == service_uid:
@@ -1054,11 +1057,15 @@ try:
                     break
         owner = "subuid" if mapped else "other"
     mode = stat.S_IMODE(info.st_mode)
-    print(f"member-{kind}-owner-{owner}-mode-{mode:04o}-path-{path_class}")
+    if os.sep not in relative:
+        print(f"member-{kind}-owner-{owner}-mode-{mode:04o}-family-{family}-persistence-{persistence}")
+    else:
+        print(f"member-{kind}-owner-{owner}-mode-{mode:04o}-path-{path_class}")
 except (OSError, ValueError, OverflowError, KeyError):
     print("member-metadata-unavailable")
 ')" || category=member-metadata-unavailable
-  if [[ "$category" =~ ^member-(regular|directory|symlink|special)-owner-(service|subuid|host-root|other)-mode-[0-7][0-7][0-7][0-7]-path-(overlay-layer|image-metadata|container-metadata|layer-metadata|overlay-locks|volume-data|libpod-metadata|temporary-data|mount-metadata|container-state|storage-lock|storage-database|network-metadata|hidden-root-entry|root-lock-entry|root-database-entry|root-metadata-entry|other-root-entry|other-root-subtree)$ ||
+  if [[ "$category" =~ ^member-(regular|directory|symlink|special)-owner-(service|subuid|host-root|other)-mode-[0-7][0-7][0-7][0-7]-family-(lock|db|index|config|other)-persistence-(persistent|unknown)$ ||
+        "$category" =~ ^member-(regular|directory|symlink|special)-owner-(service|subuid|host-root|other)-mode-[0-7][0-7][0-7][0-7]-path-(overlay-layer|image-metadata|container-metadata|layer-metadata|overlay-locks|volume-data|libpod-metadata|temporary-data|mount-metadata|container-state|storage-lock|storage-database|network-metadata|hidden-root-entry|root-lock-entry|root-database-entry|root-metadata-entry|other-root-entry|other-root-subtree)$ ||
         "$category" =~ ^member-(unidentified|outside-graphroot|metadata-unavailable|path-unsafe)$ ]]; then
     printf '%s' "$category"
   else

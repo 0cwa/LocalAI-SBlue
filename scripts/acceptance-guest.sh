@@ -596,7 +596,7 @@ backup_acceptance_step() {
     esac
     printf 'step backup-restore-backup: %s\n' "$([[ "$status" == 124 ]] && printf timeout || printf fail)" >>"$receipt"
     printf 'diagnostic backup-restore-backup-reason: %s\n' "$reason" >>"$receipt"
-    if [[ "$output" =~ diagnostic-rootless-tar-member:\ (member-(regular|directory|symlink|special)-owner-(service|subuid|host-root|other)-mode-([0-7]{4})-path-(overlay-layer|image-metadata|container-metadata|layer-metadata|overlay-locks|volume-data|libpod-metadata|temporary-data|mount-metadata|container-state|storage-lock|storage-database|network-metadata|hidden-root-entry|root-lock-entry|root-database-entry|root-metadata-entry|other-root-entry|other-root-subtree)|member-unidentified|member-outside-graphroot|member-metadata-unavailable|member-path-unsafe) ]]; then
+    if [[ "$output" =~ diagnostic-rootless-tar-member:\ (member-(regular|directory|symlink|special)-owner-(service|subuid|host-root|other)-mode-([0-7]{4})-family-(lock|db|index|config|other)-persistence-(persistent|unknown)|member-(regular|directory|symlink|special)-owner-(service|subuid|host-root|other)-mode-([0-7]{4})-path-(overlay-layer|image-metadata|container-metadata|layer-metadata|overlay-locks|volume-data|libpod-metadata|temporary-data|mount-metadata|container-state|storage-lock|storage-database|network-metadata|hidden-root-entry|root-lock-entry|root-database-entry|root-metadata-entry|other-root-entry|other-root-subtree)|member-unidentified|member-outside-graphroot|member-metadata-unavailable|member-path-unsafe) ]]; then
       printf 'diagnostic backup-restore-rootless-tar-member: %s\n' "${BASH_REMATCH[1]}" >>"$receipt"
     fi
     if [[ "$output" =~ diagnostic-controller-site:([0-9]{1,6}) ]]; then
