@@ -120,13 +120,29 @@ def stage_check(stage: str) -> None:
         fail("restore staging filesystem is memory-backed")
 
 
-def space_check(archive_path: str, stage: str, collision_file: str | None = None) -> None:
+def nearest_existing_path(path: str) -> str:
+    current = os.path.abspath(path)
+    while not os.path.exists(current):
+        parent = os.path.dirname(current)
+        if parent == current:
+            fail("cannot find a filesystem for a restore destination")
+        current = parent
+    return current
+
+
+def space_check(
+    archive_path: str,
+    stage: str,
+    collision_file: str | None = None,
+    destinations: list[str] | None = None,
+) -> None:
     archive_size = os.stat(archive_path, follow_symlinks=False).st_size
     expanded = 0
     rollback = 0
     extracted_entries = 0
     collision_entries = 0
-    block_size = os.statvfs(stage).f_frsize
+    stage_filesystem = os.statvfs(stage)
+    block_size = stage_filesystem.f_frsize
 
     def allocated(size: int) -> int:
         return max(block_size, ((size + block_size - 1) // block_size) * block_size)
@@ -158,9 +174,85 @@ def space_check(archive_path: str, stage: str, collision_file: str | None = None
     available = shutil.disk_usage(stage).free
     if available < required:
         fail("insufficient free disk space for archive extraction and rollback")
-    filesystem = os.statvfs(stage)
-    if filesystem.f_files and filesystem.f_favail < extracted_entries + collision_entries + 16:
+    if stage_filesystem.f_files and stage_filesystem.f_favail < extracted_entries + collision_entries + 16:
         fail("insufficient free inodes for archive extraction and rollback")
+
+    if not destinations:
+        return
+
+    configured = [os.path.abspath(path).lstrip("/").rstrip("/") for path in destinations]
+    if any(not path for path in configured) or len(set(configured)) != len(configured):
+        fail("restore destination paths are invalid")
+    destination_usage: dict[tuple[int, int], dict[str, int | str]] = {}
+
+    def destination_filesystem(root: str) -> tuple[int, int]:
+        probe = nearest_existing_path("/" + root)
+        filesystem = os.statvfs(probe)
+        # f_fsid distinguishes mounts sharing a device number. Fall back to st_dev
+        # only on platforms whose statvfs result omits it.
+        try:
+            device = os.stat(probe).st_dev
+        except OSError as error:
+            fail(f"cannot inspect a restore destination filesystem ({type(error).__name__})")
+        fsid = int(getattr(filesystem, "f_fsid", device))
+        key = (device, fsid)
+        if key not in destination_usage:
+            destination_usage[key] = {
+                "path": probe,
+                "block_size": max(1, filesystem.f_frsize),
+                "bytes": 0,
+                "inodes": 0,
+            }
+        return key
+
+    def destination_root(name: str) -> str | None:
+        matches = [root for root in configured if name == root or name.startswith(root + "/")]
+        return max(matches, key=len) if matches else None
+
+    def charge(name: str, size: int | None) -> None:
+        root = destination_root(name)
+        if root is None:
+            return
+        key = destination_filesystem(root)
+        usage = destination_usage[key]
+        per_fs_block = int(usage["block_size"])
+        amount = per_fs_block if size is None else max(per_fs_block, ((size + per_fs_block - 1) // per_fs_block) * per_fs_block)
+        usage["bytes"] = int(usage["bytes"]) + amount
+        usage["inodes"] = int(usage["inodes"]) + 1
+
+    try:
+        with tarfile.open(archive_path, "r:gz") as archive:
+            archive_members = {clean_member_name(info.name): info for info in archive}
+        for name, info in archive_members.items():
+            if name == "metadata":
+                continue
+            size = info.size if info.isfile() else None
+            if info.islnk():
+                target = archive_members.get(clean_member_name(info.linkname))
+                size = target.size if target is not None and target.isfile() else None
+            charge(name, size)
+        if collision_file:
+            for encoded in open(collision_file, "rb").read().split(b"\0"):
+                if not encoded:
+                    continue
+                name = clean_member_name(os.fsdecode(encoded))
+                try:
+                    info = os.lstat(os.path.join("/", name))
+                except FileNotFoundError:
+                    continue
+                charge(name, info.st_size if stat.S_ISREG(info.st_mode) else None)
+    except (OSError, tarfile.TarError) as error:
+        fail(f"cannot estimate destination filesystem requirements ({type(error).__name__})")
+
+    for key, usage in destination_usage.items():
+        path = str(usage["path"])
+        filesystem = os.statvfs(path)
+        free = shutil.disk_usage(path).free
+        required = int(usage["bytes"]) + 64 * 1024 * 1024
+        if free < required:
+            fail("insufficient free disk space on a restore destination filesystem")
+        if filesystem.f_files and filesystem.f_favail < int(usage["inodes"]) + 16:
+            fail("insufficient free inodes on a restore destination filesystem")
 
 
 def validate_destinations(names: list[str], stage: str, config: str, roots: list[str]) -> list[str]:
@@ -272,9 +364,18 @@ def main() -> None:
         stage_check(sys.argv[2])
         return
     if sys.argv[1:2] == ["space-check"]:
-        if len(sys.argv) not in {4, 5}:
+        if len(sys.argv) < 4:
             raise SystemExit(2)
-        space_check(sys.argv[2], sys.argv[3], sys.argv[4] if len(sys.argv) == 5 else None)
+        rest = sys.argv[4:]
+        collision_file = rest[0] if rest and rest[0] != "--destinations" else None
+        if collision_file:
+            rest = rest[1:]
+        destinations = None
+        if rest:
+            if rest[0] != "--destinations" or len(rest) == 1:
+                raise SystemExit(2)
+            destinations = rest[1:]
+        space_check(sys.argv[2], sys.argv[3], collision_file, destinations)
         return
     if len(sys.argv) < 4 or sys.argv[1] not in {"validate", "validate-created", "members0", "collisions0", "destinations", "skip-links0", "rollback-new", "copy-source"}:
         raise SystemExit(2)

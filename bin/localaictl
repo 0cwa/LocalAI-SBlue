@@ -212,6 +212,20 @@ tls_unit_managed() {
   run_elevated /usr/bin/grep -qx '# Managed by LocalAI secureblue TLS installer.' "$path" || die "configured TLS unit lacks the LocalAI ownership marker"
 }
 
+backend_unit_managed() {
+  local path="$LOCALAI_STATE_DIR/.config/systemd/user/localai.service" expected_uid owner
+  [[ -e "$path" || -L "$path" ]] || return 1
+  [[ -f "$path" && ! -L "$path" ]] || die "cannot verify ownership of the configured backend unit"
+  expected_uid="$(service_uid "$LOCALAI_SERVICE_USER")" || die "cannot verify the backend service account"
+  owner="$(run_elevated /usr/bin/stat -c %u -- "$path")" || die "cannot verify ownership of the configured backend unit"
+  [[ -z "${LOCALAI_TEST_BACKUP_STAGE_DIR:-}" || "$owner" == "$EUID" ]] || [[ "$owner" == "$expected_uid" ]] || die "configured backend unit is not owned by the backend service account"
+  run_elevated /usr/bin/grep -qx '# Managed by LocalAI secureblue installer.' "$path" ||
+    run_elevated /usr/bin/grep -qx 'Description=LocalAI OpenAI-compatible API and web UI container' "$path" ||
+    die "configured backend unit lacks the LocalAI ownership marker"
+  [[ "$(run_elevated /usr/bin/stat -c %a -- "$path")" =~ ^[0-7]+$ ]] || die "cannot verify permissions of the configured backend unit"
+  (( (8#$(run_elevated /usr/bin/stat -c %a -- "$path") & 8#22) == 0 )) || die "configured backend unit is group/world writable"
+}
+
 socket_units_managed() {
   local socket="$system_unit_dir/$LOCALAI_TLS_FORWARD_SOCKET_NAME" service="$system_unit_dir/$LOCALAI_TLS_FORWARD_SERVICE_NAME" path owner
   if [[ ! -e "$socket" && ! -L "$socket" && ! -e "$service" && ! -L "$service" ]]; then return 1; fi
@@ -563,6 +577,10 @@ backup_units() {
     if [[ "$LOCALAI_TLS_PUBLIC_SOCKET" == true ]]; then
       socket_units_managed || die "configured TLS socket units are not verifiably managed by LocalAI"
       backup_unit_list+=(socket)
+    elif socket_units_managed; then
+      # A previously installed managed socket may remain active after config
+      # disables it; inventory it so backup/restore preserves its real state.
+      backup_unit_list+=(socket)
     fi
   else
     tls_unit_managed && backup_unit_list+=(tls)
@@ -598,6 +616,18 @@ restore_backup_service_state() {
     fi
   done
   return "$status"
+}
+
+reload_restored_user_units() {
+  if [[ "${RESTORE_RELOAD_BACKEND_UNIT:-0}" == 1 ]]; then
+    backend_unit_managed || die "restored backend unit failed ownership checks"
+    backend_systemctl daemon-reload || die "could not reload the backend user manager after restoring its unit"
+    verify_bootstrap_unit || die "restored backend unit failed bootstrap safety checks"
+  fi
+  if [[ "${RESTORE_RELOAD_TLS_UNIT:-0}" == 1 ]]; then
+    tls_unit_managed || die "restored TLS unit failed ownership checks"
+    tls_systemctl daemon-reload || die "could not reload the TLS user manager after restoring its unit"
+  fi
 }
 
 backup_stop_services() {
@@ -732,6 +762,8 @@ restore_archive() {
 restore_locked() {
   local source="$1" stage source_copy members collisions snapshot skip_links target answer item had_target=0 stage_base needs_confirmation=0
   local restore_mutation_started=0 restore_completed=0
+  RESTORE_RELOAD_BACKEND_UNIT=0
+  RESTORE_RELOAD_TLS_UNIT=0
   local helper="$repo_root/lib/backup_archive.py"
   [[ -f "$source" && ! -L "$source" ]] || die "restore source must be a regular, non-linked archive file"
   prepare_backup_roots
@@ -761,6 +793,8 @@ restore_locked() {
   run_elevated /usr/bin/python3 "$helper" skip-links0 "$source" "$config_file" "${backup_roots[@]}" "$stage" >"$skip_links"
   run_elevated /usr/bin/python3 "$helper" members0 "$source" "$config_file" "${backup_roots[@]}" >"$members"
   run_elevated /usr/bin/python3 "$helper" collisions0 "$source" "$config_file" "${backup_roots[@]}" >"$collisions"
+  if grep -zFxq "${LOCALAI_STATE_DIR#/}/.config/systemd/user/localai.service" "$members"; then RESTORE_RELOAD_BACKEND_UNIT=1; fi
+  if grep -zFxq "${LOCALAI_TLS_STATE_DIR#/}/.config/systemd/user/$LOCALAI_TLS_SERVICE_NAME" "$members"; then RESTORE_RELOAD_TLS_UNIT=1; fi
   for target in "${backup_roots[@]}"; do
     if [[ -d "$target" ]] && [[ -n "$(run_elevated find "$target" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then needs_confirmation=1; fi
   done
@@ -785,9 +819,9 @@ restore_locked() {
   if [[ "$needs_confirmation" == 1 && "${restore_confirmed:-0}" != 1 ]]; then
     die "restore targets changed before restore; rerun with --yes after reviewing the overwrite"
   fi
-  if [[ -s "$collisions" ]]; then
-    had_target=1
-    run_elevated /usr/bin/python3 "$helper" space-check "$source" "$stage" "$collisions" || die "insufficient disk space for the restore and rollback snapshot"
+  [[ ! -s "$collisions" ]] || had_target=1
+  run_elevated /usr/bin/python3 "$helper" space-check "$source" "$stage" "$collisions" --destinations "$config_file" "${backup_roots[@]}" || die "insufficient disk space for the restore and rollback snapshot"
+  if [[ "$had_target" == 1 ]]; then
     run_elevated "$tar_bin" --create --file "$snapshot" --xattrs --acls --selinux --numeric-owner --no-recursion --directory / --null --files-from="$collisions" || die "could not prepare rollback snapshot"
   fi
   local -a links_to_keep=()
@@ -815,6 +849,7 @@ restore_locked() {
     [[ -e "$target" ]] || continue
     run_elevated "$matchpathcon_bin" -V "$target" || die "SELinux label verification failed; rollback will run before services restart"
   done
+  reload_restored_user_units || die "could not safely reload restored user service units; rollback will run before services restart"
   restore_completed=1
   rm -rf -- "$stage"
   restore_backup_service_state || die "restore completed but one or more previously active services could not be restarted"
@@ -850,6 +885,12 @@ restore_exit_cleanup() {
     exit "$exit_status"
   fi
   if [[ "${RESTORE_SERVICES_STOPPED:-0}" == 1 ]]; then
+    if [[ "${restore_mutation_started:-0}" == 1 && "${restore_completed:-0}" != 1 ]]; then
+      reload_restored_user_units || {
+        printf 'localaictl: warning: restored unit rollback could not be reloaded; previously active services remain stopped for manual recovery\n' >&2
+        exit 1
+      }
+    fi
     restore_backup_service_state || exit 1
   fi
   exit "$exit_status"

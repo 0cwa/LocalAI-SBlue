@@ -75,6 +75,9 @@ bash scripts/test-bootstrap-guard.sh
 printf 'Lifecycle facade tests\n'
 bash scripts/test-locaictl.sh
 
+printf 'Backup archive destination capacity tests\n'
+python3 scripts/test-backup-space.py
+
 printf 'Installed controller-copy tests\n'
 bash scripts/test-installed-copy.sh
 

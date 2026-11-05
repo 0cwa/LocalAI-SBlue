@@ -93,6 +93,7 @@ manifest=(
   scripts/test-config.sh
   scripts/test-bootstrap-guard.sh
   scripts/test-locaictl.sh
+  scripts/test-backup-space.py
   scripts/test-installed-copy.sh
   scripts/test-render-config.sh
   scripts/test-tray-adapter.py

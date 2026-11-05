@@ -2,6 +2,8 @@
 set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# Sourced test support reads this variable indirectly.
+# shellcheck disable=SC2034
 TEST_REPO_ROOT="$repo_root"
 source "$repo_root/scripts/test-support.sh"
 test_sanitize_localai_environment
@@ -65,6 +67,12 @@ if [[ " $* " == *" is-active "* ]]; then
     *" is-active localai-tls-forward.socket "*) if [[ -f "${LOCALAI_FAKE_STATE_DIR:-}/socket" ]]; then cat "${LOCALAI_FAKE_STATE_DIR}/socket"; else printf '%s\n' "${LOCALAI_FAKE_SOCKET_STATE:-active}"; fi ;;
     *) printf 'inactive\n' ;;
   esac
+fi
+if [[ " $* " == *" show localai.service --property=DropInPaths --value "* ]]; then
+  printf '\n'
+fi
+if [[ " $* " == *" show localai.service --property=Environment --value "* ]]; then
+  printf 'LOCALAI_AUTH=true LOCALAI_AUTH_DATABASE_URL=%s/database.db LOCALAI_ADDRESS=127.0.0.1:11455\n' "${LOCALAI_FAKE_DATA_PATH:-/var/lib/localai/data}"
 fi
 if [[ " $* " == *" stop localai.service "* ]]; then printf 'inactive\n' >"${LOCALAI_FAKE_STATE_DIR}/backend"; fi
 if [[ " $* " == *" start localai.service "* ]]; then printf 'active\n' >"${LOCALAI_FAKE_STATE_DIR}/backend"; fi
@@ -157,6 +165,85 @@ mkdir -p "$tmp_dir/systemd"
 printf '[Socket]\nFreeBind=true\n' >"$tmp_dir/systemd/localai-tls-forward.socket"
 
 [[ "$("$repo_root/bin/localaictl" --version)" == "localaictl $(<"$repo_root/VERSION")" ]]
+(
+  # Reload restored per-user unit files only after checking their ownership
+  # and bootstrap policy; a failed reload must not restart old services.
+  # shellcheck disable=SC1090
+  source <(sed -n '/^reload_restored_user_units() {$/,/^}/p' "$repo_root/bin/localaictl")
+  # shellcheck disable=SC1090
+  source <(sed -n '/^backup_unit_action() {$/,/^}/p' "$repo_root/bin/localaictl")
+  # shellcheck disable=SC1090
+  source <(sed -n '/^restore_backup_service_state() {$/,/^}/p' "$repo_root/bin/localaictl")
+  # shellcheck disable=SC1090
+  source <(sed -n '/^restore_exit_cleanup() {$/,/^}/p' "$repo_root/bin/localaictl")
+  events="$tmp_dir/unit-reload-events"
+  FAIL_RELOAD=0
+  LOCALAI_TLS_SERVICE_NAME=localai-tls-compose.service
+  LOCALAI_TLS_FORWARD_SOCKET_NAME=localai-tls-forward.socket
+  # Read indirectly by the extracted production service-action helper.
+  # shellcheck disable=SC2034
+  LOCALAI_TLS_FORWARD_SERVICE_NAME=localai-tls-forward.service
+  # The production helper invokes these checks indirectly.
+  # shellcheck disable=SC2329
+  backend_unit_managed() { printf 'backend-ownership\n' >>"$events"; }
+  # shellcheck disable=SC2329
+  verify_bootstrap_unit() { printf 'bootstrap-guard\n' >>"$events"; }
+  # shellcheck disable=SC2329
+  tls_unit_managed() { printf 'tls-ownership\n' >>"$events"; }
+  # shellcheck disable=SC2329
+  backend_systemctl() {
+    printf 'backend %s\n' "$*" >>"$events"
+    [[ "$FAIL_RELOAD:$*" != 1:daemon-reload ]]
+  }
+  # shellcheck disable=SC2329
+  tls_systemctl() { printf 'tls %s\n' "$*" >>"$events"; }
+  # shellcheck disable=SC2329
+  root_systemctl() { printf 'root %s\n' "$*" >>"$events"; }
+  # shellcheck disable=SC2329
+  die() { printf 'unit reload safety check failed\n' >&2; exit 1; }
+  RESTORE_RELOAD_BACKEND_UNIT=1 RESTORE_RELOAD_TLS_UNIT=1
+  backup_was_active=(backend tls socket)
+  reload_restored_user_units
+  restore_backup_service_state
+  [[ "$(<"$events")" == $'backend-ownership\nbackend daemon-reload\nbootstrap-guard\ntls-ownership\ntls daemon-reload\nbackend start localai.service\ntls start localai-tls-compose.service\nroot start localai-tls-forward.socket localai-tls-forward.service' ]]
+  : >"$events"
+  # These assignments are consumed by the dynamically sourced production functions.
+  # shellcheck disable=SC2034
+  if (FAIL_RELOAD=1; backup_was_active=(backend); RESTORE_RELOAD_BACKEND_UNIT=1; RESTORE_RELOAD_TLS_UNIT=0; reload_restored_user_units; restore_backup_service_state); then
+    printf 'services restarted after a failed unit-manager reload\n' >&2
+    exit 1
+  fi
+  if rg -q 'backend start' "$events"; then
+    printf 'backend restarted after a failed unit-manager reload\n' >&2
+    exit 1
+  fi
+  : >"$events"
+  mkdir -m 0700 "$tmp_dir/unit-reload-stage"
+  # shellcheck disable=SC2329
+  restore_rollback() { printf 'rollback\n' >>"$events"; }
+  # shellcheck disable=SC1007,SC2034
+  if (
+    FAIL_RELOAD=1
+    RESTORE_RELOAD_BACKEND_UNIT=1
+    RESTORE_RELOAD_TLS_UNIT=0
+    RESTORE_ROLLBACK_FAILED=0
+    RESTORE_SERVICES_STOPPED=1
+    restore_mutation_started=1
+    restore_completed=0
+    stage="$tmp_dir/unit-reload-stage"
+    members= collisions= snapshot= had_target=0
+    backup_was_active=(backend)
+    restore_exit_cleanup
+  ); then
+    printf 'services restarted after a failed rollback manager reload\n' >&2
+    exit 1
+  fi
+  rg -q '^rollback$' "$events"
+  if rg -q 'backend start' "$events"; then
+    printf 'backend restarted after a failed rollback manager reload\n' >&2
+    exit 1
+  fi
+)
 (
   # The function and its dependencies are exercised with isolated mocks.
   # shellcheck disable=SC1090
@@ -361,6 +448,9 @@ rg -q 'start localai-tls-forward.socket' "$tmp_dir/commands"
 # paths while service-manager commands remain mocked.
 unset LOCALAI_FAKE_FAIL_TLS
 mkdir -p "$tmp_dir/backup-state" "$tmp_dir/backup-tls" "$tmp_dir/backup-cache" "$tmp_dir/backup-config-dir"
+mkdir -p "$tmp_dir/backup-tls/.config/systemd/user"
+printf '# Managed by LocalAI secureblue TLS installer.\nDescription=LocalAI TLS reverse proxy compose stack\n' >"$tmp_dir/backup-tls/.config/systemd/user/localai-tls-compose.service"
+chmod 0644 "$tmp_dir/backup-tls/.config/systemd/user/localai-tls-compose.service"
 chmod 0710 "$tmp_dir/backup-state"
 printf 'active\n' >"$LOCALAI_FAKE_STATE_DIR/backend"
 printf 'state fixture\n' >"$tmp_dir/backup-state/database.db"
@@ -410,6 +500,19 @@ if ! "$repo_root/bin/localaictl" backup --exclude-models "$backup_archive" 2>"$t
   cat "$tmp_dir/commands" >&2
   exit 1
 fi
+# A configured-off public socket can still be active from an earlier setup.
+# Inventory and stop/restart it only when both root-owned LocalAI unit files
+# prove that the socket is managed by this installer.
+printf '# Managed by LocalAI secureblue TLS installer.\n' >"$tmp_dir/systemd/localai-tls-forward.socket"
+printf '# Managed by LocalAI secureblue TLS installer.\n' >"$tmp_dir/systemd/localai-tls-forward.service"
+: >"$tmp_dir/commands"
+stale_socket_archive="$tmp_dir/stale-managed-socket.tar.gz"
+if ! LOCALAI_TLS_ENABLED=true LOCALAI_TLS_PUBLIC_SOCKET=false "$repo_root/bin/localaictl" backup "$stale_socket_archive" >"$tmp_dir/stale-socket-output" 2>"$tmp_dir/stale-socket-error"; then
+  printf 'backup refused a verified stale managed TLS socket\n' >&2
+  exit 1
+fi
+rg -q 'stop localai-tls-forward.socket localai-tls-forward.service' "$tmp_dir/commands"
+rg -q 'start localai-tls-forward.socket localai-tls-forward.service' "$tmp_dir/commands"
 # The test's unprivileged run0 shim cannot restore a root-owned config. Verify
 # strict validation rejects its user-owned config, then omit that member from
 # the state-only round-trip fixture. Real root-owned config restore needs VM proof.
@@ -633,7 +736,9 @@ if not sent or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
     reason = 'unexpected'
     for marker, label in ((b'insufficient free disk', 'space'), (b'memory-backed', 'filesystem'),
                           (b'unsupported or unsafe', 'archive-validation'), (b'SELinux', 'label-check'),
-                          (b'rollback', 'rollback')):
+                          (b'rollback', 'rollback'), (b'ownership checks', 'unit-ownership'),
+                          (b'bootstrap safety', 'bootstrap-safety'), (b'daemon-reload', 'manager-reload'),
+                          (b'unit', 'unit-safety'), (b'bootstrap', 'bootstrap-safety')):
         if marker in text:
             reason = label
             break
