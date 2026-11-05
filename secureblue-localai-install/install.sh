@@ -164,6 +164,7 @@ asset_requirements() {
   for file in \
     "$asset_dir/localai.lock" \
     "$asset_dir/localai-containers-policy.json" \
+    "$repo_root/lib/bootstrap_guard.py" \
     "$script_dir/localai.service.in"; do
     if [[ ! -e "$file" ]]; then
       printf 'Missing required file: %s\n' "$file" >&2
@@ -484,7 +485,8 @@ install_project_files() {
   fi
 
   if [[ -x /usr/sbin/restorecon ]]; then
-    run0_pipe /usr/sbin/restorecon -RF "$state_dir"
+    run0_pipe /usr/sbin/restorecon -F "$state_dir"
+    run0_pipe /usr/sbin/restorecon -RF "$project_dir"
   else
     log "restorecon not found; skipping SELinux relabel."
   fi
@@ -501,6 +503,13 @@ install_container_policy() {
     -m 0600 \
     "$asset_dir/localai-containers-policy.json" \
     "$policy_dir/policy.json"
+}
+
+install_bootstrap_guard() {
+  local target=/etc/localai/bootstrap-guard.py
+  localai_installer_check_config_parent /etc/localai/localai.conf || die "Unsafe bootstrap guard directory."
+  localai_installer_check_managed_file "$target" "bootstrap guard" 0 '# Managed by LocalAI secureblue installer.' || die "Refusing to replace an unrelated bootstrap guard."
+  run0_pipe /usr/bin/install -o root -g root -m 0755 "$repo_root/lib/bootstrap_guard.py" "$target"
 }
 
 label_container_state() {
@@ -596,7 +605,7 @@ restore_existing_service() {
 }
 
 install_systemd_service() {
-  local tmp_service image_ref bind_host bind_port user_unit_dir
+  local tmp_service image_ref bind_host bind_port user_unit_dir admin_gate=''
   local container_name models_path data_path config_dir generated_content_path upload_path cache_dir log_dir
   local gpu_device_args=""
   local app_home_path backends_path download_staging_path backend_temp_dir
@@ -610,6 +619,13 @@ install_systemd_service() {
   download_staging_path="$(localai_download_staging_path)"
   backend_temp_dir="$(localai_backend_temp_dir)"
   data_path="$(localai_data_path)"
+  if [[ "$bind_host" != 127.0.0.1 && "$bind_host" != ::1 ]]; then
+    if [[ "$LOCALAI_AUTH" == true ]]; then
+      admin_gate="ExecStartPre=/usr/bin/python3 /etc/localai/bootstrap-guard.py $data_path/database.db"
+    else
+      admin_gate='ExecStartPre=/usr/bin/false'
+    fi
+  fi
   config_dir="$(localai_config_dir)"
   generated_content_path="$(localai_generated_content_path)"
   upload_path="$(localai_upload_path)"
@@ -644,6 +660,7 @@ install_systemd_service() {
     -e "s|@CONTAINER_NAME@|$container_name|g" \
     -e "s|@BIND_HOST@|$bind_host|g" \
     -e "s|@BIND_PORT@|$bind_port|g" \
+    -e "s|@ADMIN_GATE@|$admin_gate|g" \
     -e "s|@LOCALAI_AUTH@|${LOCALAI_AUTH:-true}|g" \
     -e "s|@LOCALAI_REGISTRATION_MODE@|${LOCALAI_REGISTRATION_MODE:-approval}|g" \
     -e "s|@LOCALAI_LOG_LEVEL@|${LOCALAI_LOG_LEVEL:-info}|g" \
@@ -664,6 +681,8 @@ install_systemd_service() {
     [[ ! -L "$user_unit_dir/localai.service" && -f "$user_unit_dir/localai.service" ]] || die "Refusing to replace a non-regular LocalAI service unit."
     grep -Fqx '# Managed by LocalAI secureblue installer.' "$user_unit_dir/localai.service" || grep -Fqx 'Description=LocalAI OpenAI-compatible API and web UI container' "$user_unit_dir/localai.service" || die "Refusing to replace an unrelated user service unit: $user_unit_dir/localai.service"
   fi
+  localai_installer_check_managed_file /etc/localai/backend-unit.expected "expected backend unit" 0 '# Managed by LocalAI secureblue installer.' || die "Refusing to replace an unrelated expected backend unit."
+  run0_pipe /usr/bin/install -o root -g root -m 0644 "$tmp_service" /etc/localai/backend-unit.expected
   run0_pipe /usr/bin/install -o "$service_user" -g "$service_user" -m 0644 "$tmp_service" "$user_unit_dir/localai.service"
   rm -f "$tmp_service"
   run_as_localai /usr/bin/systemctl --user daemon-reload
@@ -717,7 +736,7 @@ SERVICE_BIND_PORT="$LOCALAI_BIND_PORT"
 localai_installer_validate_service_account_name "$service_user" "LOCALAI_SERVICE_USER" || die "Unsafe LocalAI service account name."
 localai_installer_validate_managed_path "$state_dir" "LOCALAI_STATE_DIR" || die "Unsafe LocalAI state path."
 localai_installer_validate_managed_path "$project_dir" "LOCALAI_PROJECT_DIR" || die "Unsafe LocalAI project path."
-[[ "$project_dir" == "$state_dir/"* ]] || die "LOCALAI_PROJECT_DIR must be inside LOCALAI_STATE_DIR."
+localai_installer_check_project_location "$project_dir" "$state_dir" || die "LOCALAI_PROJECT_DIR must be inside LOCALAI_STATE_DIR and must not overlap service configuration or Podman storage."
 while IFS= read -r path; do
   [[ -n "$path" ]] || continue
   localai_installer_validate_managed_path "$path" "LocalAI app data path" || die "Unsafe LocalAI app data path: $path"
@@ -727,7 +746,13 @@ while IFS= read -r path; do
   done
 done < <(localai_app_data_dirs)
 elevate_once
+bootstrap_isolation_command=__verify-bootstrap-isolation-if-needed
+if [[ "$LOCALAI_AUTH" != true ]] || ! /usr/bin/python3 "$repo_root/lib/bootstrap_guard.py" "$LOCALAI_DATA_PATH/database.db"; then
+  bootstrap_isolation_command=__verify-bootstrap-isolation
+fi
 localai_installer_prepare_config "$canonical_config" "$LOCALAI_INSTALLER_CONFIG_SOURCE" "$LOCALAI_INSTALLER_CONFIG_FORMAT" || die "Could not safely persist the shared LocalAI configuration."
+/usr/bin/env -i HOME=/root PATH=/usr/bin:/bin LOCALAI_CONFIG_FILE=/etc/localai/localai.conf \
+  /usr/bin/bash "$repo_root/bin/localaictl" "$bootstrap_isolation_command" || die "Stop and disable existing TLS listeners before first administrator bootstrap."
 localai_installer_persist_environment_overrides "$canonical_config" || die "Could not safely persist explicit configuration overrides."
 localai_installer_load_config "$canonical_config" canonical || die "Invalid persisted LocalAI configuration."
 service_user="$LOCALAI_SERVICE_USER"
@@ -738,7 +763,7 @@ SERVICE_BIND_PORT="$LOCALAI_BIND_PORT"
 localai_installer_validate_service_account_name "$service_user" "LOCALAI_SERVICE_USER" || die "Unsafe LocalAI service account name."
 localai_installer_validate_managed_path "$state_dir" "LOCALAI_STATE_DIR" || die "Unsafe LocalAI state path."
 localai_installer_validate_managed_path "$project_dir" "LOCALAI_PROJECT_DIR" || die "Unsafe LocalAI project path."
-[[ "$project_dir" == "$state_dir/"* ]] || die "LOCALAI_PROJECT_DIR must be inside LOCALAI_STATE_DIR."
+localai_installer_check_project_location "$project_dir" "$state_dir" || die "LOCALAI_PROJECT_DIR must be inside LOCALAI_STATE_DIR and must not overlap service configuration or Podman storage."
 while IFS= read -r path; do
   [[ -n "$path" ]] || continue
   localai_installer_validate_managed_path "$path" "LocalAI app data path" || die "Unsafe LocalAI app data path: $path"
@@ -749,12 +774,22 @@ while IFS= read -r path; do
 done < <(localai_app_data_dirs)
 require_cmd run0
 
+if [[ "$LOCALAI_AUTH" != true ]] || ! /usr/bin/python3 "$repo_root/lib/bootstrap_guard.py" "$LOCALAI_DATA_PATH/database.db"; then
+  /usr/bin/env -u LOCALAI_SYSTEM_UNIT_DIR -u LOCALAI_SYSTEMCTL_BIN -u LOCALAI_RUN0_BIN -u LOCALAI_ID_BIN \
+    LOCALAI_CONFIG_FILE=/etc/localai/localai.conf /usr/bin/bash "$repo_root/bin/localaictl" __verify-bootstrap-isolation || die "Stop and disable existing TLS listeners before first administrator bootstrap."
+fi
+if [[ "$LOCALAI_BIND_HOST" != 127.0.0.1 && "$LOCALAI_BIND_HOST" != ::1 ]]; then
+  [[ "$LOCALAI_AUTH" == true ]] || die "A non-loopback backend requires authentication."
+  /usr/bin/python3 "$repo_root/lib/bootstrap_guard.py" "$LOCALAI_DATA_PATH/database.db" || die "Complete the first administrator bootstrap on loopback before configuring a public backend."
+fi
+
 log "Installing from LocalAI assets: $asset_dir"
 ensure_service_user
 ensure_subids
 ensure_gpu_groups
 install_project_files
 install_container_policy
+install_bootstrap_guard
 label_container_state
 preflight_existing_backend_state
 preflight_user_systemd_parent
@@ -763,6 +798,9 @@ snapshot_existing_service_state
 stop_existing_managed_service
 remove_preflighted_existing_container
 ensure_container_userns
+if [[ "$install_service" == 1 ]]; then
+  localai_installer_ensure_image_volumes run_as_localai "$state_dir" "${LOCALAI_CONTAINER_NAME:-localai}" || die "Cannot safely create or reuse managed image volumes."
+fi
 
 if [[ "$run_pull" == "1" ]]; then
   pull_image

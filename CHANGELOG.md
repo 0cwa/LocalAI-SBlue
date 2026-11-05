@@ -5,6 +5,9 @@ has been runtime-qualified on secureblue or on a GPU.
 
 ## Unreleased
 
+- Gate public listeners on completion of the first administrator bootstrap.
+- Use the current upstream CPU image for VM acceptance.
+- Keep image-declared LocalAI data volumes in labelled persistent Podman volumes.
 - Add bounded host and disposable VM lifecycle acceptance with sanitized receipts.
 - Leave new installations idle and preserve existing backend and TLS service states on upgrades.
 

@@ -44,6 +44,7 @@ manifest=(
   config/localai.conf.example
   lib/config.sh
   lib/acceptance.sh
+  lib/bootstrap_guard.py
   lib/installer_safety.sh
   lib/tls_compose_render.sh
   localai/localai.lock
@@ -80,6 +81,7 @@ manifest=(
   scripts/acceptance-host.sh
   scripts/acceptance-policy.sh
   scripts/acceptance-guest.sh
+  scripts/acceptance-bootstrap.sh
   scripts/test-host-acceptance.sh
   scripts/check-public-tree.py
   scripts/test-public-tree.sh
@@ -88,6 +90,7 @@ manifest=(
   scripts/test-release.sh
   scripts/test-support.sh
   scripts/test-config.sh
+  scripts/test-bootstrap-guard.sh
   scripts/test-locaictl.sh
   scripts/test-installed-copy.sh
   scripts/test-render-config.sh

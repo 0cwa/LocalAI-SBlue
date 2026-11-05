@@ -501,6 +501,45 @@ fake_podman() {
 expect_reject_with_message writable-layer-backend-data 'has writable-layer data under /backends' \
   localai_installer_preflight_backend_containers fake_podman "$synthetic_backend_bind" "$(id -u)" "$synthetic_state_root" localai
 
+(
+  # shellcheck disable=SC2329
+  fake_named_volume_podman() {
+    [[ "$1" == /usr/bin/podman ]] || return 90
+    shift
+    case "$1" in
+      ps) printf 'localai\n' ;;
+      inspect)
+        case "$3" in
+          '{{.Id}}') printf '%s\n' "$synthetic_container_id" ;;
+          '{{json .Config.Labels}}') printf '{"io.localai.secureblue.managed":"localai","io.localai.secureblue.state":"%s","io.localai.secureblue.container":"localai"}\n' "$synthetic_state_root" ;;
+          '{{json .Mounts}}') printf '[{"Type":"volume","Name":"%s","Source":"%s","Destination":"%s"}]\n' "$mock_volume" "$synthetic_backend_volume" "$mock_destination" ;;
+          *) return 91 ;;
+        esac ;;
+      volume)
+        [[ "$2" == inspect && "$3" == --format && "$4" == '{{json .}}' ]] || return 92
+        printf '{"Name":"localai-image-backends","Driver":"local","Options":{},"Labels":{"io.localai.secureblue.managed":"image-volume","io.localai.secureblue.state":"%s","io.localai.secureblue.container":"localai","io.localai.secureblue.role":"backends"}}\n' "$synthetic_state_root" ;;
+      diff) printf '%s\n' "$mock_diff" ;;
+      *) return 93 ;;
+    esac
+  }
+  mock_volume=localai-image-backends
+  mock_destination=/backends
+  mock_diff='A /backends'
+  localai_installer_preflight_backend_containers fake_named_volume_podman "$synthetic_backend_bind" "$(id -u)" "$synthetic_state_root" localai || fail "managed persistent volume was rejected"
+  mock_diff='A /backends/file'
+  expect_reject writable-layer-under-managed-volume localai_installer_preflight_backend_containers fake_named_volume_podman "$synthetic_backend_bind" "$(id -u)" "$synthetic_state_root" localai
+  mock_volume=unknown-volume
+  mock_destination=/models
+  mock_diff=
+  expect_reject unknown-image-volume localai_installer_preflight_backend_containers fake_named_volume_podman "$synthetic_backend_bind" "$(id -u)" "$synthetic_state_root" localai
+)
+
+printf 'Project and Podman storage separation checks\n'
+localai_installer_check_project_location "$synthetic_state_root/build/localai-oci" "$synthetic_state_root" || fail "normal project directory rejected"
+for project_path in "$synthetic_state_root/.local" "$synthetic_state_root/.local/share/containers/storage/volumes" "$synthetic_state_root/.config/containers"; do
+  expect_reject overlapping-project-directory localai_installer_check_project_location "$project_path" "$synthetic_state_root"
+done
+
 printf 'Managed-container ownership integration checks\n'
 source_production_function() {
   local source_file="$1" function_name="$2"
@@ -508,6 +547,34 @@ source_production_function() {
   # shellcheck disable=SC1090
   source <(/usr/bin/sed -n "/^${function_name}() {$/,/^}/p" "$source_file")
 }
+
+(
+  source_production_function "$repo_root/localai-podman-compose/install.sh" retire_forward_units
+  # These mocks are used by the extracted production function.
+  # shellcheck disable=SC2329
+  localai_installer_check_managed_file() { [[ ! -e "$1" ]] || rg -q '^# Managed by LocalAI secureblue TLS installer\.$' "$1"; }
+  # shellcheck disable=SC2329
+  run0_pipe() { printf '%s\n' "$*" >> "$scratch/retire-calls"; }
+  # shellcheck disable=SC2329
+  die() { exit 1; }
+  mkdir -p "$scratch/forward-units"
+  printf '# Managed by LocalAI secureblue TLS installer.\n' > "$scratch/forward-units/example.socket"
+  printf '# Managed by LocalAI secureblue TLS installer.\n' > "$scratch/forward-units/example.service"
+  printf '# Managed by LocalAI secureblue TLS installer.\n' > "$scratch/forward-units/previous.socket"
+  printf '# Managed by LocalAI secureblue TLS installer.\n' > "$scratch/forward-units/previous.service"
+  # Variables are consumed by the extracted function.
+  # shellcheck disable=SC2034
+  install_service=1 install_public_socket=0 tls_forward_socket_name=example.socket tls_forward_service_name=example.service
+  retire_forward_units "$scratch/forward-units"
+  rg -q 'systemctl disable --now example.socket' "$scratch/retire-calls"
+  rg -q 'systemctl stop example.service' "$scratch/retire-calls"
+  rg -q 'systemctl disable --now previous.socket' "$scratch/retire-calls"
+  rg -q 'systemctl stop previous.service' "$scratch/retire-calls"
+  printf 'unrelated\n' > "$scratch/forward-units/example.socket"
+  : > "$scratch/retire-calls"
+  if (retire_forward_units "$scratch/forward-units"); then exit 1; fi
+  [[ ! -s "$scratch/retire-calls" ]]
+)
 
 (
   source_production_function "$repo_root/secureblue-localai-install/install.sh" install_project_files
