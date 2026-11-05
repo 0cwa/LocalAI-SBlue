@@ -29,8 +29,11 @@ cd LocalAI-SBlue
 
    The installer saves the shared installed configuration at
    `/etc/localai/localai.conf`. Keep `LOCALAI_BIND_HOST=127.0.0.1` unless you
-   have a specific reason to expose the backend directly. Do not put passwords,
-   API keys, or private keys in this file.
+   have a specific reason to expose the backend directly. The private Podman
+   network publishes this address on the host, so use a numeric IPv4 or IPv6
+   address; hostnames such as `localhost` or DNS names are rejected before
+   elevation or stopping an existing service during install or upgrade. Do not
+   put passwords, API keys, or private keys in this file.
 3. Install the backend from the host:
 
    ```sh
