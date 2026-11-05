@@ -150,6 +150,21 @@ printf 'Acceptance checkpoint tests passed\n'
 )
 printf 'Acceptance policy timeout tests passed\n'
 printf 'Acceptance step tests passed\n'
+(
+  # shellcheck disable=SC1090
+  source <(sed -n '/^upgrade_step() {$/,/^}/p' "$repo_root/scripts/acceptance-guest.sh")
+  # The mock writes a fixed stage and an unknown value to test filtering.
+  # shellcheck disable=SC2329
+  step() { printf 'backend-preflight\nunknown-stage\nsafety-refusal\n' > "$work/installer-stages"; return 1; }
+  # Variables are consumed by the extracted function.
+  # shellcheck disable=SC2034
+  installer=unused cpu_image=unused receipt="$work/upgrade-receipt"
+  : > "$receipt"
+  if upgrade_step upgrade-disabled-running; then exit 1; fi
+  rg -q '^diagnostic upgrade-stage: backend-preflight$' "$receipt"
+  rg -q '^diagnostic upgrade-stage: safety-refusal$' "$receipt"
+  ! rg -q 'unknown-stage' "$receipt"
+)
 
 getent() { return 2; }
 mkdir -p "$work/root/etc"

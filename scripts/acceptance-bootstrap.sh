@@ -3,6 +3,7 @@
 set -euo pipefail
 [[ "${EUID:-$(id -u)}" == 0 ]] && systemd-detect-virt --vm --quiet || exit 1
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+receipt="${LOCALAI_ACCEPTANCE_RECEIPT:?}"
 socket=/etc/systemd/system/localai-acceptance-bootstrap.socket
 service=/etc/systemd/system/localai-acceptance-bootstrap.service
 [[ ! -e "$socket" && ! -L "$socket" && ! -e "$service" && ! -L "$service" ]] || exit 1
@@ -25,9 +26,12 @@ printf '[Service]\nExecStart=/usr/bin/true\n' >"$service"
 systemctl daemon-reload
 if systemctl start localai-acceptance-bootstrap.socket >/dev/null 2>&1; then exit 1; fi
 if systemctl is-active --quiet localai-acceptance-bootstrap.socket; then exit 1; fi
+printf 'diagnostic bootstrap-before-admin: blocked\n' >> "$receipt"
 python3 - <<'PY'
 import json
+import os
 import secrets
+import urllib.error
 import urllib.request
 
 payload = json.dumps({
@@ -42,10 +46,20 @@ request = urllib.request.Request(
     method="POST",
 )
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-with opener.open(request, timeout=30) as response:
-    if response.status != 201:
-        raise SystemExit(1)
+try:
+    with opener.open(request, timeout=30) as response:
+        status = response.status
+except urllib.error.HTTPError as error:
+    status = error.code
+except (OSError, urllib.error.URLError):
+    status = 0
+if status != 201:
+    with open(os.environ["LOCALAI_ACCEPTANCE_RECEIPT"], "a", encoding="utf-8") as receipt:
+        receipt.write(f"diagnostic bootstrap-registration-http: {status}\n")
+    raise SystemExit(1)
 PY
+printf 'diagnostic bootstrap-registration: complete\n' >> "$receipt"
 systemctl reset-failed localai-acceptance-bootstrap.socket
 systemctl start localai-acceptance-bootstrap.socket
 systemctl is-active --quiet localai-acceptance-bootstrap.socket
+printf 'diagnostic bootstrap-after-admin: active\n' >> "$receipt"

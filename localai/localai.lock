@@ -8,7 +8,7 @@ LOCK_SCHEMA=1
 # Default target: AMD ROCm/HIP LocalAI image from Docker Hub.
 # Alternatives:
 #   docker.io/localai/localai:latest-gpu-vulkan
-#   docker.io/localai/localai:latest-cpu
+#   docker.io/localai/localai:latest
 LOCALAI_IMAGE_REF="docker.io/localai/localai:latest-gpu-hipblas"
 
 # Optional digest pin. After a known-good pull, set this to sha256:<digest>.

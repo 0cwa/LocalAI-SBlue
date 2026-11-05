@@ -485,7 +485,8 @@ install_project_files() {
   fi
 
   if [[ -x /usr/sbin/restorecon ]]; then
-    run0_pipe /usr/sbin/restorecon -RF "$state_dir"
+    run0_pipe /usr/sbin/restorecon -F "$state_dir"
+    run0_pipe /usr/sbin/restorecon -RF "$project_dir"
   else
     log "restorecon not found; skipping SELinux relabel."
   fi
@@ -797,6 +798,9 @@ snapshot_existing_service_state
 stop_existing_managed_service
 remove_preflighted_existing_container
 ensure_container_userns
+if [[ "$install_service" == 1 ]]; then
+  localai_installer_ensure_image_volumes run_as_localai "$state_dir" "${LOCALAI_CONTAINER_NAME:-localai}" || die "Cannot safely create or reuse managed image volumes."
+fi
 
 if [[ "$run_pull" == "1" ]]; then
   pull_image

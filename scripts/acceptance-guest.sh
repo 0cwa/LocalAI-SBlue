@@ -74,7 +74,7 @@ service_systemctl() {
     --setenv=PATH=/usr/bin:/bin -- /usr/bin/systemctl --user "$@"
 }
 
-cpu_image=docker.io/localai/localai:latest-cpu
+cpu_image=docker.io/localai/localai:latest
 service_podman() {
   local uid
   uid="$(id -u localai)" || return 1
@@ -236,6 +236,24 @@ check() {
   fi
   return 1
 }
+
+upgrade_step() {
+  local label="$1" stage
+  local trace="$work/installer-trace" stages="$work/installer-stages"
+  cat >"$trace" <<'TRACE'
+set -T
+trap 'case "$BASH_COMMAND" in ensure_service_user) printf "service-user\n";; ensure_subids) printf "subids\n";; install_project_files) printf "project-files\n";; install_container_policy) printf "policy\n";; install_bootstrap_guard) printf "bootstrap-guard\n";; label_container_state) printf "labels\n";; preflight_existing_backend_state) printf "backend-preflight\n";; preflight_user_systemd_parent) printf "unit-preflight\n";; ensure_user_manager) printf "manager\n";; snapshot_existing_service_state) printf "snapshot\n";; stop_existing_managed_service) printf "stop\n";; remove_preflighted_existing_container) printf "remove\n";; ensure_container_userns) printf "userns\n";; install_systemd_service) printf "unit\n";; localai_installer_error*"writable-layer data"*) printf "writable-layer-data\n";; localai_installer_error*"writable-layer changes"*) printf "writable-layer-inspection\n";; localai_installer_error*"mount metadata"*) printf "mount-metadata\n";; localai_installer_error*"ownership labels"*) printf "ownership-inspection\n";; localai_installer_error*"not marked for LocalAI"*) printf "ownership-mismatch\n";; localai_installer_error*"multiple /backends mounts"*) printf "multiple-backend-mounts\n";; localai_installer_error*"stores backends at"*) printf "backend-mount-mismatch\n";; localai_installer_error*"data in anonymous or named"*) printf "backend-volume-data\n";; localai_installer_error\ *) printf "safety-refusal\n";; die\ *) printf "installer-refusal\n";; esac >> "$LOCALAI_ACCEPTANCE_STAGE_FILE"' DEBUG
+TRACE
+  : >"$stages"
+  if ! step "$label" 1200 env BASH_ENV="$trace" LOCALAI_ACCEPTANCE_STAGE_FILE="$stages" LOCALAI_IMAGE_REF_OVERRIDE="$cpu_image" bash "$installer" --yes --no-pull; then
+    while IFS= read -r stage; do
+      case "$stage" in service-user|subids|project-files|policy|bootstrap-guard|labels|backend-preflight|unit-preflight|manager|snapshot|stop|remove|userns|unit|writable-layer-data|writable-layer-inspection|mount-metadata|ownership-inspection|ownership-mismatch|multiple-backend-mounts|backend-mount-mismatch|backend-volume-data|safety-refusal|installer-refusal)
+        printf 'diagnostic upgrade-stage: %s\n' "$stage" >>"$receipt" ;;
+      esac
+    done < <(tail -n 8 "$stages")
+    return 1
+  fi
+}
 installer="$repo_root/secureblue-localai-install/install.sh"
 controller="$repo_root/bin/localaictl"
 
@@ -355,7 +373,7 @@ else
   '
   step doctor 90 "$0" --check-health "$controller"
   if [[ "$mode" == vm ]]; then
-    step first-admin-bootstrap 120 bash "$repo_root/scripts/acceptance-bootstrap.sh"
+    step first-admin-bootstrap 120 env LOCALAI_ACCEPTANCE_RECEIPT="$receipt" bash "$repo_root/scripts/acceptance-bootstrap.sh"
   fi
   if [[ ! -e "$work/config-before" && ! -L "$work/config-before" ]]; then
     cp -- /etc/localai/localai.conf "$work/config-before"
@@ -378,17 +396,17 @@ else
   run_id="$(<"$work/container-run-id")"
   [[ "$run_id" =~ ^[a-f0-9]{32}$ ]] || fail 'test container identity is invalid.'
   step create-unrelated-container 120 "$0" --ensure-unrelated "$run_id"
-  step upgrade-disabled-running 1200 env LOCALAI_IMAGE_REF_OVERRIDE="$cpu_image" bash "$installer" --yes --no-pull
+  upgrade_step upgrade-disabled-running
   check upgrade-disabled-running-state active disabled
   step enable-boot 30 "$0" --set-unit-enabled enable
-  step upgrade-enabled-running 1200 env LOCALAI_IMAGE_REF_OVERRIDE="$cpu_image" bash "$installer" --yes --no-pull
+  upgrade_step upgrade-enabled-running
   check upgrade-enabled-running-state active enabled
   step explicit-stop 300 "$controller" stop
   check enabled-stopped-state inactive enabled
-  step upgrade-enabled-stopped 1200 env LOCALAI_IMAGE_REF_OVERRIDE="$cpu_image" bash "$installer" --yes --no-pull
+  upgrade_step upgrade-enabled-stopped
   check upgrade-enabled-stopped-state inactive enabled
   step disable-boot 30 "$0" --set-unit-enabled disable
-  step upgrade-disabled-stopped 1200 env LOCALAI_IMAGE_REF_OVERRIDE="$cpu_image" bash "$installer" --yes --no-pull
+  upgrade_step upgrade-disabled-stopped
   check upgrade-disabled-stopped-state inactive disabled
   step preserve-config 30 cmp -s /etc/localai/localai.conf "$work/config-before"
   step preserve-data 30 grep -qx 'localai acceptance marker' /var/lib/localai/models/.acceptance-marker

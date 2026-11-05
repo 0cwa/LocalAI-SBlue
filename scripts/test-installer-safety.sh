@@ -501,6 +501,39 @@ fake_podman() {
 expect_reject_with_message writable-layer-backend-data 'has writable-layer data under /backends' \
   localai_installer_preflight_backend_containers fake_podman "$synthetic_backend_bind" "$(id -u)" "$synthetic_state_root" localai
 
+(
+  # shellcheck disable=SC2329
+  fake_named_volume_podman() {
+    [[ "$1" == /usr/bin/podman ]] || return 90
+    shift
+    case "$1" in
+      ps) printf 'localai\n' ;;
+      inspect)
+        case "$3" in
+          '{{.Id}}') printf '%s\n' "$synthetic_container_id" ;;
+          '{{json .Config.Labels}}') printf '{"io.localai.secureblue.managed":"localai","io.localai.secureblue.state":"%s","io.localai.secureblue.container":"localai"}\n' "$synthetic_state_root" ;;
+          '{{json .Mounts}}') printf '[{"Type":"volume","Name":"%s","Source":"%s","Destination":"%s"}]\n' "$mock_volume" "$synthetic_backend_volume" "$mock_destination" ;;
+          *) return 91 ;;
+        esac ;;
+      volume)
+        [[ "$2" == inspect && "$3" == --format && "$4" == '{{json .}}' ]] || return 92
+        printf '{"Name":"localai-image-backends","Driver":"local","Options":{},"Labels":{"io.localai.secureblue.managed":"image-volume","io.localai.secureblue.state":"%s","io.localai.secureblue.container":"localai","io.localai.secureblue.role":"backends"}}\n' "$synthetic_state_root" ;;
+      diff) printf '%s\n' "$mock_diff" ;;
+      *) return 93 ;;
+    esac
+  }
+  mock_volume=localai-image-backends
+  mock_destination=/backends
+  mock_diff='A /backends'
+  localai_installer_preflight_backend_containers fake_named_volume_podman "$synthetic_backend_bind" "$(id -u)" "$synthetic_state_root" localai || fail "managed persistent volume was rejected"
+  mock_diff='A /backends/file'
+  expect_reject writable-layer-under-managed-volume localai_installer_preflight_backend_containers fake_named_volume_podman "$synthetic_backend_bind" "$(id -u)" "$synthetic_state_root" localai
+  mock_volume=unknown-volume
+  mock_destination=/models
+  mock_diff=
+  expect_reject unknown-image-volume localai_installer_preflight_backend_containers fake_named_volume_podman "$synthetic_backend_bind" "$(id -u)" "$synthetic_state_root" localai
+)
+
 printf 'Managed-container ownership integration checks\n'
 source_production_function() {
   local source_file="$1" function_name="$2"

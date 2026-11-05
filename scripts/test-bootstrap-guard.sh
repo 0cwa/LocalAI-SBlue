@@ -90,4 +90,20 @@ finally:
     server.shutdown()
     server.server_close()
 PY
+python3 - "$guard" <<'PYTEST'
+import importlib.util
+import subprocess
+import sys
+from unittest.mock import patch
+
+spec = importlib.util.spec_from_file_location("bootstrap_guard", sys.argv[1])
+guard = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(guard)
+sys.argv = ["guard", "--image-volumes-safe", "example"]
+for output, expected in [("null", 0), ('{"/backends": {}, "/data": {}}', 0), ('{"/new-volume": {}}', 1), ("[]", 1), ("invalid", 1)]:
+    with patch.object(guard.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, stdout=output)):
+        assert guard.main() == expected
+with patch.object(guard.subprocess, "run", side_effect=subprocess.TimeoutExpired("podman", 30)):
+    assert guard.main() == 1
+PYTEST
 printf 'Bootstrap guard tests passed.\n'

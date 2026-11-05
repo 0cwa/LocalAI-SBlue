@@ -109,6 +109,21 @@ def effective_unit_matches(database: str, port: str) -> bool:
 
 
 def main() -> int:
+    if len(sys.argv) == 3 and sys.argv[1] == "--image-volumes-safe":
+        try:
+            result = subprocess.run(
+                ["/usr/bin/podman", "image", "inspect", "--format", "{{json .Config.Volumes}}", sys.argv[2]],
+                capture_output=True, text=True, timeout=30, check=True,
+            )
+            volumes = json.loads(result.stdout)
+            if volumes is None:
+                volumes = {}
+            if not isinstance(volumes, dict) or set(volumes) - {"/backends", "/models", "/data", "/configuration"}:
+                raise ValueError("unsupported image volumes")
+            return 0
+        except (OSError, ValueError, subprocess.SubprocessError):
+            print("LocalAI image volume layout is unavailable or unsupported.", file=sys.stderr)
+            return 1
     status_only = len(sys.argv) == 3 and sys.argv[1] == "--status"
     if status_only:
         state = admin_state(sys.argv[2])

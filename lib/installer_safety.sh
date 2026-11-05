@@ -682,11 +682,50 @@ localai_installer_user_manager_is_active() {
 # or remove its container. The service manager runner must target the already
 # active nologin account manager; starting a manager here could auto-start an
 # old --rm unit before its anonymous /backends volume is checked.
+localai_installer_check_image_volume() {
+  local runner="$1" volume="$2" state="$3" container="$4" role="$5" volume_metadata
+  [[ "$volume" == "${container}-image-${role}" ]] || return 1
+  volume_metadata="$("$runner" /usr/bin/podman volume inspect --format '{{json .}}' "$volume")" || return 1
+  /usr/bin/python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    labels = data.get("Labels") or {}
+    valid = (data.get("Name") == sys.argv[1] and data.get("Driver") == "local"
+             and not data.get("Options") and labels.get("io.localai.secureblue.managed") == "image-volume"
+             and labels.get("io.localai.secureblue.state") == sys.argv[2]
+             and labels.get("io.localai.secureblue.container") == sys.argv[3]
+             and labels.get("io.localai.secureblue.role") == sys.argv[4])
+    raise SystemExit(0 if valid else 1)
+except (ValueError, TypeError, AttributeError):
+    raise SystemExit(1)
+' "$volume" "$state" "$container" "$role" <<< "$volume_metadata" 2>/dev/null
+}
+
+localai_installer_ensure_image_volumes() {
+  local runner="$1" state="$2" container="$3" role volume status
+  for role in backends models data configuration; do
+    volume="${container}-image-${role}"
+    status=0
+    "$runner" /usr/bin/podman volume exists "$volume" || status=$?
+    case "$status" in
+      0) ;;
+      1) "$runner" /usr/bin/podman volume create --uid 0 --gid 0 \
+        --label io.localai.secureblue.managed=image-volume \
+        --label "io.localai.secureblue.state=$state" \
+        --label "io.localai.secureblue.container=$container" \
+        --label "io.localai.secureblue.role=$role" "$volume" >/dev/null || return 1 ;;
+      *) return 1 ;;
+    esac
+    localai_installer_check_image_volume "$runner" "$volume" "$state" "$container" "$role" || return 1
+  done
+}
+
 localai_installer_preflight_backend_containers() {
   local runner="$1" backend_destination="$2" expected_uid="$3" expected_state_dir="$4"
   shift 4
   local names name target matched container_id labels_json mounts mounts_json type volume source destination suffix expected_source volume_path volume_path_json entries diff
-  local backend_mounts
+  local backend_mounts persistent_backend role
   LOCALAI_INSTALLER_VALIDATED_CONTAINER_IDS=()
   names="$("$runner" /usr/bin/podman ps --all --format '{{.Names}}')" || {
     localai_installer_error "could not read rootless container state before changing the service; if Podman requests migration, inventory and back up all containers and volumes for this account, stop every running container, run 'podman system migrate' manually as this account, then retry"
@@ -748,9 +787,9 @@ for mount in mounts:
     destination = posixpath.normpath(raw_destination)
     if raw_destination != destination or destination == "/":
         raise SystemExit(8)
-    if destination != "/backends" and not destination.startswith("/backends/"):
-        continue
     kind = mount.get("Type", "")
+    if destination != "/backends" and not destination.startswith("/backends/") and kind != "volume":
+        continue
     name = mount.get("Name", "") or ""
     source = mount.get("Source", "")
     if kind not in ("bind", "volume"):
@@ -765,8 +804,17 @@ for mount in mounts:
       return 1
     }
     backend_mounts=0
+    persistent_backend=0
     while IFS='|' read -r type volume source destination; do
       [[ -n "$type" ]] || continue
+      if [[ "$destination" != /backends && "$destination" != /backends/* ]]; then
+        role="${destination#/}"
+        if [[ "$destination" != "/$role" || ! "$role" =~ ^(models|data|configuration)$ ]] || ! localai_installer_check_image_volume "$runner" "$volume" "$expected_state_dir" "$name" "$role"; then
+          localai_installer_error "container $name has an unrecognized volume at $destination; preserve or migrate it before retrying"
+          return 1
+        fi
+        continue
+      fi
       backend_mounts=$((backend_mounts + 1))
       (( backend_mounts == 1 )) || {
         localai_installer_error "container $name has multiple /backends mounts; refusing to choose one"
@@ -785,6 +833,10 @@ for mount in mounts:
           if ! [[ "$volume" =~ ^[A-Za-z0-9_.-]+$ ]]; then
             localai_installer_error "container $name has an unreadable /backends volume name"
             return 1
+          fi
+          if [[ "$destination" == /backends ]] && localai_installer_check_image_volume "$runner" "$volume" "$expected_state_dir" "$name" backends; then
+            persistent_backend=1
+            continue
           fi
           volume_path_json="$("$runner" /usr/bin/podman volume inspect --format '{{json .Mountpoint}}' "$volume")" || {
             localai_installer_error "could not locate container $name /backends volume $volume"
@@ -822,7 +874,7 @@ print(path)
       localai_installer_error "could not inspect container $container_id writable-layer changes"
       return 1
     }
-    if /usr/bin/awk '$2 == "/backends" || index($2, "/backends/") == 1 { found=1 } END { exit found ? 0 : 1 }' <<< "$diff"; then
+    if /usr/bin/awk -v persistent="$persistent_backend" '($2 == "/backends" && !(persistent == 1 && $1 == "A")) || index($2, "/backends/") == 1 { found=1 } END { exit found ? 0 : 1 }' <<< "$diff"; then
       localai_installer_error "container $container_id has writable-layer data under /backends; preserve or migrate it before retrying"
       return 1
     fi

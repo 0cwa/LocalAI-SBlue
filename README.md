@@ -292,6 +292,11 @@ confirmation before terminating processes; this scope includes other
 containers and services running as the dedicated service account. Passing
 `--yes` with either option supplies that confirmation explicitly.
 
+The LocalAI image directories `/backends`, `/models`, `/data`, and
+`/configuration` use managed named Podman volumes under the service account’s
+state directory. Upgrades refuse unrecognized existing volumes so their data
+can be inspected and migrated safely before retrying.
+
 Stop the services before taking a file-level backup:
 
 ```sh
