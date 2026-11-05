@@ -9,7 +9,8 @@ has been runtime-qualified on secureblue or on a GPU.
 - Probe all configured writable LocalAI paths inside the existing container and document which paths hold persistent data or scratch files.
 
 - Add protected `localaictl backup` and explicitly confirmed overlay restore,
-  preserving archive ownership, modes, xattrs, ACLs, and SELinux labels.
+  covering configured persistent paths and preserving ownership, modes, xattrs,
+  ACLs, and SELinux labels.
 
 ## 0.2.0
 

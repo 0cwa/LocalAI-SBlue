@@ -337,27 +337,31 @@ Create a protected archive with `localaictl`:
 bin/localaictl backup /path/to/localai-backup.tar.gz
 ```
 
-The command briefly stops active LocalAI services, archives the configured
-shared configuration and state with numeric ownership, modes, ACLs, extended
-attributes, and SELinux labels, then returns services to their prior active
-state. The archive records the configured backend and TLS image references and
-digests. Use `backup --exclude-models` to leave the configured models directory
-out of the archive; restoring such an archive leaves any existing models
-untouched. The archive is created with mode `0600`.
+The command briefly stops active, verified LocalAI services, archives the
+configuration and every configured persistent data path with numeric
+ownership, modes, ACLs, extended attributes, and SELinux labels, then returns
+services to their prior active state. Nested paths are stored once. The archive
+records the configured backend and TLS image references and digests. Use
+`backup --exclude-models` to leave the configured models directory out of the
+archive; restoring such an archive leaves any existing models untouched. The
+archive is created with mode `0600`.
 
 Backups contain the TLS CA private key and the LocalAI authentication database.
-Store them as sensitive data. Restore into matching configured paths; restore
-rejects unsafe archive entries and linked destination paths. It overlays files
-from the archive, preserving unrelated files. If any archived path already
-exists, review the archive and explicitly confirm the overlay:
+Store them as sensitive data. Restore into matching configured paths. It
+rejects unsafe archive entries, privilege-bearing files, cross-path links, and
+linked destination paths. Restore stages the archive on a disk-backed filesystem
+after checking available space, then overlays archived files while preserving
+unrelated files. If any archived path already exists, review the archive and
+explicitly confirm the overlay:
 
 ```sh
 bin/localaictl restore --yes /path/to/localai-backup.tar.gz
 ```
 
-Restore preserves archived ownership and SELinux xattrs, verifies the labels
-on configured state roots, and restores the services' previous active state.
-`--yes` does not remove unrelated files from state directories.
+Restore preserves archived ownership and SELinux xattrs, normalizes and checks
+the configuration file label, verifies labels on configured persistent roots,
+and starts services in dependency order. It restores the services' previous
+active state. `--yes` does not remove unrelated files from state directories.
 
 For an upgrade, keep a copy of the previous release and shared config, unpack
 the new release, review changes to `config/localai.conf.example`, and rerun the

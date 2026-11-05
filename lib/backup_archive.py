@@ -25,8 +25,14 @@ def clean_member_name(name: str) -> str:
     return "/".join(parts)
 
 
-def validate_archive(archive: str, config: str, state: str, tls: str) -> list[str]:
-    prefixes = [p.lstrip("/").rstrip("/") for p in (config, state, tls)]
+def member_root(name: str, roots: list[str]) -> str | None:
+    matches = [root for root in roots if name == root or name.startswith(root + "/")]
+    return max(matches, key=len) if matches else None
+
+
+def validate_archive(archive: str, config: str, roots: list[str], *, require_root_config: bool = True) -> list[str]:
+    config_name = config.lstrip("/")
+    prefixes = [p.lstrip("/").rstrip("/") for p in roots]
     if any(not p for p in prefixes) or len(set(prefixes)) != len(prefixes):
         fail("configured backup paths must be distinct absolute paths")
     members: dict[str, tarfile.TarInfo] = {}
@@ -40,10 +46,21 @@ def validate_archive(archive: str, config: str, state: str, tls: str) -> list[st
                 name = clean_member_name(info.name)
                 if name in members:
                     fail("backup contains duplicate member names")
-                if name != "metadata" and not any(name == p or name.startswith(p + "/") for p in prefixes):
+                if name != "metadata" and name != config_name and member_root(name, prefixes) is None:
                     fail("backup contains a path outside configured LocalAI paths")
                 if not (info.isfile() or info.isdir() or info.issym() or info.islnk()):
                     fail("backup contains an unsupported special file")
+                if info.mode & 0o6000:
+                    fail("backup contains setuid or setgid permission bits")
+                if any(key.lower().endswith("security.capability") and value for key, value in info.pax_headers.items()):
+                    fail("backup contains a file capability xattr")
+                if name == config_name:
+                    expected_uid = 0 if require_root_config else os.stat(config, follow_symlinks=False).st_uid
+                    if not info.isfile() or info.uid != expected_uid or info.mode & 0o022:
+                        ownership = "root-owned" if require_root_config else "owned by its source file owner"
+                        fail(f"backup configuration member must be a {ownership} regular file without group or world write permission")
+                if name in prefixes and not info.isdir():
+                    fail("configured persistent path must be archived as a directory")
                 members[name] = info
     except (OSError, tarfile.TarError) as error:
         fail(f"cannot read backup archive ({type(error).__name__})")
@@ -61,12 +78,12 @@ def validate_archive(archive: str, config: str, state: str, tls: str) -> list[st
             resolved = posixpath.normpath(link.lstrip("/")) if link.startswith("/") else posixpath.normpath(posixpath.join(posixpath.dirname(name), link))
             if resolved == ".." or resolved.startswith("../"):
                 fail("backup contains a symbolic link escaping its archived tree")
-            if not any(resolved == p or resolved.startswith(p + "/") for p in prefixes):
-                fail("backup contains a symbolic link outside configured LocalAI paths")
+            if member_root(name, prefixes) != member_root(resolved, prefixes):
+                fail("backup contains a symbolic link crossing configured persistent paths")
         elif info.islnk():
             target = clean_member_name(info.linkname)
-            root = next((p for p in prefixes if name == p or name.startswith(p + "/")), None)
-            target_root = next((p for p in prefixes if target == p or target.startswith(p + "/")), None)
+            root = member_root(name, prefixes)
+            target_root = member_root(target, prefixes)
             if target not in members or not members[target].isfile() or root != target_root:
                 fail("backup contains an invalid hard link")
     if "metadata" not in members or not members["metadata"].isfile():
@@ -84,8 +101,52 @@ def copy_source(source: str, destination: str) -> None:
     os.chmod(destination, 0o600)
 
 
-def validate_destinations(names: list[str], stage: str, config: str, state: str, tls: str) -> list[str]:
-    roots = [os.path.abspath(p) for p in (config, state, tls)]
+def stage_check(stage: str) -> None:
+    target = os.path.realpath(stage)
+    best_mount = "/"
+    best_type = ""
+    try:
+        with open("/proc/self/mountinfo", encoding="utf-8") as mounts:
+            for line in mounts:
+                fields = line.rstrip("\n").split()
+                separator = fields.index("-")
+                mountpoint = fields[4].replace("\\040", " ").replace("\\011", "\t").replace("\\134", "\\")
+                if (target == mountpoint or target.startswith(mountpoint.rstrip("/") + "/")) and len(mountpoint) >= len(best_mount):
+                    best_mount = mountpoint
+                    best_type = fields[separator + 1]
+    except (OSError, ValueError):
+        fail("cannot verify restore staging filesystem")
+    if best_type in {"tmpfs", "ramfs"}:
+        fail("restore staging filesystem is memory-backed")
+
+
+def space_check(archive_path: str, stage: str, collision_file: str | None = None) -> None:
+    archive_size = os.stat(archive_path, follow_symlinks=False).st_size
+    expanded = 0
+    rollback = 0
+    try:
+        with tarfile.open(archive_path, "r:gz") as archive:
+            expanded = sum(info.size for info in archive if info.isfile())
+        if collision_file:
+            for encoded in open(collision_file, "rb").read().split(b"\0"):
+                if not encoded:
+                    continue
+                try:
+                    info = os.lstat(os.path.join("/", os.fsdecode(encoded)))
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISREG(info.st_mode):
+                    rollback += info.st_size
+    except (OSError, tarfile.TarError) as error:
+        fail(f"cannot estimate restore staging space ({type(error).__name__})")
+    required = archive_size + expanded + rollback + 64 * 1024 * 1024
+    available = shutil.disk_usage(stage).free
+    if available < required:
+        fail("insufficient free disk space for archive extraction and rollback")
+
+
+def validate_destinations(names: list[str], stage: str, config: str, roots: list[str]) -> list[str]:
+    roots = [os.path.abspath(p) for p in [config, *roots]]
     for root in roots:
         if os.path.islink(root):
             fail("refusing to restore through a linked configured path")
@@ -103,8 +164,8 @@ def validate_destinations(names: list[str], stage: str, config: str, state: str,
         candidate = os.path.join("/", name)
         relative = os.path.relpath(candidate, "/")
         staged = os.path.join(stage, relative)
-        if os.path.islink(staged) and any(staged == os.path.join(stage, root.lstrip("/")) for root in (state, tls)):
-            fail("backup state root must be a directory, not a symbolic link")
+        if os.path.islink(staged) and any(staged == os.path.join(stage, root.lstrip("/")) for root in roots[1:]):
+            fail("backup persistent root must be a directory, not a symbolic link")
         current = candidate
         while current != "/":
             if os.path.islink(current):
@@ -118,14 +179,14 @@ def validate_destinations(names: list[str], stage: str, config: str, state: str,
     return identical_links
 
 
-def write_names(names: list[str], mode: str) -> None:
+def write_names(names: list[str], mode: str, config: str, roots: list[str]) -> None:
     selected: set[str] = set()
     for name in names:
         if name == "metadata":
             continue
         selected.add(name)
         if mode == "collisions0":
-            for root in (os.path.dirname(os.path.abspath(sys.argv[3])), os.path.abspath(sys.argv[4]), os.path.abspath(sys.argv[5])):
+            for root in [os.path.abspath(config), *(os.path.abspath(p) for p in roots)]:
                 root_name = root.lstrip("/").rstrip("/")
                 if name == root_name or name.startswith(root_name + "/"):
                     parent = posixpath.dirname(name)
@@ -141,17 +202,17 @@ def write_names(names: list[str], mode: str) -> None:
         sys.stdout.buffer.write(os.fsencode(name) + b"\0")
 
 
-def rollback_new(member_file: str, collision_file: str, config: str, state: str, tls: str) -> int:
+def rollback_new(member_file: str, collision_file: str, config: str, roots: list[str]) -> int:
     members = open(member_file, "rb").read().split(b"\0")
     collisions = set(open(collision_file, "rb").read().split(b"\0"))
-    roots = [os.path.dirname(config).lstrip("/").rstrip("/"), state.lstrip("/").rstrip("/"), tls.lstrip("/").rstrip("/")]
+    roots = [p.lstrip("/").rstrip("/") for p in roots]
     config_name = config.lstrip("/")
     status = 0
     for encoded in reversed(members):
         if not encoded or encoded == b"metadata" or encoded in collisions:
             continue
         name = os.fsdecode(encoded)
-        if name != config_name and not any(name == p or name.startswith(p + "/") for p in roots[1:]):
+        if name != config_name and member_root(name, roots) is None:
             continue
         path = os.path.join("/", name)
         try:
@@ -187,30 +248,42 @@ def rollback_new(member_file: str, collision_file: str, config: str, state: str,
 
 
 def main() -> None:
-    if len(sys.argv) < 6 or sys.argv[1] not in {"validate", "members0", "collisions0", "destinations", "skip-links0", "rollback-new", "copy-source"}:
-        raise SystemExit(2)
-    mode, archive, config, state, tls = sys.argv[1:6]
-    if mode == "copy-source":
-        if len(sys.argv) != 7:
+    if sys.argv[1:2] == ["stage-check"]:
+        if len(sys.argv) != 3:
             raise SystemExit(2)
-        copy_source(archive, sys.argv[6])
+        stage_check(sys.argv[2])
+        return
+    if sys.argv[1:2] == ["space-check"]:
+        if len(sys.argv) not in {4, 5}:
+            raise SystemExit(2)
+        space_check(sys.argv[2], sys.argv[3], sys.argv[4] if len(sys.argv) == 5 else None)
+        return
+    if len(sys.argv) < 4 or sys.argv[1] not in {"validate", "validate-created", "members0", "collisions0", "destinations", "skip-links0", "rollback-new", "copy-source"}:
+        raise SystemExit(2)
+    mode, archive, config = sys.argv[1:4]
+    rest = sys.argv[4:]
+    if mode == "copy-source":
+        if len(rest) < 1:
+            raise SystemExit(2)
+        copy_source(archive, rest[-1])
         return
     if mode == "rollback-new":
-        if len(sys.argv) != 8:
+        if len(rest) < 3:
             raise SystemExit(2)
-        raise SystemExit(rollback_new(sys.argv[6], sys.argv[7], config, state, tls))
-    names = validate_archive(archive, config, state, tls)
+        raise SystemExit(rollback_new(rest[-2], rest[-1], config, rest[:-2]))
+    roots = rest[:-1] if mode in {"destinations", "skip-links0"} else rest
+    names = validate_archive(archive, config, roots, require_root_config=mode != "validate-created" or os.geteuid() == 0)
     if mode == "destinations":
-        if len(sys.argv) != 7:
+        if not rest:
             raise SystemExit(2)
-        validate_destinations(names, sys.argv[6], config, state, tls)
+        validate_destinations(names, rest[-1], config, roots)
     if mode == "skip-links0":
-        if len(sys.argv) != 7:
+        if not rest:
             raise SystemExit(2)
-        for name in validate_destinations(names, sys.argv[6], config, state, tls):
+        for name in validate_destinations(names, rest[-1], config, roots):
             sys.stdout.buffer.write(os.fsencode(name) + b"\0")
     if mode in {"members0", "collisions0"}:
-        write_names(names, mode)
+        write_names(names, mode, config, roots)
 
 
 if __name__ == "__main__":

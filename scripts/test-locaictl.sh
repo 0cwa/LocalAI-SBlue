@@ -115,11 +115,18 @@ export LOCALAI_FAKE_LOG="$tmp_dir/commands"
 export LOCALAI_FAKE_STATE_DIR="$tmp_dir/service-state"
 export LOCALAI_FAKE_LOCK_FILE="$tmp_dir/backup.lock"
 export XDG_RUNTIME_DIR="$tmp_dir"
+export LOCALAI_TEST_BACKUP_STAGE_DIR="$tmp_dir/restore-stage"
 mkdir -p "$LOCALAI_FAKE_STATE_DIR"
 export LOCALAI_ID_BIN="$tmp_dir/id"
 export LOCALAI_JOURNALCTL_BIN="$tmp_dir/journalctl"
 export LOCALAI_SYSTEM_UNIT_DIR="$tmp_dir/systemd"
 export HOME="$tmp_dir/home"
+mkdir -m 0700 "$LOCALAI_TEST_BACKUP_STAGE_DIR"
+python3 "$repo_root/lib/backup_archive.py" stage-check "$LOCALAI_TEST_BACKUP_STAGE_DIR"
+if python3 "$repo_root/lib/backup_archive.py" stage-check /run >/dev/null 2>&1; then
+  printf 'restore staging accepted a memory-backed filesystem\n' >&2
+  exit 1
+fi
 
 # Exercise the elevated-command helpers with both effective privilege states.
 # shellcheck disable=SC1090
@@ -353,7 +360,8 @@ rg -q 'start localai-tls-forward.socket' "$tmp_dir/commands"
 # Backup and restore exercise real tar metadata operations against disposable
 # paths while service-manager commands remain mocked.
 unset LOCALAI_FAKE_FAIL_TLS
-mkdir -p "$tmp_dir/backup-state" "$tmp_dir/backup-tls" "$tmp_dir/backup-config-dir"
+mkdir -p "$tmp_dir/backup-state" "$tmp_dir/backup-tls" "$tmp_dir/backup-cache" "$tmp_dir/backup-config-dir"
+chmod 0710 "$tmp_dir/backup-state"
 printf 'active\n' >"$LOCALAI_FAKE_STATE_DIR/backend"
 printf 'state fixture\n' >"$tmp_dir/backup-state/database.db"
 chmod 0640 "$tmp_dir/backup-state/database.db"
@@ -367,12 +375,20 @@ PY
 ln -s database.db "$tmp_dir/backup-state/database-current"
 printf 'tls fixture\n' >"$tmp_dir/backup-tls/ca.key"
 printf 'preserve this\n' >"$tmp_dir/backup-state/unrelated.txt"
-printf 'LOCALAI_STATE_DIR=%s\nLOCALAI_TLS_STATE_DIR=%s\nLOCALAI_MODELS_PATH=%s\nLOCALAI_TLS_ENABLED=false\n' \
-  "$tmp_dir/backup-state" "$tmp_dir/backup-tls" "$tmp_dir/backup-state/models" >"$tmp_dir/backup-config-dir/localai.conf"
+printf 'external cache fixture\n' >"$tmp_dir/backup-cache/cache.db"
+printf 'LOCALAI_STATE_DIR=%s\nLOCALAI_MODELS_PATH=%s\nLOCALAI_BACKENDS_PATH=%s/backends\nLOCALAI_DOWNLOAD_STAGING_PATH=%s/downloading\nLOCALAI_BACKEND_TEMP_DIR=%s/tmp\nLOCALAI_DATA_PATH=%s/data\nLOCALAI_CONFIG_DIR=%s/config\nLOCALAI_GENERATED_CONTENT_PATH=%s/generated\nLOCALAI_UPLOAD_PATH=%s/uploads\nLOCALAI_CACHE_DIR=%s\nLOCALAI_LOG_DIR=%s/logs\nLOCALAI_TLS_STATE_DIR=%s\nLOCALAI_TLS_CONFIG_DIR=%s/caddy\nLOCALAI_TLS_CACHE_DIR=%s/cache\nLOCALAI_TLS_CERT_DIR=%s/certs\nLOCALAI_TLS_COMPOSE_DIR=%s/compose\nLOCALAI_TLS_ENABLED=false\n' \
+  "$tmp_dir/backup-state" "$tmp_dir/backup-state/models" "$tmp_dir/backup-state" "$tmp_dir/backup-state" "$tmp_dir/backup-state" "$tmp_dir/backup-state" "$tmp_dir/backup-state" "$tmp_dir/backup-state" "$tmp_dir/backup-state" "$tmp_dir/backup-cache" "$tmp_dir/backup-state" "$tmp_dir/backup-tls" "$tmp_dir/backup-tls" "$tmp_dir/backup-tls" "$tmp_dir/backup-tls" "$tmp_dir/backup-tls" >"$tmp_dir/backup-config-dir/localai.conf"
 mkdir -p "$tmp_dir/backup-state/models"
 printf 'model fixture\n' >"$tmp_dir/backup-state/models/model.bin"
 export LOCALAI_CONFIG_FILE="$tmp_dir/backup-config-dir/localai.conf"
-export LOCALAI_TAR_BIN=/usr/bin/tar
+cat >"$tmp_dir/tar-test" <<'EOF'
+#!/usr/bin/env bash
+args=()
+for arg in "$@"; do [[ "$arg" == --same-owner ]] || args+=("$arg"); done
+exec /usr/bin/tar "${args[@]}"
+EOF
+chmod 0755 "$tmp_dir/tar-test"
+export LOCALAI_TAR_BIN="$tmp_dir/tar-test"
 cat >"$tmp_dir/matchpathcon" <<'EOF'
 #!/usr/bin/env bash
 printf 'matchpathcon %s\n' "$*" >>"${LOCALAI_FAKE_LOG:?}"
@@ -380,12 +396,45 @@ printf 'matchpathcon %s\n' "$*" >>"${LOCALAI_FAKE_LOG:?}"
 EOF
 chmod 0755 "$tmp_dir/matchpathcon"
 export LOCALAI_MATCHPATHCON_BIN="$tmp_dir/matchpathcon"
+cat >"$tmp_dir/restorecon" <<'EOF'
+#!/usr/bin/env bash
+printf 'restorecon %s\n' "$*" >>"${LOCALAI_FAKE_LOG:?}"
+EOF
+chmod 0755 "$tmp_dir/restorecon"
+export LOCALAI_RESTORECON_BIN="$tmp_dir/restorecon"
 : >"$tmp_dir/commands"
+rm -f "$tmp_dir/systemd/localai-tls-forward.socket"
 backup_archive="$tmp_dir/backup.tar.gz"
 if ! "$repo_root/bin/localaictl" backup --exclude-models "$backup_archive" 2>"$tmp_dir/backup-warning"; then
   cat "$tmp_dir/backup-warning" >&2
+  cat "$tmp_dir/commands" >&2
   exit 1
 fi
+# The test's unprivileged run0 shim cannot restore a root-owned config. Verify
+# strict validation rejects its user-owned config, then omit that member from
+# the state-only round-trip fixture. Real root-owned config restore needs VM proof.
+if python3 "$repo_root/lib/backup_archive.py" validate "$backup_archive" "$tmp_dir/backup-config-dir/localai.conf" \
+  "$tmp_dir/backup-state" "$tmp_dir/backup-tls" "$tmp_dir/backup-cache" >/dev/null 2>&1; then
+  printf 'archive validator accepted a non-root-owned configuration member\n' >&2
+  exit 1
+fi
+python3 - "$backup_archive" "$tmp_dir/backup-config-dir/localai.conf" <<'PY'
+import os, sys, tarfile, tempfile
+archive_path, config_path = sys.argv[1:]
+fd, rewritten = tempfile.mkstemp(dir=os.path.dirname(archive_path))
+os.close(fd)
+try:
+    with tarfile.open(archive_path, 'r:gz') as source, tarfile.open(rewritten, 'w:gz', format=tarfile.PAX_FORMAT) as target:
+        for info in source:
+            if info.name == config_path.lstrip('/'):
+                continue
+            data = source.extractfile(info) if info.isfile() else None
+            target.addfile(info, data)
+    os.chmod(rewritten, 0o600)
+    os.replace(rewritten, archive_path)
+finally:
+    if os.path.exists(rewritten): os.unlink(rewritten)
+PY
 [[ "$(stat -c '%a' "$backup_archive")" == 600 ]]
 rg -q 'TLS CA private key' "$tmp_dir/backup-warning"
 archive_metadata="$(/usr/bin/tar -xOzf "$backup_archive" metadata)"
@@ -393,6 +442,10 @@ rg -q '^backend_image=' <<<"$archive_metadata"
 rg -q '^backend_digest=' <<<"$archive_metadata"
 if /usr/bin/tar -tzf "$backup_archive" | rg -q 'models/model.bin'; then
   printf 'models were included despite --exclude-models\n' >&2
+  exit 1
+fi
+if ! /usr/bin/tar -tzf "$backup_archive" | rg -q 'backup-cache/cache.db'; then
+  printf 'configured persistent data outside the main state root was omitted\n' >&2
   exit 1
 fi
 if "$repo_root/bin/localaictl" backup "$tmp_dir/backup-state/inside.tar.gz" >/dev/null 2>&1; then
@@ -414,6 +467,113 @@ PY
 stop_count_before="$(rg -c ' stop localai.service$' "$tmp_dir/commands" || true)"
 if "$repo_root/bin/localaictl" restore --yes "$malicious_archive" >/dev/null 2>&1; then
   printf 'restore accepted a traversal symbolic link\n' >&2
+  exit 1
+fi
+stop_count_after="$(rg -c ' stop localai.service$' "$tmp_dir/commands" || true)"
+[[ "$stop_count_before" == "$stop_count_after" ]]
+for entry_type in directory symlink; do
+  invalid_config_archive="$tmp_dir/invalid-config-$entry_type.tar.gz"
+  python3 - "$invalid_config_archive" "$tmp_dir/backup-config-dir/localai.conf" "$entry_type" <<'PY'
+import sys, tarfile
+archive_path, config_path, entry_type = sys.argv[1:]
+with tarfile.open(archive_path, 'w:gz') as archive:
+    metadata = tarfile.TarInfo('metadata')
+    metadata.size = 3
+    import io
+    archive.addfile(metadata, io.BytesIO(b'v=1'))
+    config = tarfile.TarInfo(config_path.lstrip('/'))
+    if entry_type == 'directory':
+        config.type = tarfile.DIRTYPE
+    else:
+        config.type = tarfile.SYMTYPE
+        config.linkname = 'outside'
+    archive.addfile(config)
+PY
+  if "$repo_root/bin/localaictl" restore --yes "$invalid_config_archive" >/dev/null 2>&1; then
+    printf 'restore accepted a configuration member of type %s\n' "$entry_type" >&2
+    exit 1
+  fi
+done
+unsafe_config_archive="$tmp_dir/unsafe-config-mode.tar.gz"
+python3 - "$unsafe_config_archive" "$tmp_dir/backup-config-dir/localai.conf" <<'PY'
+import io, sys, tarfile
+archive_path, config_path = sys.argv[1:]
+with tarfile.open(archive_path, 'w:gz') as archive:
+    metadata = tarfile.TarInfo('metadata')
+    metadata.size = 3
+    archive.addfile(metadata, io.BytesIO(b'v=1'))
+    config = tarfile.TarInfo(config_path.lstrip('/'))
+    config.mode = 0o666
+    config.size = 3
+    archive.addfile(config, io.BytesIO(b'x=1'))
+PY
+if "$repo_root/bin/localaictl" restore --yes "$unsafe_config_archive" >/dev/null 2>&1; then
+  printf 'restore accepted a group/world-writable configuration member\n' >&2
+  exit 1
+fi
+cross_root_archive="$tmp_dir/cross-root-link.tar.gz"
+python3 - "$cross_root_archive" "$tmp_dir/backup-state" "$tmp_dir/backup-tls" <<'PY'
+import io, sys, tarfile
+archive_path, state, tls = sys.argv[1:]
+with tarfile.open(archive_path, 'w:gz') as archive:
+    metadata = tarfile.TarInfo('metadata')
+    metadata.size = 3
+    archive.addfile(metadata, io.BytesIO(b'v=1'))
+    root = tarfile.TarInfo(state.lstrip('/'))
+    root.type = tarfile.DIRTYPE
+    archive.addfile(root)
+    link = tarfile.TarInfo(state.lstrip('/') + '/cross-root')
+    link.type = tarfile.SYMTYPE
+    link.linkname = tls + '/ca.key'
+    archive.addfile(link)
+PY
+if "$repo_root/bin/localaictl" restore --yes "$cross_root_archive" >/dev/null 2>&1; then
+  printf 'restore accepted a symbolic link crossing configured persistent roots\n' >&2
+  exit 1
+fi
+stop_count_after="$(rg -c ' stop localai.service$' "$tmp_dir/commands" || true)"
+[[ "$stop_count_before" == "$stop_count_after" ]]
+for unsafe_kind in setuid capability; do
+  unsafe_archive="$tmp_dir/unsafe-$unsafe_kind.tar.gz"
+  python3 - "$unsafe_archive" "$tmp_dir/backup-state" "$unsafe_kind" <<'PY'
+import io, sys, tarfile
+archive_path, state, unsafe_kind = sys.argv[1:]
+with tarfile.open(archive_path, 'w:gz', format=tarfile.PAX_FORMAT) as archive:
+    metadata = tarfile.TarInfo('metadata')
+    metadata.size = 3
+    archive.addfile(metadata, io.BytesIO(b'v=1'))
+    root = tarfile.TarInfo(state.lstrip('/'))
+    root.type = tarfile.DIRTYPE
+    root.mode = 0o755
+    archive.addfile(root)
+    member = tarfile.TarInfo(state.lstrip('/') + '/privileged')
+    member.size = 1
+    if unsafe_kind == 'setuid':
+        member.mode = 0o4755
+    else:
+        member.mode = 0o755
+        member.pax_headers['SCHILY.xattr.security.capability'] = 'cap_setuid=ep'
+    archive.addfile(member, io.BytesIO(b'x'))
+PY
+  if "$repo_root/bin/localaictl" restore --yes "$unsafe_archive" >/dev/null 2>&1; then
+    printf 'restore accepted a %s executable entry\n' "$unsafe_kind" >&2
+    exit 1
+  fi
+done
+non_directory_root_archive="$tmp_dir/non-directory-root.tar.gz"
+python3 - "$non_directory_root_archive" "$tmp_dir/backup-state" <<'PY'
+import io, sys, tarfile
+archive_path, state = sys.argv[1:]
+with tarfile.open(archive_path, 'w:gz') as archive:
+    metadata = tarfile.TarInfo('metadata')
+    metadata.size = 3
+    archive.addfile(metadata, io.BytesIO(b'v=1'))
+    root = tarfile.TarInfo(state.lstrip('/'))
+    root.size = 1
+    archive.addfile(root, io.BytesIO(b'x'))
+PY
+if "$repo_root/bin/localaictl" restore --yes "$non_directory_root_archive" >/dev/null 2>&1; then
+  printf 'restore accepted a non-directory persistent root member\n' >&2
   exit 1
 fi
 stop_count_after="$(rg -c ' stop localai.service$' "$tmp_dir/commands" || true)"
@@ -473,7 +633,42 @@ if not sent or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
 PY
 [[ "$(<"$tmp_dir/backup-state/database.db")" == 'state fixture' ]]
 printf 'damaged state\n' >"$tmp_dir/backup-state/database.db"
+printf 'damaged external cache\n' >"$tmp_dir/backup-cache/cache.db"
+chmod 0755 "$tmp_dir/backup-state"
 "$repo_root/bin/localaictl" restore --yes "$backup_archive" >"$tmp_dir/restore-output"
+[[ "$(stat -c '%a' "$tmp_dir/backup-state")" == 710 ]]
+restore_config_dir="$tmp_dir/restore-config"
+mkdir -m 0700 "$restore_config_dir"
+restore_config_path="$restore_config_dir/localai.conf"
+printf 'LOCALAI_STATE_DIR=%s\nLOCALAI_MODELS_PATH=%s/models\nLOCALAI_BACKENDS_PATH=%s/backends\nLOCALAI_DOWNLOAD_STAGING_PATH=%s/downloading\nLOCALAI_BACKEND_TEMP_DIR=%s/tmp\nLOCALAI_DATA_PATH=%s/data\nLOCALAI_CONFIG_DIR=%s/config\nLOCALAI_GENERATED_CONTENT_PATH=%s/generated\nLOCALAI_UPLOAD_PATH=%s/uploads\nLOCALAI_CACHE_DIR=%s\nLOCALAI_LOG_DIR=%s/logs\nLOCALAI_TLS_STATE_DIR=%s\nLOCALAI_TLS_CONFIG_DIR=%s/caddy\nLOCALAI_TLS_CACHE_DIR=%s/cache\nLOCALAI_TLS_CERT_DIR=%s/certs\nLOCALAI_TLS_COMPOSE_DIR=%s/compose\nLOCALAI_TLS_ENABLED=false\n' \
+  "$tmp_dir/backup-state" "$tmp_dir/backup-state" "$tmp_dir/backup-state" "$tmp_dir/backup-state" "$tmp_dir/backup-state" "$tmp_dir/backup-state" "$tmp_dir/backup-state" "$tmp_dir/backup-state" "$tmp_dir/backup-state" "$tmp_dir/backup-cache" "$tmp_dir/backup-state" "$tmp_dir/backup-tls" "$tmp_dir/backup-tls" "$tmp_dir/backup-tls" "$tmp_dir/backup-tls" "$tmp_dir/backup-tls" >"$restore_config_path"
+config_archive="$tmp_dir/root-owned-config.tar.gz"
+python3 - "$config_archive" "$restore_config_path" <<'PY'
+import io, sys, tarfile
+archive_path, config_path = sys.argv[1:]
+with tarfile.open(archive_path, 'w:gz') as archive:
+    metadata = tarfile.TarInfo('metadata')
+    metadata.size = 3
+    archive.addfile(metadata, io.BytesIO(b'v=1'))
+    config = tarfile.TarInfo(config_path.lstrip('/'))
+    config.uid = 0
+    config.gid = 0
+    config.mode = 0o600
+    config.size = 18
+    archive.addfile(config, io.BytesIO(b'LOCALAI_AUTH=false'))
+PY
+cat >"$tmp_dir/cp-config-test" <<'EOF'
+#!/usr/bin/env bash
+if [[ " $* " == *" ${LOCALAI_TEST_CONFIG_DEST:?} "* ]]; then
+  exec /usr/bin/cp -a --no-preserve=ownership "${@:3}"
+fi
+exec /usr/bin/cp "$@"
+EOF
+chmod 0755 "$tmp_dir/cp-config-test"
+export LOCALAI_TEST_CONFIG_DEST="$restore_config_path"
+export LOCALAI_CP_BIN="$tmp_dir/cp-config-test"
+LOCALAI_CONFIG_FILE="$restore_config_path" "$repo_root/bin/localaictl" restore --yes "$config_archive" >"$tmp_dir/config-restore-output"
+unset LOCALAI_CP_BIN LOCALAI_TEST_CONFIG_DEST
 [[ "$(<"$tmp_dir/backup-state/database.db")" == 'state fixture' ]]
 [[ "$(stat -c '%a' "$tmp_dir/backup-state/database.db")" == 640 ]]
 python3 - "$tmp_dir/backup-state/database.db" <<'PY'
@@ -484,9 +679,12 @@ except OSError:
     pass
 PY
 [[ "$(<"$tmp_dir/backup-tls/ca.key")" == 'tls fixture' ]]
+[[ "$(<"$tmp_dir/backup-cache/cache.db")" == 'external cache fixture' ]]
 [[ "$(readlink "$tmp_dir/backup-state/database-current")" == database.db ]]
 rg -q '^matchpathcon -V ' "$tmp_dir/commands"
-if rg -q '^restorecon ' "$tmp_dir/commands"; then
+rg -q "^restorecon -F -- $restore_config_path$" "$tmp_dir/commands"
+rg -q "^matchpathcon -V $restore_config_path$" "$tmp_dir/commands"
+if rg -q '^restorecon .*backup-(state|tls|cache)' "$tmp_dir/commands"; then
   printf 'restore recursively relabeled persistent state\n' >&2
   exit 1
 fi
@@ -550,5 +748,30 @@ if [[ "$(<"$LOCALAI_FAKE_STATE_DIR/backend")" != active ]]; then
   cat "$tmp_dir/commands" >&2
   exit 1
 fi
+
+# TLS is disabled in config, but previously installed managed units remain
+# part of the state snapshot. Refuse unowned units before stopping anything.
+tls_unit_dir="$tmp_dir/backup-tls/.config/systemd/user"
+mkdir -p "$tls_unit_dir" "$tmp_dir/systemd"
+printf '# unrelated unit\n' >"$tls_unit_dir/localai-tls-compose.service"
+: >"$tmp_dir/commands"
+stale_archive="$tmp_dir/stale-tls.tar.gz"
+if "$repo_root/bin/localaictl" backup "$stale_archive" >/dev/null 2>&1; then
+  printf 'backup accepted an unowned TLS unit while TLS was disabled\n' >&2
+  exit 1
+fi
+if rg -q ' stop localai' "$tmp_dir/commands"; then
+  printf 'backup stopped a service before verifying TLS unit ownership\n' >&2
+  exit 1
+fi
+printf '# Managed by LocalAI secureblue TLS installer.\n' >"$tls_unit_dir/localai-tls-compose.service"
+printf '# Managed by LocalAI secureblue TLS installer.\n' >"$tmp_dir/systemd/localai-tls-forward.socket"
+printf '# Managed by LocalAI secureblue TLS installer.\n' >"$tmp_dir/systemd/localai-tls-forward.service"
+: >"$tmp_dir/commands"
+"$repo_root/bin/localaictl" backup "$stale_archive" >"$tmp_dir/stale-backup-output" 2>"$tmp_dir/stale-backup-warning"
+backend_start_line="$(rg -n ' start localai.service$' "$tmp_dir/commands" | tail -n1 | cut -d: -f1)"
+tls_start_line="$(rg -n ' start localai-tls-compose.service$' "$tmp_dir/commands" | tail -n1 | cut -d: -f1)"
+socket_start_line="$(rg -n ' start localai-tls-forward.socket' "$tmp_dir/commands" | tail -n1 | cut -d: -f1)"
+(( backend_start_line < tls_start_line && tls_start_line < socket_start_line ))
 
 printf 'localaictl tests passed\n'
