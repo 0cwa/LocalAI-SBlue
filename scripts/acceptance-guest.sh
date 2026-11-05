@@ -11,6 +11,7 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$repo_root/lib/acceptance.sh"
 
 host_receipt_ready=0
+rootless_poc_dir=''
 fail() {
   printf 'acceptance: %s\n' "$*" >&2
   if [[ "${host_receipt_ready:-0}" == 1 ]]; then printf 'acceptance: %s\n' "$*" >>"$receipt"; fi
@@ -92,6 +93,154 @@ service_podman() {
     --setenv=PATH=/usr/bin:/bin -- /usr/bin/podman "$@"
 }
 
+rootless_archive_roundtrip_poc() {
+  local receipt_path="${LOCALAI_ACCEPTANCE_RECEIPT:-}" probe_script result status=0 uid
+  [[ -n "$receipt_path" && -f "$receipt_path" && ! -L "$receipt_path" ]] || return 1
+  # shellcheck disable=SC1091
+  # shellcheck source=../lib/config.sh
+  source "$repo_root/lib/config.sh"
+  localai_config_load_compat /etc/localai/localai.conf "$repo_root/localai/localai.lock" || return 1
+  [[ -d "$LOCALAI_STATE_DIR" && ! -L "$LOCALAI_STATE_DIR" ]] || return 1
+  rootless_poc_dir="$(mktemp -d "$LOCALAI_STATE_DIR/.localaictl-unshare-poc.XXXXXX")" || return 1
+  uid="$(id -u localai)" || return 1
+  chown localai:localai "$rootless_poc_dir" || return 1
+  chmod 0700 "$rootless_poc_dir" || return 1
+  probe_script="$rootless_poc_dir/probe.py"
+  cat >"$probe_script" <<'PY'
+import os
+import pathlib
+import subprocess
+import sys
+
+def stop(category):
+    print(f"poc: {category}")
+    raise SystemExit(0)
+
+try:
+    base = pathlib.Path(sys.argv[1])
+    source = base / "source"
+    target = base / "target"
+    source.mkdir(mode=0o700)
+    target.mkdir(mode=0o700)
+    fixture = source / "setgid-fixture"
+    fixture.write_bytes(b"synthetic-backup-roundtrip")
+    subgid_ranges = []
+    for row in pathlib.Path("/etc/subgid").read_text(encoding="ascii").splitlines():
+        fields = row.split(":")
+        if len(fields) == 3 and fields[0] == "localai" and fields[1].isdigit() and fields[2].isdigit():
+            subgid_ranges.append((int(fields[1]), int(fields[1]) + int(fields[2])))
+    mapped_gid = None
+    for row in pathlib.Path("/proc/self/gid_map").read_text(encoding="ascii").splitlines():
+        inside, outside, length = map(int, row.split())
+        for start, end in subgid_ranges:
+            host_gid = max(outside, start)
+            if host_gid < min(outside + length, end):
+                mapped_gid = inside + host_gid - outside
+                break
+        if mapped_gid is not None:
+            break
+    if mapped_gid is None or mapped_gid == 0:
+        stop("subgid-map-unavailable")
+    fixture.chown(0, mapped_gid)
+    fixture.chmod(0o2750)
+    os.setxattr(fixture, "user.issue20-probe", b"synthetic-xattr")
+    try:
+        source_selinux = os.getxattr(fixture, "security.selinux")
+    except OSError:
+        source_selinux = None
+    archive = base / "fixture.tar"
+    create = subprocess.run([
+        "/usr/bin/tar", "--create", "--file", str(archive), "--xattrs", "--acls", "--selinux",
+        "--numeric-owner", "--directory", str(source), ".",
+    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if create.returncode:
+        stop("tar-create-failed")
+    extract = subprocess.run([
+        "/usr/bin/tar", "--extract", "--file", str(archive), "--xattrs", "--acls", "--selinux",
+        "--numeric-owner", "--same-owner", "--same-permissions", "--directory", str(target),
+    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if extract.returncode:
+        stop("tar-extract-failed")
+    restored = target / "setgid-fixture"
+    expected = fixture.stat()
+    actual = restored.stat()
+    if (expected.st_uid, expected.st_gid, expected.st_mode & 0o7777) != (actual.st_uid, actual.st_gid, actual.st_mode & 0o7777):
+        stop("owner-mode-failed")
+    if os.getxattr(fixture, "user.issue20-probe") != os.getxattr(restored, "user.issue20-probe"):
+        stop("user-xattr-failed")
+    if source_selinux is None:
+        stop("selinux-source-unavailable")
+    if os.getxattr(restored, "security.selinux") != source_selinux:
+        stop("selinux-label-failed")
+    print("poc: namespace-owner-mode-pass")
+    print("poc: user-xattr-pass")
+    print("poc: selinux-label-pass")
+except SystemExit:
+    raise
+except BaseException as error:
+    known = {"PermissionError", "FileNotFoundError", "OSError", "ValueError", "OverflowError", "TypeError", "KeyError", "RuntimeError"}
+    print("poc: python-" + (type(error).__name__ if type(error).__name__ in known else "other"))
+    raise SystemExit(0)
+PY
+  chmod 0644 "$probe_script" || { rm -rf -- "$rootless_poc_dir"; return 1; }
+  chown localai:localai "$probe_script" || { rm -rf -- "$rootless_poc_dir"; return 1; }
+  if result="$(service_podman unshare /usr/bin/python3 "$probe_script" "$rootless_poc_dir" 2>&1)"; then
+    status=0
+  else
+    status=$?
+  fi
+  if [[ "$result" == *'poc: namespace-owner-mode-pass'* ]]; then
+    printf 'diagnostic graphroot-unshare-owner-mode: pass\n' >>"$receipt_path"
+  else
+    printf 'diagnostic graphroot-unshare-owner-mode: fail\n' >>"$receipt_path"
+  fi
+  if [[ "$result" == *'poc: user-xattr-pass'* ]]; then
+    printf 'diagnostic graphroot-unshare-xattr: pass\n' >>"$receipt_path"
+  else
+    printf 'diagnostic graphroot-unshare-xattr: fail\n' >>"$receipt_path"
+  fi
+  if [[ "$result" == *'poc: selinux-label-pass'* ]]; then
+    printf 'diagnostic graphroot-unshare-selinux: pass\n' >>"$receipt_path"
+  elif [[ "$result" == *'poc: selinux-source-unavailable'* ]]; then
+    printf 'diagnostic graphroot-unshare-selinux: unavailable\n' >>"$receipt_path"
+  else
+    printf 'diagnostic graphroot-unshare-selinux: fail\n' >>"$receipt_path"
+  fi
+  if (( status != 0 )) || [[ "$result" != *'poc: namespace-owner-mode-pass'* || "$result" != *'poc: user-xattr-pass'* || "$result" != *'poc: selinux-label-pass'* ]]; then
+    unset result
+    rm -rf -- "$rootless_poc_dir"
+    return 1
+  fi
+  local host_uid host_gid host_mode
+  host_uid="$(stat -c %u -- "$rootless_poc_dir/target/setgid-fixture")" || status=1
+  host_gid="$(stat -c %g -- "$rootless_poc_dir/target/setgid-fixture")" || status=1
+  host_mode="$(stat -c %a -- "$rootless_poc_dir/target/setgid-fixture")" || status=1
+  if (( status == 0 )) && [[ "$host_uid" == "$uid" && "$host_mode" == 2750 ]] &&
+     python3 - "$host_gid" <<'PY'
+import sys
+gid = int(sys.argv[1])
+for row in open("/etc/subgid", encoding="ascii"):
+    fields = row.rstrip("\n").split(":")
+    if len(fields) == 3 and fields[0] == "localai" and fields[1].isdigit() and fields[2].isdigit():
+        start, length = int(fields[1]), int(fields[2])
+        if start <= gid < start + length:
+            raise SystemExit(0)
+raise SystemExit(1)
+PY
+  then
+    printf 'diagnostic graphroot-unshare-host-mapping: pass\n' >>"$receipt_path"
+    unset result
+    rm -rf -- "$rootless_poc_dir"
+    rootless_poc_dir=''
+    return 0
+  fi
+  printf 'diagnostic graphroot-unshare-host-mapping: fail\n' >>"$receipt_path"
+  unset result
+  rm -rf -- "$rootless_poc_dir"
+  rootless_poc_dir=''
+  return 1
+}
+
 unrelated_container_matches() {
   local run_id="$1" actual
   [[ "$run_id" =~ ^[a-f0-9]{32}$ ]] || return 2
@@ -143,7 +292,7 @@ if [[ "${1:-}" == --set-unit-enabled && "$#" == 2 ]]; then
 fi
 
 phase="${1:-}"
-[[ "$#" == 1 && ( "$phase" == install || "$phase" == verify || "$phase" == diagnose-backup ) ]] || fail 'expected install, verify, or backup diagnostic phase.'
+[[ "$#" == 1 && ( "$phase" == install || "$phase" == verify || "$phase" == diagnose-backup || "$phase" == --rootless-archive-roundtrip ) ]] || fail 'expected install, verify, or backup diagnostic phase.'
 umask 077
 if [[ "$mode" == host ]]; then
   work="$host_state/work"
@@ -163,7 +312,12 @@ else
   progress=''
   receipt="$work/receipt"
   : >"$receipt"
-  trap 'cat "$receipt"; rm -rf -- "$work"' EXIT
+  trap 'cat "$receipt"; [[ -z "${rootless_poc_dir:-}" ]] || rm -rf -- "$rootless_poc_dir"; rm -rf -- "$work"' EXIT
+fi
+
+if [[ "$phase" == --rootless-archive-roundtrip ]]; then
+  rootless_archive_roundtrip_poc
+  exit $?
 fi
 
 step() {
@@ -181,6 +335,7 @@ step() {
     container-running) description='podman inspect managed container running state' ;;
     doctor) description='localaictl doctor (HTTP 200 or 401)' ;;
     first-admin-bootstrap) description='VM first administrator and guarded socket ordering' ;;
+    rootless-archive-roundtrip) description='podman unshare tar round trip for setgid ownership, xattrs, and SELinux labels' ;;
     create-unrelated-container) description='podman create unrelated test container' ;;
     upgrade-disabled-running|upgrade-enabled-running|upgrade-enabled-stopped|upgrade-disabled-stopped)
       description='backend installer --yes --no-pull' ;;
@@ -514,6 +669,9 @@ if [[ "$phase" == install ]]; then
   check fresh-idle inactive disabled
 else
   check after-reboot-idle inactive disabled
+  if [[ "$mode" == vm ]]; then
+    step rootless-archive-roundtrip 180 env LOCALAI_ACCEPTANCE_RECEIPT="$receipt" "$0" --rootless-archive-roundtrip
+  fi
   step explicit-start 300 "$controller" start
   check explicit-start-state active disabled
   step status 30 "$controller" status --elevated

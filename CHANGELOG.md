@@ -19,6 +19,12 @@ has been runtime-qualified on secureblue or on a GPU.
   active user unit definitions.
 - Install the backup archive helper beside the tray controller so installed
   tray backup and restore commands work outside the source checkout.
+- Store rootless Podman GraphRoot as a separately validated nested archive,
+  create and extract it through the LocalAI user namespace, and roll back by
+  same-filesystem no-replace renames with identity-checked cleanup.
+- Include configured external GraphRoots, check backup/restore capacity on
+  their actual filesystems, and refuse restores when the installed graph path
+  or subordinate UID/GID mappings differ from the archive.
 
 ## 0.2.0
 

@@ -43,6 +43,29 @@ fi
 if [[ "${1:-}" == /usr/bin/python3 && "${2:-}" == /etc/localai/bootstrap-guard.py ]]; then
   exit 0
 fi
+if [[ "${1:-}" == /usr/bin/systemd-run ]]; then
+  shift
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      --user|--wait|--pipe|--collect|--quiet) shift ;;
+      --machine=*|--setenv=*) shift ;;
+      --) shift; break ;;
+      *) exit 96 ;;
+    esac
+  done
+  if [[ "${1:-}" == /usr/bin/podman && "${2:-}" == info ]]; then
+    printf '%s/nonexistent-graphroot\n' "${LOCALAI_FAKE_STATE_DIR:?}"
+    exit 0
+  fi
+  if [[ "${1:-}" == /usr/bin/podman && "${2:-}" == unshare ]]; then
+    printf '0:1001:1;1:100000:65536\n0:1001:1;1:200000:65536\n'
+    exit 0
+  fi
+  if [[ "${1:-}" == /usr/bin/podman && "${2:-}" == ps ]]; then
+    exit 0
+  fi
+  exit 96
+fi
 if [[ "${1:-}" == /usr/bin/rm ]]; then
   for target in "$@"; do
     if [[ "$target" == "$LOCALAI_RESTORE_STAGE_BASE"/* ]]; then
@@ -563,6 +586,188 @@ for service_root, unit in ((state, "localai.service"), (tls, "localai-tls-compos
 system_unit = f"{state.lstrip('/')}/.config/systemd/system/evil.service"
 if not has_systemd_tree(system_unit, "system", roots):
     raise SystemExit("configured-root system manager unit tree was not rejected")
+PY
+PYTHONDONTWRITEBYTECODE=1 python3 - "$repo_root/lib" <<'PY'
+import builtins
+import contextlib
+import io
+import pwd
+import grp
+import os
+import stat
+import sys
+import tempfile
+from types import SimpleNamespace
+from unittest.mock import patch
+
+sys.path.insert(0, sys.argv[1])
+import backup_archive as helper
+
+uid_map = "0:1001:1;1:200000:65536"
+gid_map = "0:1001:1;1:300000:65536"
+rootless_path = "/var/lib/localai/.local/share/containers/storage"
+original_open = builtins.open
+
+def fixture_open(filename, *args, **kwargs):
+    if filename == "/etc/subuid":
+        return io.StringIO("localai:200000:65536\n")
+    if filename == "/etc/subgid":
+        return io.StringIO("localai:300000:65536\n")
+    return original_open(filename, *args, **kwargs)
+
+def make_archive(entries):
+    output = io.BytesIO()
+    with helper.tarfile.open(fileobj=output, mode="w:") as archive:
+        for info, payload in entries:
+            info.uid = info.uid or 0
+            info.gid = info.gid or 0
+            if payload is None:
+                archive.addfile(info)
+            else:
+                info.size = len(payload)
+                archive.addfile(info, io.BytesIO(payload))
+    return output.getvalue()
+
+def directory(name, mode=0o700, uid=0, gid=0):
+    info = helper.tarfile.TarInfo(name)
+    info.type = helper.tarfile.DIRTYPE
+    info.mode, info.uid, info.gid = mode, uid, gid
+    return info, None
+
+def regular(name, payload=b"fixture", mode=0o600, uid=1, gid=1, pax=None):
+    info = helper.tarfile.TarInfo(name)
+    info.mode, info.uid, info.gid = mode, uid, gid
+    info.pax_headers = pax or {}
+    return info, payload
+
+def validate(raw, uid_value=uid_map, gid_value=gid_map):
+    with patch.object(pwd, "getpwnam", return_value=SimpleNamespace(pw_uid=1001)), \
+         patch.object(grp, "getgrnam", return_value=SimpleNamespace(gr_gid=1001)), \
+         patch.object(builtins, "open", side_effect=fixture_open):
+        return helper.validate_graphroot_tar(io.BytesIO(raw), rootless_path, uid_map, gid_map,
+                                             uid_value, gid_value, "localai")
+
+def rejects(raw, uid_value=uid_map, gid_value=gid_map):
+    with contextlib.redirect_stderr(io.StringIO()):
+        try:
+            validate(raw, uid_value, gid_value)
+        except SystemExit:
+            return
+    raise SystemExit("unsafe nested graphroot archive was accepted")
+
+valid = make_archive([
+    directory("storage/"),
+    regular("storage/overlay/layer/diff/tool", b"synthetic", mode=0o2750),
+])
+if "storage/overlay/layer/diff/tool" not in validate(valid):
+    raise SystemExit("nested graphroot archive member was not validated")
+rejects(valid, "0:1002:1;1:200000:65536")
+rejects(make_archive([directory("storage/"), regular("storage/../outside")]))
+rejects(make_archive([directory("storage/"), regular("storage/cap", pax={"SCHILY.xattr.security.capability": "synthetic"})]))
+fifo = helper.tarfile.TarInfo("storage/fifo")
+fifo.type = helper.tarfile.FIFOTYPE
+fifo.uid = fifo.gid = 1
+rejects(make_archive([directory("storage/"), (fifo, None)]))
+hardlink = helper.tarfile.TarInfo("storage/hardlink")
+hardlink.type = helper.tarfile.LNKTYPE
+hardlink.linkname = "storage/overlay/layer/diff/tool"
+hardlink.uid, hardlink.gid, hardlink.mode = 1, 1, 0o2750
+rejects(make_archive([directory("storage/"), regular("storage/overlay/layer/diff/tool", mode=0o2750), (hardlink, None)]))
+rejects(valid + b"unvalidated")
+
+with tempfile.TemporaryDirectory(prefix="graphroot-rename-", dir=os.environ["TMPDIR"]) as parent:
+    source = os.path.join(parent, "store")
+    destination = os.path.join(parent, "store.rollback")
+    os.mkdir(source, 0o700)
+    with open(os.path.join(source, "payload"), "w", encoding="ascii") as stream:
+        stream.write("synthetic")
+    helper.rename_graphroot_noreplace(source, destination)
+    if os.path.exists(source) or not os.path.isfile(os.path.join(destination, "payload")):
+        raise SystemExit("rootless graphroot no-replace rename did not preserve the tree")
+    device, inode = os.stat(destination).st_dev, os.stat(destination).st_ino
+    with contextlib.redirect_stderr(io.StringIO()):
+        try:
+            helper.remove_graphroot_nofollow(destination, device, inode + 1)
+        except SystemExit:
+            pass
+        else:
+            raise SystemExit("rootless graphroot removal accepted a mismatched inode")
+    sentinel = os.path.join(parent, "outside")
+    with open(sentinel, "w", encoding="ascii") as stream:
+        stream.write("keep")
+    os.symlink(sentinel, os.path.join(destination, "outside-link"))
+    helper.remove_graphroot_nofollow(destination, device, inode)
+    if not os.path.isfile(sentinel):
+        raise SystemExit("rootless graphroot cleanup followed a symbolic link")
+    os.unlink(sentinel)
+
+with tempfile.TemporaryDirectory(prefix="graphroot-outer-", dir=os.environ["TMPDIR"]) as outer:
+    os.chmod(outer, 0o700)
+    graphroot = os.path.join(outer, "storage")
+    os.mkdir(graphroot, 0o700)
+    uid, gid = os.getuid(), os.getgid()
+    context = {"graphroot": graphroot, "uid_map": f"0:{uid}:1;1:200000:65536",
+               "gid_map": f"0:{gid}:1;1:300000:65536", "service_home": outer,
+               "service_uid": uid, "service_gid": gid, "service_user": "localai"}
+    config = os.path.join(outer, "localai.conf")
+    with open(config, "w", encoding="ascii") as stream:
+        stream.write("synthetic config\n")
+    os.chmod(config, 0o600)
+    archive_path = os.path.join(outer, "backup.tar.gz")
+    metadata_text = ("format=2\nbackend_image=synthetic\nbackend_digest=sha256:synthetic\n"
+                     f"graphroot={graphroot}\nuid_map={context['uid_map']}\ngid_map={context['gid_map']}\n")
+    outer_members = [(helper.tarfile.TarInfo("metadata"), metadata_text.encode())]
+    outer_members[0][0].mode = 0o600
+    outer_members += [(helper.tarfile.TarInfo(outer.lstrip("/") + "/"), None),
+                      (helper.tarfile.TarInfo(config.lstrip("/")), b"synthetic config\n")]
+    outer_members[-1][0].mode = 0o600
+    outer_members[-1][0].uid, outer_members[-1][0].gid = uid, gid
+    nested_info = helper.tarfile.TarInfo(helper.ROOTLESS_GRAPHROOT_MEMBER)
+    nested_info.mode, nested_info.uid, nested_info.gid = 0o600, 0, 0
+    outer_members.append((nested_info, valid))
+    outer_raw = io.BytesIO()
+    with helper.tarfile.open(fileobj=outer_raw, mode="w:gz") as bundle:
+        for info, payload in outer_members:
+            if payload is not None:
+                info.size = len(payload)
+                bundle.addfile(info, io.BytesIO(payload))
+            else:
+                info.type = helper.tarfile.DIRTYPE
+                info.mode = 0o700
+                info.uid, info.gid = uid, gid
+                bundle.addfile(info)
+    with open(archive_path, "wb") as stream:
+        stream.write(outer_raw.getvalue())
+    actual_lstat = os.lstat
+    def fixture_lstat(path, *args, **kwargs):
+        path = os.fspath(path)
+        info = actual_lstat(path, *args, **kwargs)
+        if path in {outer, graphroot}:
+            return info
+        fields = list(info)
+        fields[0] = stat.S_IFDIR | 0o755
+        fields[4], fields[5] = 0, 0
+        return os.stat_result(fields)
+    with patch.object(pwd, "getpwnam", return_value=SimpleNamespace(pw_uid=uid)), \
+         patch.object(grp, "getgrnam", return_value=SimpleNamespace(gr_gid=gid)), \
+         patch.object(builtins, "open", side_effect=fixture_open), \
+         patch.object(helper.os, "lstat", side_effect=fixture_lstat), \
+         patch.object(helper.os, "listxattr", return_value=[]), \
+         patch.object(helper, "graphroot_mounts", return_value=[]):
+        names = helper.validate_archive(archive_path, config, [outer], require_root_config=False,
+                                        rootless_context=context)
+        if helper.ROOTLESS_GRAPHROOT_MEMBER in names:
+            raise SystemExit("nested graphroot tar was included in ordinary restore paths")
+        helper.space_check(archive_path, outer, destinations=[outer], rootless_context=context)
+        bad_context = dict(context, graphroot=os.path.join(outer, "other-storage"))
+        with contextlib.redirect_stderr(io.StringIO()):
+            try:
+                helper.validate_archive(archive_path, config, [outer], require_root_config=False,
+                                        rootless_context=bad_context)
+            except SystemExit:
+                pass
+            else:
+                raise SystemExit("nested graphroot archive accepted a different live destination")
 PY
 stop_count_before="$(rg -c ' stop localai.service$' "$tmp_dir/commands" || true)"
 if LOCALAI_FAKE_WRONG_TLS_UNIT_OWNER=true "$repo_root/bin/localaictl" backup "$tmp_dir/wrong-tls-owner.tar.gz" >/dev/null 2>&1; then

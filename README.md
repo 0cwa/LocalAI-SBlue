@@ -348,6 +348,19 @@ records the configured backend and TLS image references and digests. Use
 `backup --exclude-models` to leave the configured models directory out of the
 archive; restoring such an archive leaves any existing models untouched. The
 archive is created with mode `0600`.
+Backup checks free bytes and inodes on both the private staging filesystem and
+the archive destination, combining needs when they share a filesystem. The
+estimate treats sparse files conservatively and may require space for their
+expanded size.
+
+When rootless Podman storage exists, backup stores it as a separate nested
+archive created in the LocalAI account's `podman unshare` namespace. The
+controller checks that the LocalAI account has no running containers before
+reading or replacing that store. A GraphRoot outside the other persistent paths
+is included as its own persistent root. GraphRoot mountpoints, nested mounts,
+unsafe ancestry, or overlap with host user service-unit trees cause backup or
+restore to stop before changing state. `--exclude-models` is refused if the
+configured models path overlaps GraphRoot.
 
 Backups contain the TLS CA private key and the LocalAI authentication database.
 Store them as sensitive data. Restore into matching configured paths. It
@@ -360,6 +373,16 @@ explicitly confirm the overlay:
 ```sh
 bin/localaictl restore --yes /path/to/localai-backup.tar.gz
 ```
+
+For a nested rootless GraphRoot, `--yes` also confirms replacing the complete
+GraphRoot. Restore requires the matching GraphRoot to already exist and its
+effective path plus UID/GID namespace mappings to match the backup. This binds
+the backup to an installation with the same LocalAI subordinate ID mapping;
+restoring it onto a host with different mappings is refused. Restore moves the
+old GraphRoot aside on the same filesystem, extracts the validated inner tar
+using `podman unshare`, and returns the old tree if restore fails. The inner
+archive is never extracted as host root. Existing service unit trees remain
+required on the destination host as described below.
 
 Restore preserves archived ownership and SELinux xattrs, normalizes and checks
 the configuration file label, verifies labels on configured persistent roots,

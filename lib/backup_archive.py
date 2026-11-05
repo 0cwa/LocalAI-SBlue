@@ -10,6 +10,12 @@ import stat
 import sys
 import tarfile
 import hashlib
+import pwd
+import grp
+import json
+import ctypes
+
+ROOTLESS_GRAPHROOT_MEMBER = "rootless-graphroot.tar"
 
 
 def fail(message: str) -> None:
@@ -31,12 +37,437 @@ def member_root(name: str, roots: list[str]) -> str | None:
     return max(matches, key=len) if matches else None
 
 
-def validate_archive(archive: str, config: str, roots: list[str], *, require_root_config: bool = True) -> list[str]:
+def read_metadata(archive: tarfile.TarFile) -> dict[str, str]:
+    members = [info for info in archive if clean_member_name(info.name) == "metadata"]
+    if len(members) != 1 or not members[0].isfile():
+        fail("backup metadata is missing")
+    stream = archive.extractfile(members[0])
+    if stream is None:
+        fail("backup metadata is unreadable")
+    try:
+        raw = stream.read(1024 * 1024 + 1)
+        if len(raw) > 1024 * 1024:
+            fail("backup metadata is too large")
+        lines = raw.decode("ascii").splitlines()
+    except (OSError, UnicodeError):
+        fail("backup metadata is invalid")
+    values: dict[str, str] = {}
+    for line in lines:
+        if "=" not in line:
+            fail("backup metadata is invalid")
+        key, value = line.split("=", 1)
+        if not key or key in values:
+            fail("backup metadata is invalid")
+        values[key] = value
+    return values
+
+
+def read_rootless_context(filename: str) -> dict[str, str | int]:
+    try:
+        fd = os.open(filename, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        metadata = os.fstat(fd)
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid() or
+                stat.S_IMODE(metadata.st_mode) != 0o600):
+            os.close(fd)
+            fail("verified rootless service context has unsafe ownership or mode")
+        with os.fdopen(fd, "r", encoding="ascii") as stream:
+            context = json.load(stream)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        fail("cannot read the verified rootless service context")
+    required = {"graphroot", "uid_map", "gid_map", "service_home", "service_uid", "service_gid", "service_user"}
+    if not isinstance(context, dict) or set(context) != required:
+        fail("verified rootless service context is incomplete")
+    if any(not isinstance(context[key], str) or not context[key] for key in required - {"service_uid", "service_gid"}):
+        fail("verified rootless service context is invalid")
+    if any(not isinstance(context[key], int) or context[key] < 0 for key in ("service_uid", "service_gid")):
+        fail("verified rootless service context is invalid")
+    for key in ("graphroot", "service_home"):
+        value = str(context[key])
+        if not value.startswith("/") or os.path.normpath(value) != value or "\n" in value or "\r" in value:
+            fail("verified rootless service context is invalid")
+    if not str(context["service_user"]).isidentifier():
+        fail("verified rootless service context is invalid")
+    return context
+
+
+def parse_id_map(value: str) -> list[tuple[int, int, int]]:
+    result: list[tuple[int, int, int]] = []
+    for row in value.split(";"):
+        fields = row.split(":")
+        if len(fields) != 3 or not all(field.isdecimal() for field in fields):
+            fail("rootless backup contains an invalid user namespace map")
+        inside, outside, length = (int(field) for field in fields)
+        if length < 1 or inside < 0 or outside < 0:
+            fail("rootless backup contains an invalid user namespace map")
+        result.append((inside, outside, length))
+    if not result:
+        fail("rootless backup contains an invalid user namespace map")
+    return result
+
+
+def subid_ranges(account: str, filename: str) -> tuple[list[tuple[int, int]], list[tuple[str, int, int]]]:
+    own: list[tuple[int, int]] = []
+    all_ranges: list[tuple[str, int, int]] = []
+    try:
+        with open(filename, encoding="ascii") as stream:
+            for line in stream:
+                fields = line.rstrip("\n").split(":")
+                if len(fields) != 3 or not fields[1].isdecimal() or not fields[2].isdecimal():
+                    fail("cannot verify rootless subordinate ID ranges")
+                start, length = int(fields[1]), int(fields[2])
+                if length < 1:
+                    fail("cannot verify rootless subordinate ID ranges")
+                all_ranges.append((fields[0], start, start + length))
+                if fields[0] == account:
+                    own.append((start, start + length))
+    except OSError:
+        fail("cannot verify rootless subordinate ID ranges")
+    return own, all_ranges
+
+
+def validate_id_map(value: str, primary_id: int, account: str, filename: str) -> list[tuple[int, int, int]]:
+    mapping = parse_id_map(value)
+    if mapping[0][0] != 0 or mapping[0][1] != primary_id or mapping[0][2] != 1:
+        fail("rootless namespace does not map its owner to the service account")
+    own_ranges, all_ranges = subid_ranges(account, filename)
+    account_file = "/etc/passwd" if filename.endswith("subuid") else "/etc/group"
+    try:
+        with open(account_file, encoding="ascii") as stream:
+            for line in stream:
+                fields = line.rstrip("\n").split(":")
+                if len(fields) > 2 and fields[2].isdecimal():
+                    identity = int(fields[2])
+                    if any(start <= identity < stop for start, stop in own_ranges):
+                        fail("rootless namespace subordinate IDs collide with a local account")
+    except OSError:
+        fail("cannot verify local account ID ranges")
+    expected_inside = 1
+    outside_ranges: list[tuple[int, int]] = []
+    for inside, outside, length in mapping[1:]:
+        if inside != expected_inside:
+            fail("rootless namespace mapping is not contiguous")
+        expected_inside += length
+        end = outside + length
+        if not any(start <= outside and end <= stop for start, stop in own_ranges):
+            fail("rootless namespace maps IDs outside the service subordinate range")
+        for other, start, stop in all_ranges:
+            if other != account and outside < stop and start < end:
+                fail("rootless namespace ID ranges overlap another account")
+        if any(outside < stop and start < end for start, stop in outside_ranges):
+            fail("rootless namespace ID ranges overlap")
+        outside_ranges.append((outside, end))
+    return mapping
+
+
+def mapped_id(value: int, mapping: list[tuple[int, int, int]]) -> bool:
+    return any(inside <= value < inside + length for inside, _outside, length in mapping)
+
+
+def graphroot_mounts(graphroot: str, mountinfo: str = "/proc/self/mountinfo") -> list[str]:
+    mounted: list[str] = []
+    try:
+        with open(mountinfo, encoding="ascii") as stream:
+            for line in stream:
+                fields = line.split(" - ", 1)[0].split()
+                if len(fields) < 5:
+                    fail("cannot verify rootless graphroot mount state")
+                target = fields[4]
+                for escaped, actual in (("\\040", " "), ("\\011", "\t"), ("\\134", "\\")):
+                    target = target.replace(escaped, actual)
+                if target == graphroot or target.startswith(graphroot.rstrip("/") + "/"):
+                    mounted.append(target)
+    except OSError:
+        fail("cannot verify rootless graphroot mount state")
+    return mounted
+
+
+def validate_graphroot_path(
+    graphroot: str,
+    service_home: str,
+    service_uid: int,
+    service_gid: int,
+    roots: list[str],
+) -> None:
+    if not graphroot.startswith("/") or graphroot == "/" or os.path.normpath(graphroot) != graphroot:
+        fail("configured rootless graphroot path is unsafe")
+    if not any(graphroot == root or graphroot.startswith(root.rstrip("/") + "/") for root in roots):
+        fail("configured rootless graphroot is outside the persistent backup roots")
+    under_home = graphroot == service_home or graphroot.startswith(service_home.rstrip("/") + "/")
+    persistent_matches = [root for root in roots if graphroot == root or graphroot.startswith(root.rstrip("/") + "/")]
+    external_root = max(persistent_matches, key=len) if persistent_matches else None
+    if not under_home and external_root is None:
+        fail("configured external rootless graphroot is not a persistent path")
+    graphroot_exists = os.path.lexists(graphroot)
+    if os.path.realpath(graphroot) != graphroot:
+        fail("configured rootless graphroot path contains a symbolic link")
+    current = graphroot if graphroot_exists else os.path.dirname(graphroot)
+    chain: list[str] = []
+    while current != "/":
+        chain.append(current)
+        current = os.path.dirname(current)
+    chain.append("/")
+    home_chain = set()
+    if under_home:
+        current = graphroot if graphroot_exists else os.path.dirname(graphroot)
+        while current != service_home:
+            home_chain.add(current)
+            current = os.path.dirname(current)
+        home_chain.add(service_home)
+    private_chain = set()
+    if not under_home and external_root is not None:
+        current = graphroot if graphroot_exists else os.path.dirname(graphroot)
+        while current != external_root:
+            private_chain.add(current)
+            current = os.path.dirname(current)
+        private_chain.add(external_root)
+    for path in reversed(chain):
+        try:
+            info = os.lstat(path)
+        except OSError:
+            fail("configured rootless graphroot ancestry cannot be verified")
+        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            fail("configured rootless graphroot ancestry is not a directory")
+        if info.st_mode & 0o022:
+            fail("configured rootless graphroot ancestry is group/world writable")
+        try:
+            names = os.listxattr(path, follow_symlinks=False)
+            if any(name in {"system.posix_acl_access", "system.posix_acl_default"} for name in names):
+                fail("configured rootless graphroot ancestry has an ACL")
+        except OSError:
+            fail("configured rootless graphroot ACLs cannot be verified")
+        if path == graphroot:
+            continue
+        if path in home_chain or path in private_chain:
+            if info.st_uid != service_uid or stat.S_IMODE(info.st_mode) & 0o077:
+                fail("configured rootless graphroot service-home ancestry is public")
+        elif path != "/" and info.st_uid != 0:
+            fail("configured rootless graphroot ancestry has an unexpected owner")
+    if graphroot_exists:
+        try:
+            root_info = os.lstat(graphroot)
+        except OSError:
+            fail("configured rootless graphroot is unavailable")
+        if not stat.S_ISDIR(root_info.st_mode) or (root_info.st_uid, root_info.st_gid) != (service_uid, service_gid) or stat.S_IMODE(root_info.st_mode) & 0o077:
+            fail("configured rootless graphroot has unsafe owner or mode")
+    if graphroot_mounts(graphroot):
+        fail("configured rootless graphroot contains a mount point")
+
+
+def open_directory_nofollow(path: str) -> int:
+    if not path.startswith("/") or os.path.normpath(path) != path:
+        fail("rootless graphroot parent path is unsafe")
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open("/", flags)
+    try:
+        for component in path.split("/")[1:]:
+            if not component:
+                continue
+            next_fd = os.open(component, flags, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+        return fd
+    except OSError:
+        os.close(fd)
+        fail("rootless graphroot parent contains an unsafe path component")
+
+
+def rename_graphroot_noreplace(source: str, destination: str, expected: tuple[int, int] | None = None) -> None:
+    if (not source.startswith("/") or not destination.startswith("/") or
+            os.path.normpath(source) != source or os.path.normpath(destination) != destination or
+            os.path.dirname(source) != os.path.dirname(destination)):
+        fail("rootless graphroot rename paths are invalid")
+    source_name = os.path.basename(source)
+    destination_name = os.path.basename(destination)
+    if source_name in {"", ".", ".."} or destination_name in {"", ".", ".."}:
+        fail("rootless graphroot rename paths are invalid")
+    try:
+        parent_fd = open_directory_nofollow(os.path.dirname(source))
+    except OSError:
+        fail("rootless graphroot rename source or parent is unsafe")
+    try:
+        try:
+            source_info = os.stat(source_name, dir_fd=parent_fd, follow_symlinks=False)
+        except OSError:
+            fail("rootless graphroot rename source or parent is unsafe")
+        if not stat.S_ISDIR(source_info.st_mode) or stat.S_ISLNK(source_info.st_mode):
+            fail("rootless graphroot rename source is not a directory")
+        if expected is not None and (source_info.st_dev, source_info.st_ino) != expected:
+            fail("rootless graphroot rollback identity does not match")
+        try:
+            os.stat(destination_name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            fail("rootless graphroot rollback destination already exists")
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = libc.renameat2
+        renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        renameat2.restype = ctypes.c_int
+        result = renameat2(parent_fd, os.fsencode(source_name), parent_fd, os.fsencode(destination_name), 1)
+        if result != 0:
+            error_number = ctypes.get_errno()
+            fail("rootless graphroot no-replace rename failed" if error_number != 17 else "rootless graphroot rollback destination already exists")
+    finally:
+        os.close(parent_fd)
+
+
+def create_graphroot_noreplace(path: str, service_uid: int, service_gid: int) -> None:
+    if not path.startswith("/") or os.path.normpath(path) != path:
+        fail("rootless graphroot creation path is invalid")
+    parent = os.path.dirname(path)
+    name = os.path.basename(path)
+    if name in {"", ".", ".."}:
+        fail("rootless graphroot creation path is invalid")
+    try:
+        parent_fd = open_directory_nofollow(parent)
+        os.mkdir(name, 0o700, dir_fd=parent_fd)
+        os.chown(name, service_uid, service_gid, dir_fd=parent_fd, follow_symlinks=False)
+    except FileExistsError:
+        fail("rootless graphroot destination already exists")
+    except OSError:
+        fail("rootless graphroot destination could not be created safely")
+    finally:
+        if "parent_fd" in locals():
+            os.close(parent_fd)
+
+
+def remove_tree_at(parent_fd: int, name: str) -> None:
+    try:
+        metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if stat.S_ISDIR(metadata.st_mode):
+        child_fd = os.open(
+            name,
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_fd,
+        )
+        try:
+            child_metadata = os.fstat(child_fd)
+            if (child_metadata.st_dev, child_metadata.st_ino) != (metadata.st_dev, metadata.st_ino):
+                fail("rootless graphroot changed during safe removal")
+            for child in os.listdir(child_fd):
+                remove_tree_at(child_fd, child)
+        finally:
+            os.close(child_fd)
+        try:
+            os.rmdir(name, dir_fd=parent_fd)
+        except OSError:
+            fail("rootless graphroot changed during safe removal")
+    else:
+        try:
+            os.unlink(name, dir_fd=parent_fd)
+        except OSError:
+            fail("rootless graphroot changed during safe removal")
+
+
+def remove_graphroot_nofollow(path: str, expected_device: int, expected_inode: int) -> None:
+    if not path.startswith("/") or os.path.normpath(path) != path:
+        fail("rootless graphroot removal path is invalid")
+    parent_fd = open_directory_nofollow(os.path.dirname(path))
+    try:
+        name = os.path.basename(path)
+        metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(metadata.st_mode) or (metadata.st_dev, metadata.st_ino) != (expected_device, expected_inode):
+            fail("rootless graphroot removal identity does not match")
+        if graphroot_mounts(path):
+            fail("rootless graphroot removal contains a mount point")
+        remove_tree_at(parent_fd, name)
+    finally:
+        os.close(parent_fd)
+
+
+def validate_graphroot_tar(
+    archive_file: object,
+    graphroot: str,
+    uid_map_value: str,
+    gid_map_value: str,
+    live_uid_map_value: str,
+    live_gid_map_value: str,
+    service_user: str,
+) -> list[str]:
+    try:
+        passwd_entry = pwd.getpwnam(service_user)
+        group_entry = grp.getgrnam(service_user)
+    except KeyError:
+        fail("cannot verify the rootless service account")
+    if parse_id_map(uid_map_value) != parse_id_map(live_uid_map_value):
+        fail("rootless archive UID mapping differs from the installed service")
+    if parse_id_map(gid_map_value) != parse_id_map(live_gid_map_value):
+        fail("rootless archive GID mapping differs from the installed service")
+    uid_map = validate_id_map(uid_map_value, passwd_entry.pw_uid, service_user, "/etc/subuid")
+    gid_map = validate_id_map(gid_map_value, group_entry.gr_gid, service_user, "/etc/subgid")
+    prefix = os.path.basename(graphroot.rstrip("/"))
+    members: dict[str, tarfile.TarInfo] = {}
+    try:
+        with tarfile.open(fileobj=archive_file, mode="r:") as nested:
+            for info in nested:
+                name = clean_member_name(info.name)
+                if name != prefix and not name.startswith(prefix + "/"):
+                    fail("rootless archive contains a path outside its graphroot")
+                relative = name[len(prefix):].lstrip("/")
+                if name in members:
+                    fail("rootless archive contains duplicate member names")
+                if not (info.isfile() or info.isdir() or info.issym() or info.islnk()):
+                    fail("rootless archive contains an unsupported special file")
+                if not mapped_id(info.uid, uid_map) or not mapped_id(info.gid, gid_map):
+                    fail("rootless archive contains an unmapped owner or group")
+                if info.mode & 0o4000 and info.uid == 0:
+                    fail("rootless archive has setuid ownership mapped to the service account")
+                if info.mode & 0o2000 and info.gid == 0:
+                    fail("rootless archive has setgid ownership mapped to the service group")
+                if any(key.lower().endswith("security.capability") and value for key, value in info.pax_headers.items()):
+                    fail("rootless archive contains a file capability xattr")
+                if info.issym():
+                    link = info.linkname
+                    if "\x00" in link or "\n" in link or "\r" in link:
+                        fail("rootless archive contains an unsafe symbolic link")
+                    if not link.startswith("/"):
+                        resolved = posixpath.normpath(posixpath.join(posixpath.dirname(relative), link))
+                        if resolved == ".." or resolved.startswith("../"):
+                            fail("rootless archive contains a symbolic link escaping its graphroot")
+                members[name] = info
+            trailing = nested.fileobj.read(10241)
+            if len(trailing) > 10240 or any(trailing):
+                fail("rootless archive contains unvalidated trailing data")
+    except (OSError, tarfile.TarError) as error:
+        fail(f"cannot read rootless graphroot archive ({type(error).__name__})")
+    root = members.get(prefix)
+    if root is None or not root.isdir() or root.uid != 0 or root.gid != 0 or root.mode & 0o077:
+        fail("rootless archive graphroot root is missing or not a directory")
+    for name, info in members.items():
+        if info.islnk():
+            target = clean_member_name(info.linkname)
+            target_info = members.get(target)
+            if target_info is None or not target_info.isfile():
+                fail("rootless archive contains an invalid hard link")
+            if (info.uid, info.gid, info.mode) != (target_info.uid, target_info.gid, target_info.mode):
+                fail("rootless archive hard link metadata differs from its target")
+            if info.mode & 0o6000 or target_info.mode & 0o6000:
+                fail("rootless archive has a hard link to a privileged member")
+        parent = posixpath.dirname(name)
+        while parent:
+            if parent in members and not members[parent].isdir():
+                fail("rootless archive nests a member below a non-directory entry")
+            parent = posixpath.dirname(parent)
+    return sorted(members)
+
+
+def validate_archive(
+    archive: str,
+    config: str,
+    roots: list[str],
+    *,
+    require_root_config: bool = True,
+    rootless_context: dict[str, str | int] | None = None,
+) -> list[str]:
     config_name = config.lstrip("/")
     prefixes = [p.lstrip("/").rstrip("/") for p in roots]
     if any(not p for p in prefixes) or len(set(prefixes)) != len(prefixes):
         fail("configured backup paths must be distinct absolute paths")
+    graphroot_prefix = None if rootless_context is None else str(rootless_context["graphroot"]).lstrip("/").rstrip("/")
     members: dict[str, tarfile.TarInfo] = {}
+    nested_member: tarfile.TarInfo | None = None
     try:
         fd = os.open(archive, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         if not stat.S_ISREG(os.fstat(fd).st_mode):
@@ -45,8 +476,15 @@ def validate_archive(archive: str, config: str, roots: list[str], *, require_roo
         with os.fdopen(fd, "rb") as stream, tarfile.open(fileobj=stream, mode="r:gz") as source:
             for info in source:
                 name = clean_member_name(info.name)
-                if name in members:
+                if name in members or (nested_member is not None and name == ROOTLESS_GRAPHROOT_MEMBER):
                     fail("backup contains duplicate member names")
+                if name == ROOTLESS_GRAPHROOT_MEMBER:
+                    if not info.isfile() or info.uid != 0 or info.gid != 0 or info.mode & 0o6077:
+                        fail("backup rootless graphroot archive member is unsafe")
+                    nested_member = info
+                    continue
+                if graphroot_prefix and (name == graphroot_prefix or name.startswith(graphroot_prefix + "/")):
+                    fail("backup stores rootless graphroot outside its nested archive")
                 if has_systemd_tree(name, "system", roots):
                     fail("backup contains system manager unit configuration")
                 if name != "metadata" and name != config_name and member_root(name, prefixes) is None:
@@ -91,6 +529,43 @@ def validate_archive(archive: str, config: str, roots: list[str], *, require_roo
                 fail("backup contains an invalid hard link")
     if "metadata" not in members or not members["metadata"].isfile():
         fail("backup metadata is missing")
+    if nested_member is not None:
+        if rootless_context is None:
+            fail("backup rootless graphroot archive has no verified service context")
+        if not os.path.isdir(str(rootless_context["graphroot"])) or os.path.islink(str(rootless_context["graphroot"])):
+            fail("backup rootless graphroot destination is unavailable")
+        with tarfile.open(archive, "r:gz") as source:
+            metadata = read_metadata(source)
+            expected_metadata = {
+                "graphroot": str(rootless_context["graphroot"]),
+                "uid_map": str(rootless_context["uid_map"]),
+                "gid_map": str(rootless_context["gid_map"]),
+            }
+            if any(metadata.get(key) != value for key, value in expected_metadata.items()):
+                fail("backup rootless service settings differ from the installed service")
+            if metadata.get("format") != "2":
+                fail("backup rootless graphroot format is unsupported")
+            validate_graphroot_path(
+                expected_metadata["graphroot"],
+                str(rootless_context["service_home"]),
+                int(rootless_context["service_uid"]),
+                int(rootless_context["service_gid"]),
+                roots,
+            )
+            stream = source.extractfile(nested_member)
+            if stream is None:
+                fail("backup rootless graphroot archive is unreadable")
+            validate_graphroot_tar(
+                stream,
+                expected_metadata["graphroot"],
+                expected_metadata["uid_map"],
+                expected_metadata["gid_map"],
+                str(rootless_context["uid_map"]),
+                str(rootless_context["gid_map"]),
+                str(rootless_context["service_user"]),
+            )
+    elif rootless_context is not None and os.path.lexists(str(rootless_context["graphroot"])):
+        fail("backup omits the installed rootless graphroot")
     return list(members)
 
 
@@ -177,9 +652,14 @@ def directory_metadata_not_weaker(staged: str, installed: str) -> bool:
 
 
 def unit_trees(
-    archive_path: str, stage: str, config: str, roots: list[str], expected_roots: list[str]
+    archive_path: str,
+    stage: str,
+    config: str,
+    roots: list[str],
+    expected_roots: list[str],
+    rootless_context: dict[str, str | int] | None = None,
 ) -> list[str]:
-    names = validate_archive(archive_path, config, roots)
+    names = validate_archive(archive_path, config, roots, rootless_context=rootless_context)
     directories: dict[str, set[str]] = {}
     archive_prefixes = {systemd_tree_prefix(name, "user", expected_roots) for name in names}
     for index, root in enumerate(expected_roots):
@@ -275,6 +755,90 @@ def nearest_existing_path(path: str) -> str:
         current = parent
 
 
+def backup_space_check(
+    archive_path: str,
+    stage: str,
+    graphroot: str,
+    roots: list[str],
+    exclude_path: str | None = None,
+) -> None:
+    payload = 0
+    entries = 0
+    nested_payload = 0
+    nested_entries = 0
+
+    def scan_tree(path: str, *, skip: list[str]) -> tuple[int, int, int]:
+        total = 0
+        count = 0
+        headers = 0
+        if any(path == ignored or path.startswith(ignored.rstrip("/") + "/") for ignored in skip):
+            return total, count, headers
+        if not os.path.lexists(path):
+            return total, count, headers
+        def walk_error(_error: OSError) -> None:
+            fail("cannot estimate backup storage requirements")
+
+        for current, directories, files in os.walk(path, topdown=True, onerror=walk_error, followlinks=False):
+            directories[:] = [name for name in directories if not any(
+                os.path.join(current, name) == ignored or os.path.join(current, name).startswith(ignored.rstrip("/") + "/")
+                for ignored in skip
+            )]
+            for name in [*directories, *files]:
+                member = os.path.join(current, name)
+                if any(member == ignored or member.startswith(ignored.rstrip("/") + "/") for ignored in skip):
+                    continue
+                try:
+                    info = os.lstat(member)
+                    count += 1
+                    path_blocks = (len(os.fsencode(member)) + 511) // 512
+                    headers += max(1024, (path_blocks + 1) * 512)
+                    if stat.S_ISREG(info.st_mode):
+                        total += info.st_size
+                    elif stat.S_ISLNK(info.st_mode):
+                        total += len(os.fsencode(os.readlink(member)))
+                    for attr in os.listxattr(member, follow_symlinks=False):
+                        total += len(os.getxattr(member, attr, follow_symlinks=False))
+                except OSError:
+                    fail("cannot estimate backup storage requirements")
+        return total, count, headers
+
+    for root in roots:
+        if root == graphroot:
+            continue
+        skips = [path for path in (graphroot, exclude_path) if path]
+        current_size, current_count, current_headers = scan_tree(root, skip=skips)
+        payload += current_size
+        entries += current_count
+        payload += current_headers
+    nested_payload, nested_entries, nested_headers = scan_tree(graphroot, skip=[])
+    nested_size = nested_payload + nested_headers + 10240
+    outer_size = payload + entries * 1024 + nested_size + 10240
+    archive_size = outer_size + outer_size // 100 + 1024 * 1024
+    stage_size = nested_size + 1024 * 1024
+    by_fs: dict[tuple[int, int], dict[str, int]] = {}
+
+    def charge(path: str, amount: int, inodes: int) -> None:
+        probe = nearest_existing_path(path)
+        filesystem = os.statvfs(probe)
+        metadata = os.stat(probe, follow_symlinks=False)
+        key = (metadata.st_dev, int(getattr(filesystem, "f_fsid", metadata.st_dev)))
+        usage = by_fs.setdefault(key, {"path": probe, "bytes": 0, "inodes": 0,
+                                      "free_inodes": filesystem.f_favail, "total_inodes": filesystem.f_files})
+        usage["bytes"] += amount
+        usage["inodes"] += inodes
+
+    try:
+        charge(stage, stage_size, 1)
+        charge(archive_path, archive_size, 0)
+    except OSError:
+        fail("cannot inspect backup destination filesystems")
+    for usage in by_fs.values():
+        if shutil.disk_usage(usage["path"]).free < usage["bytes"]:
+            fail("insufficient disk space for backup staging and archive output")
+        if usage["total_inodes"] and usage["free_inodes"] < usage["inodes"] + 8:
+            fail("insufficient free inodes for backup staging")
+
+
 def space_check(
     archive_path: str,
     stage: str,
@@ -282,6 +846,7 @@ def space_check(
     destinations: list[str] | None = None,
     *,
     staged: bool = False,
+    rootless_context: dict[str, str | int] | None = None,
 ) -> None:
     archive_size = os.stat(archive_path, follow_symlinks=False).st_size
     expanded = 0
@@ -385,6 +950,24 @@ def space_check(
                 archive_members = {clean_member_name(info.name): info for info in archive}
             for name, info in archive_members.items():
                 if name == "metadata":
+                    continue
+                if name == ROOTLESS_GRAPHROOT_MEMBER:
+                    if rootless_context is None:
+                        fail("cannot estimate an unverified rootless graphroot restore")
+                    with tarfile.open(archive_path, "r:gz") as outer:
+                        nested_stream = outer.extractfile(info)
+                        if nested_stream is None:
+                            fail("cannot estimate rootless graphroot restore size")
+                        with tarfile.open(fileobj=nested_stream, mode="r:") as nested:
+                            graphroot = str(rootless_context["graphroot"])
+                            prefix = posixpath.basename(graphroot.rstrip("/"))
+                            for nested_info in nested:
+                                nested_name = clean_member_name(nested_info.name)
+                                if nested_name != prefix and not nested_name.startswith(prefix + "/"):
+                                    fail("rootless archive contains a path outside its graphroot")
+                                relative = nested_name[len(prefix):].lstrip("/")
+                                target = graphroot if not relative else os.path.join(graphroot, *relative.split("/"))
+                                charge_tree(target.lstrip("/"), nested_info.size if nested_info.isfile() else None)
                     continue
                 size = info.size if info.isfile() else None
                 if info.islnk():
@@ -521,6 +1104,45 @@ def rollback_new(member_file: str, collision_file: str, config: str, roots: list
 
 
 def main() -> None:
+    if sys.argv[1:2] == ["backup-space-check"]:
+        if len(sys.argv) < 6:
+            raise SystemExit(2)
+        archive_path, stage, graphroot = sys.argv[2:5]
+        rest = sys.argv[5:]
+        exclude_path = None
+        if "--exclude-models" in rest:
+            index = rest.index("--exclude-models")
+            if index + 1 >= len(rest):
+                raise SystemExit(2)
+            exclude_path = rest[index + 1]
+            del rest[index:index + 2]
+        backup_space_check(archive_path, stage, graphroot, rest, exclude_path)
+        return
+    if sys.argv[1:2] == ["graphroot-rename"]:
+        if len(sys.argv) != 4:
+            raise SystemExit(2)
+        rename_graphroot_noreplace(sys.argv[2], sys.argv[3])
+        return
+    if sys.argv[1:2] == ["graphroot-rename-expected"]:
+        if len(sys.argv) != 6:
+            raise SystemExit(2)
+        rename_graphroot_noreplace(sys.argv[2], sys.argv[3], (int(sys.argv[4]), int(sys.argv[5])))
+        return
+    if sys.argv[1:2] == ["graphroot-create"]:
+        if len(sys.argv) != 5:
+            raise SystemExit(2)
+        create_graphroot_noreplace(sys.argv[2], int(sys.argv[3]), int(sys.argv[4]))
+        return
+    if sys.argv[1:2] == ["graphroot-remove"]:
+        if len(sys.argv) != 5:
+            raise SystemExit(2)
+        remove_graphroot_nofollow(sys.argv[2], int(sys.argv[3]), int(sys.argv[4]))
+        return
+    if sys.argv[1:2] == ["graphroot-check"]:
+        if len(sys.argv) < 7:
+            raise SystemExit(2)
+        validate_graphroot_path(sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5]), sys.argv[6:])
+        return
     if sys.argv[1:2] == ["stage-check"]:
         if len(sys.argv) != 3:
             raise SystemExit(2)
@@ -530,6 +1152,13 @@ def main() -> None:
         if len(sys.argv) < 4:
             raise SystemExit(2)
         rest = sys.argv[4:]
+        rootless_context = None
+        if "--rootless-context" in rest:
+            index = rest.index("--rootless-context")
+            if index + 1 >= len(rest):
+                raise SystemExit(2)
+            rootless_context = read_rootless_context(rest[index + 1])
+            del rest[index:index + 2]
         staged = "--staged" in rest
         if staged:
             rest.remove("--staged")
@@ -541,12 +1170,19 @@ def main() -> None:
             if rest[0] != "--destinations" or len(rest) == 1:
                 raise SystemExit(2)
             destinations = rest[1:]
-        space_check(sys.argv[2], sys.argv[3], collision_file, destinations, staged=staged)
+        space_check(sys.argv[2], sys.argv[3], collision_file, destinations, staged=staged, rootless_context=rootless_context)
         return
-    if len(sys.argv) < 4 or sys.argv[1] not in {"validate", "validate-created", "members0", "collisions0", "destinations", "skip-links0", "unit-trees0", "rollback-new", "copy-source"}:
+    if len(sys.argv) < 4 or sys.argv[1] not in {"validate", "validate-created", "members0", "collisions0", "destinations", "skip-links0", "unit-trees0", "rollback-new", "copy-source", "rootless-present"}:
         raise SystemExit(2)
     mode, archive, config = sys.argv[1:4]
     rest = sys.argv[4:]
+    rootless_context = None
+    if "--rootless-context" in rest:
+        index = rest.index("--rootless-context")
+        if index + 1 >= len(rest):
+            raise SystemExit(2)
+        rootless_context = read_rootless_context(rest[index + 1])
+        del rest[index:index + 2]
     if mode == "copy-source":
         if len(rest) < 1:
             raise SystemExit(2)
@@ -556,8 +1192,21 @@ def main() -> None:
         if len(rest) < 3:
             raise SystemExit(2)
         raise SystemExit(rollback_new(rest[-2], rest[-1], config, rest[:-2]))
+    if mode == "rootless-present":
+        roots = rest
+        validate_archive(archive, config, roots, rootless_context=rootless_context)
+        with tarfile.open(archive, "r:gz") as source:
+            present = any(clean_member_name(info.name) == ROOTLESS_GRAPHROOT_MEMBER for info in source)
+        print("1" if present else "0")
+        return
     roots = rest[:-3] if mode == "unit-trees0" else rest[:-1] if mode in {"destinations", "skip-links0"} else rest
-    names = validate_archive(archive, config, roots, require_root_config=mode != "validate-created" or os.geteuid() == 0)
+    names = validate_archive(
+        archive,
+        config,
+        roots,
+        require_root_config=mode != "validate-created" or os.geteuid() == 0,
+        rootless_context=rootless_context,
+    )
     if mode == "destinations":
         if not rest:
             raise SystemExit(2)
@@ -570,7 +1219,7 @@ def main() -> None:
     if mode == "unit-trees0":
         if len(rest) < 3:
             raise SystemExit(2)
-        for name in unit_trees(archive, rest[-3], config, roots, rest[-2:]):
+        for name in unit_trees(archive, rest[-3], config, roots, rest[-2:], rootless_context):
             sys.stdout.buffer.write(os.fsencode(name) + b"\0")
     if mode in {"members0", "collisions0"}:
         write_names(names, mode, config, roots)
