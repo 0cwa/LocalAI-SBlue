@@ -682,6 +682,14 @@ localai_installer_user_manager_is_active() {
 # or remove its container. The service manager runner must target the already
 # active nologin account manager; starting a manager here could auto-start an
 # old --rm unit before its anonymous /backends volume is checked.
+localai_installer_check_project_location() {
+  local project="$1" state="$2" reserved
+  [[ "$project" == "$state/"* ]] || return 1
+  for reserved in "$state/.config" "$state/.local/share/containers"; do
+    [[ "$project" != "$reserved" && "$project" != "$reserved/"* && "$reserved" != "$project/"* ]] || return 1
+  done
+}
+
 localai_installer_check_image_volume() {
   local runner="$1" volume="$2" state="$3" container="$4" role="$5" volume_metadata
   [[ "$volume" == "${container}-image-${role}" ]] || return 1

@@ -24,5 +24,6 @@ and data, and completed conservative uninstall while preserving an unrelated
 container. The test credential was generated in guest memory and not recorded.
 
 The archive identifies the exact tested snapshot. Subsequent changes narrowed
-malformed image metadata handling and renamed a shell variable; those changes
-were covered by local mocked checks and are not claimed as VM-tested here.
+malformed image metadata handling, renamed a shell variable, and rejected
+custom project paths that overlap Podman storage. Those changes were covered
+by local mocked checks and are not claimed as VM-tested here.

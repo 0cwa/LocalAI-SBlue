@@ -534,6 +534,12 @@ expect_reject_with_message writable-layer-backend-data 'has writable-layer data 
   expect_reject unknown-image-volume localai_installer_preflight_backend_containers fake_named_volume_podman "$synthetic_backend_bind" "$(id -u)" "$synthetic_state_root" localai
 )
 
+printf 'Project and Podman storage separation checks\n'
+localai_installer_check_project_location "$synthetic_state_root/build/localai-oci" "$synthetic_state_root" || fail "normal project directory rejected"
+for project_path in "$synthetic_state_root/.local" "$synthetic_state_root/.local/share/containers/storage/volumes" "$synthetic_state_root/.config/containers"; do
+  expect_reject overlapping-project-directory localai_installer_check_project_location "$project_path" "$synthetic_state_root"
+done
+
 printf 'Managed-container ownership integration checks\n'
 source_production_function() {
   local source_file="$1" function_name="$2"

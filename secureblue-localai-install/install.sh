@@ -736,7 +736,7 @@ SERVICE_BIND_PORT="$LOCALAI_BIND_PORT"
 localai_installer_validate_service_account_name "$service_user" "LOCALAI_SERVICE_USER" || die "Unsafe LocalAI service account name."
 localai_installer_validate_managed_path "$state_dir" "LOCALAI_STATE_DIR" || die "Unsafe LocalAI state path."
 localai_installer_validate_managed_path "$project_dir" "LOCALAI_PROJECT_DIR" || die "Unsafe LocalAI project path."
-[[ "$project_dir" == "$state_dir/"* ]] || die "LOCALAI_PROJECT_DIR must be inside LOCALAI_STATE_DIR."
+localai_installer_check_project_location "$project_dir" "$state_dir" || die "LOCALAI_PROJECT_DIR must be inside LOCALAI_STATE_DIR and must not overlap service configuration or Podman storage."
 while IFS= read -r path; do
   [[ -n "$path" ]] || continue
   localai_installer_validate_managed_path "$path" "LocalAI app data path" || die "Unsafe LocalAI app data path: $path"
@@ -763,7 +763,7 @@ SERVICE_BIND_PORT="$LOCALAI_BIND_PORT"
 localai_installer_validate_service_account_name "$service_user" "LOCALAI_SERVICE_USER" || die "Unsafe LocalAI service account name."
 localai_installer_validate_managed_path "$state_dir" "LOCALAI_STATE_DIR" || die "Unsafe LocalAI state path."
 localai_installer_validate_managed_path "$project_dir" "LOCALAI_PROJECT_DIR" || die "Unsafe LocalAI project path."
-[[ "$project_dir" == "$state_dir/"* ]] || die "LOCALAI_PROJECT_DIR must be inside LOCALAI_STATE_DIR."
+localai_installer_check_project_location "$project_dir" "$state_dir" || die "LOCALAI_PROJECT_DIR must be inside LOCALAI_STATE_DIR and must not overlap service configuration or Podman storage."
 while IFS= read -r path; do
   [[ -n "$path" ]] || continue
   localai_installer_validate_managed_path "$path" "LocalAI app data path" || die "Unsafe LocalAI app data path: $path"
