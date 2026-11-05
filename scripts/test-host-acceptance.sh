@@ -362,6 +362,9 @@ ssh() {
     'install -o root -g root -m 0644 /dev/stdin /root/agent-scratch/LocalAI-SBlue/acceptance-source/scripts/acceptance-guest.sh')
       cat >/dev/null
       : >"$vm_mock_dir/diagnostic-worker-refreshed" ;;
+    *'test -d /root/agent-scratch/LocalAI-SBlue/acceptance-source/'*'install -o root -g root -m '*'/dev/stdin /root/agent-scratch/LocalAI-SBlue/acceptance-source/'*)
+      cat >/dev/null
+      : >"$vm_mock_dir/diagnostic-components-refreshed" ;;
     *'ps -eo comm=,etimes='*)
       printf 'vm-install-process: container-runtime count=1 max-elapsed=42s\n'
       printf 'untrusted process detail: /etc/passwd\n' ;;
@@ -533,6 +536,7 @@ if result="$(HOME="$vm_mock_dir/test-home-alias" diagnose_vm_backup_with_proc_ro
 fi
 [[ -e "$vm_mock_dir/diagnose-command-seen" ]] || { printf 'valid mocked QEMU identity did not reach diagnostic SSH\n' >&2; exit 1; }
 [[ -e "$vm_mock_dir/diagnostic-worker-refreshed" ]] || { printf 'diagnostic worker refresh did not run after QEMU identity verification\n' >&2; exit 1; }
+[[ -e "$vm_mock_dir/diagnostic-components-refreshed" ]] || { printf 'diagnostic component refresh did not run after QEMU identity verification\n' >&2; exit 1; }
 if [[ "$result" != $'diagnostic-worker: refreshed\ndiagnostic graphroot-unshare-poc-run: pass\ndiagnostic graphroot-unshare-poc-reason: user-xattr-failed\ndiagnostic guest-worker-prerequisite: debug-shell-active\ndiagnostic graphroot-unshare-owner-mode: fail\ndiagnostic graphroot-unshare-xattr: fail\ndiagnostic graphroot-unshare-selinux: fail\ndiagnostic graphroot-unshare-host-mapping: fail\nstep backup-restore-backup: fail\ndiagnostic backup-restore-backup-reason: system-manager-tree' ]]; then
   printf 'VM diagnostic control did not sanitize its fixed mock response\n' >&2; exit 1
 fi

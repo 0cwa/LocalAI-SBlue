@@ -14,8 +14,12 @@ host_receipt_ready=0
 rootless_poc_dir=''
 record_early_failure_category() {
   local category='' receipt_path="${LOCALAI_ACCEPTANCE_RECEIPT:-}"
-  [[ "${LOCALAI_ACCEPTANCE_MODE:-vm}" == host && "$receipt_path" == /var/lib/localai-acceptance-run/receipt &&
-     -f "$receipt_path" && ! -L "$receipt_path" && "$(stat -c '%u:%a' "$receipt_path" 2>/dev/null)" == 0:600 ]] || return 0
+  case "${LOCALAI_ACCEPTANCE_MODE:-vm}:$receipt_path" in
+    "host:/var/lib/localai-acceptance-run/receipt") ;;
+    "vm:$repo_root/.diagnostic-receipt") ;;
+    *) return 0 ;;
+  esac
+  [[ -f "$receipt_path" && ! -L "$receipt_path" && "$(stat -c '%u:%a' "$receipt_path" 2>/dev/null)" == 0:600 ]] || return 0
   case "$*" in
     'acceptance worker requires root.') category=not-root ;;
     'host worker requires a prepared isolated run.') category=host-state-missing ;;
@@ -114,6 +118,7 @@ service_podman() {
 rootless_poc_failure_category() {
   local result="$1"
   case "$result" in
+    *'poc: namespace-owner-mode-pass'*) printf 'roundtrip-pass' ;;
     *'poc: subgid-map-unavailable'*) printf 'subgid-map-unavailable' ;;
     *'poc: tar-create-failed'*) printf 'tar-create-failed' ;;
     *'poc: tar-extract-failed'*) printf 'tar-extract-failed' ;;
@@ -129,6 +134,7 @@ rootless_poc_failure_category() {
     *'poc: python-TypeError'*) printf 'python-type-error' ;;
     *'poc: python-KeyError'*) printf 'python-key-error' ;;
     *'poc: python-RuntimeError'*) printf 'python-runtime-error' ;;
+    *'poc: python-AttributeError'*) printf 'python-attribute-error' ;;
     *'poc: python-FileExistsError'*) printf 'python-file-exists' ;;
     *'poc: python-NotADirectoryError'*) printf 'python-not-directory' ;;
     *'poc: python-IsADirectoryError'*) printf 'python-is-directory' ;;
@@ -138,9 +144,13 @@ rootless_poc_failure_category() {
     *'poc: python-SubprocessError'*) printf 'python-subprocess' ;;
     *'poc: python-UnicodeDecodeError'*) printf 'python-unicode-decode' ;;
     *'poc: python-UnicodeEncodeError'*) printf 'python-unicode-encode' ;;
+    *'poc: python-UnicodeError'*) printf 'python-unicode' ;;
     *'poc: python-IndexError'*) printf 'python-index' ;;
     *'poc: python-AssertionError'*) printf 'python-assertion' ;;
     *'poc: python-NameError'*) printf 'python-name' ;;
+    *'poc: python-EOFError'*) printf 'python-eof' ;;
+    *'poc: python-StopIteration'*) printf 'python-stop-iteration' ;;
+    *'poc: python-NotImplementedError'*) printf 'python-not-implemented' ;;
     *'poc: python-ImportError'*) printf 'python-import' ;;
     *'poc: python-ModuleNotFoundError'*) printf 'python-module-missing' ;;
     *'poc: python-MemoryError'*) printf 'python-memory' ;;
@@ -181,6 +191,7 @@ def stop(category):
     raise SystemExit(0)
 
 try:
+    print("poc: started", flush=True)
     base = pathlib.Path(sys.argv[1])
     source = base / "source"
     target = base / "target"
@@ -205,7 +216,7 @@ try:
             break
     if mapped_gid is None or mapped_gid == 0:
         stop("subgid-map-unavailable")
-    fixture.chown(0, mapped_gid)
+    os.chown(fixture, 0, mapped_gid)
     fixture.chmod(0o2750)
     os.setxattr(fixture, "user.issue20-probe", b"synthetic-xattr")
     try:
@@ -242,8 +253,16 @@ try:
 except SystemExit:
     raise
 except BaseException as error:
-    known = {"PermissionError", "FileNotFoundError", "OSError", "ValueError", "OverflowError", "TypeError", "KeyError", "RuntimeError"}
-    print("poc: python-" + (type(error).__name__ if type(error).__name__ in known else "other"))
+    import traceback
+    known = {"PermissionError", "FileNotFoundError", "OSError", "ValueError", "OverflowError", "TypeError", "KeyError", "RuntimeError", "AttributeError", "NameError", "EOFError", "StopIteration", "NotImplementedError", "AssertionError", "IndexError", "IsADirectoryError", "NotADirectoryError", "FileExistsError", "BlockingIOError", "InterruptedError", "UnicodeError", "MemoryError"}
+    exception_name = type(error).__name__
+    if exception_name in known:
+        print("poc: python-" + exception_name)
+    else:
+        print("poc: python-other")
+    frames = traceback.extract_tb(error.__traceback__)
+    if frames:
+        print("poc: exception-line-" + str(frames[-1].lineno))
     raise SystemExit(0)
 PY
   chmod 0644 "$probe_script" || { rm -rf -- "$rootless_poc_dir"; record_rootless_poc_setup_failure "$receipt_path" probe-mode; return 1; }
@@ -257,6 +276,19 @@ PY
   poc_reason="$(rootless_poc_failure_category "$result")"
   if (( status != 0 )); then poc_reason=unshare-command-failed; fi
   printf 'diagnostic graphroot-unshare-poc-reason: %s\n' "$poc_reason" >>"$receipt_path"
+  if [[ -n "$result" ]]; then
+    printf 'diagnostic graphroot-unshare-poc-output: present\n' >>"$receipt_path"
+  else
+    printf 'diagnostic graphroot-unshare-poc-output: empty\n' >>"$receipt_path"
+  fi
+  if (( status == 0 )); then
+    printf 'diagnostic graphroot-unshare-poc-status: zero\n' >>"$receipt_path"
+  else
+    printf 'diagnostic graphroot-unshare-poc-status: nonzero\n' >>"$receipt_path"
+  fi
+  if [[ "$result" =~ (^|$'\n')poc:\ exception-line-([0-9]{1,6})($|$'\n') ]]; then
+    printf 'diagnostic graphroot-unshare-exception-line: %s\n' "${BASH_REMATCH[2]}" >>"$receipt_path"
+  fi
   if [[ "$result" == *'poc: namespace-owner-mode-pass'* ]]; then
     printf 'diagnostic graphroot-unshare-owner-mode: pass\n' >>"$receipt_path"
   else
@@ -474,7 +506,7 @@ backup_acceptance_step() {
   local destination="$1" status=0 reason=other output=''
   printf 'command backup-restore-backup: localaictl backup with root-owned config and persistent marker\n' >>"$receipt"
   printf 'waiting backup-restore-backup: timeout 1800s\n' >>"$receipt"
-  if output="$(timeout --kill-after=10s 1800s "$controller" backup "$destination" 2>&1)"; then
+  if output="$(LOCALAI_ACCEPTANCE_DIAGNOSTIC=1 timeout --kill-after=10s 1800s "$controller" backup "$destination" 2>&1)"; then
     printf 'step backup-restore-backup: pass\n' >>"$receipt"
   else
     status=$?
@@ -543,6 +575,11 @@ backup_acceptance_step() {
     esac
     printf 'step backup-restore-backup: %s\n' "$([[ "$status" == 124 ]] && printf timeout || printf fail)" >>"$receipt"
     printf 'diagnostic backup-restore-backup-reason: %s\n' "$reason" >>"$receipt"
+    if [[ "$output" =~ diagnostic-controller-site:([0-9]{1,6}) ]]; then
+      printf 'diagnostic backup-restore-controller-site: %s\n' "${BASH_REMATCH[1]}" >>"$receipt"
+    elif [[ "$output" =~ diagnostic-helper-site:([0-9]{1,6}) ]]; then
+      printf 'diagnostic backup-restore-helper-site: %s\n' "${BASH_REMATCH[1]}" >>"$receipt"
+    fi
   fi
   unset output
   return "$status"

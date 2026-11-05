@@ -53,7 +53,13 @@ RESTORE_TLS_FORWARD_SOCKET_NAME=''
 RESTORE_TLS_FORWARD_SERVICE_NAME=''
 RESTORE_MARKER_PATH=/var/lib/.localaictl-backup-restore.pending
 
-die() { printf 'localaictl: %s\n' "$*" >&2; exit 1; }
+die() {
+  printf 'localaictl: %s\n' "$*" >&2
+  if [[ "${LOCALAI_ACCEPTANCE_DIAGNOSTIC:-}" == 1 ]]; then
+    printf 'localaictl: diagnostic-controller-site:%s\n' "${BASH_LINENO[0]:-0}" >&2
+  fi
+  exit 1
+}
 log() { printf '%s\n' "$*"; }
 backup_archive_helper_for() {
   local adjacent="$1/backup_archive.py" repository="$2/lib/backup_archive.py"

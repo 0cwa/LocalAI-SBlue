@@ -29,6 +29,8 @@ MAX_ARCHIVE_EXPANDED_BYTES = 16 * 1024**4
 
 def fail(message: str) -> None:
     print(f"localaictl: {message}", file=sys.stderr)
+    if os.environ.get("LOCALAI_ACCEPTANCE_DIAGNOSTIC") == "1":
+        print(f"localaictl: diagnostic-helper-site:{sys._getframe(1).f_lineno}", file=sys.stderr)
     raise SystemExit(1)
 
 

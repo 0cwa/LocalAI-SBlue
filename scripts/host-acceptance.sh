@@ -140,7 +140,7 @@ report_qemu_exit() {
 
 diagnose_vm_backup_with_proc_root() {
   local key_arg="$1" proc_root="$2"
-  local scratch canonical_scratch active connection port key known_hosts known_hosts_dir run_name canonical_known_hosts qemu_pid qemu_start expected_exe worker output line status=0 reason
+  local scratch canonical_scratch active connection port key known_hosts known_hosts_dir run_name canonical_known_hosts qemu_pid qemu_start expected_exe worker controller helper source_target source_file target_file target_dir mode output line status=0 reason
   local -a connection_fields=() ssh_args=()
   [[ "$key_arg" == /* ]] || { usage >&2; exit 2; }
   key="$(realpath -e -- "$key_arg")" || fail 'VM diagnostic identity is unavailable.'
@@ -170,6 +170,8 @@ diagnose_vm_backup_with_proc_root() {
   expected_exe="$(realpath -e -- "$(type -P qemu-system-x86_64)")" || fail 'VM diagnostic QEMU executable is unavailable.'
   qemu_process_matches "$qemu_pid" "$qemu_start" "$port" "$expected_exe" "$proc_root" || fail 'VM diagnostic QEMU process identity is stale or mismatched.'
   worker=/root/agent-scratch/LocalAI-SBlue/acceptance-source/scripts/acceptance-guest.sh
+  controller=/root/agent-scratch/LocalAI-SBlue/acceptance-source/bin/localaictl
+  helper=/root/agent-scratch/LocalAI-SBlue/acceptance-source/lib/backup_archive.py
   isolated_ssh_args ssh_args "$key" "$port" "$known_hosts" 5
   # Refresh only the acceptance diagnostic worker in this disposable guest.
   # The remote command and target are fixed, and the connection remains bound
@@ -180,18 +182,40 @@ diagnose_vm_backup_with_proc_root() {
     fail 'could not refresh the fixed VM diagnostic worker.'
   fi
   printf 'diagnostic-worker: refreshed\n'
+  for source_target in "$repo_root/bin/localaictl:$controller" "$repo_root/lib/backup_archive.py:$helper"; do
+    source_file="${source_target%%:*}"
+    target_file="${source_target#*:}"
+    target_dir="${target_file%/*}"
+    mode=0644
+    [[ "$target_file" == */bin/localaictl ]] && mode=0755
+    if ! timeout 30s ssh "${ssh_args[@]}" root@127.0.0.1 \
+      "test -d $target_dir && test ! -L $target_dir && install -o root -g root -m $mode /dev/stdin $target_file" \
+      <"$source_file" >/dev/null 2>&1; then
+      fail 'could not refresh a fixed VM diagnostic component.'
+    fi
+  done
   local rootless_output=''
+  local diagnostic_receipt=/root/agent-scratch/LocalAI-SBlue/acceptance-source/.diagnostic-receipt
   if rootless_output="$(timeout 240s ssh "${ssh_args[@]}" root@127.0.0.1 \
-    "env LOCALAI_ACCEPTANCE_MODE=host LOCALAI_ACCEPTANCE_RECEIPT=/var/lib/localai-acceptance-run/receipt bash $worker --rootless-archive-roundtrip >/dev/null 2>&1; status=\$?; if [ \$status -eq 0 ]; then printf 'diagnostic graphroot-unshare-poc-run: pass\\n'; else printf 'diagnostic graphroot-unshare-poc-run: fail\\n'; fi; grep -E '^diagnostic (guest-worker-prerequisite|graphroot-unshare-(poc-reason|setup-reason|owner-mode|xattr|selinux|host-mapping)): ' /var/lib/localai-acceptance-run/receipt | tail -n 10" 2>/dev/null)"; then
+    "receipt=$diagnostic_receipt; if [ -L \$receipt ] || [ -e \$receipt ]; then printf 'diagnostic graphroot-unshare-poc-reason: receipt-occupied\\n'; exit 0; fi; umask 077; : >\$receipt || { printf 'diagnostic graphroot-unshare-poc-reason: receipt-create-failed\\n'; exit 0; }; chmod 0600 \$receipt || { rm -f -- \$receipt; printf 'diagnostic graphroot-unshare-poc-reason: receipt-mode-failed\\n'; exit 0; }; trap 'rm -f -- \$receipt' EXIT; env LOCALAI_ACCEPTANCE_MODE=vm LOCALAI_ACCEPTANCE_RECEIPT=\$receipt bash $worker --rootless-archive-roundtrip >/dev/null 2>&1; status=\$?; if [ \$status -eq 0 ]; then printf 'diagnostic graphroot-unshare-poc-run: pass\\n'; else printf 'diagnostic graphroot-unshare-poc-run: fail\\n'; fi; grep -E '^diagnostic (guest-worker-prerequisite|graphroot-unshare-(poc-reason|poc-output|poc-status|exception-line|setup-reason|owner-mode|xattr|selinux|host-mapping)): ' \$receipt | tail -n 10" 2>/dev/null)"; then
     printf '%s\n' "$rootless_output" | while IFS= read -r line; do
+      if [[ "$line" == 'diagnostic graphroot-unshare-poc-reason: roundtrip-pass' ]]; then
+        printf '%s\n' "$line"
+        continue
+      fi
       case "$line" in
         'diagnostic graphroot-unshare-poc-run: pass'|'diagnostic graphroot-unshare-poc-run: fail') printf '%s\n' "$line" ;;
         'diagnostic graphroot-unshare-setup-reason: config-load'|'diagnostic graphroot-unshare-setup-reason: state-directory'|'diagnostic graphroot-unshare-setup-reason: temp-directory'|'diagnostic graphroot-unshare-setup-reason: service-uid'|'diagnostic graphroot-unshare-setup-reason: directory-owner'|'diagnostic graphroot-unshare-setup-reason: directory-mode'|'diagnostic graphroot-unshare-setup-reason: probe-mode'|'diagnostic graphroot-unshare-setup-reason: probe-owner') printf '%s\n' "$line" ;;
         'diagnostic guest-worker-prerequisite: not-root'|'diagnostic guest-worker-prerequisite: host-state-missing'|'diagnostic guest-worker-prerequisite: host-state-permissions'|'diagnostic guest-worker-prerequisite: selinux-not-enforcing'|'diagnostic guest-worker-prerequisite: debug-shell-active'|'diagnostic guest-worker-prerequisite: receipt-private') printf '%s\n' "$line" ;;
-        'diagnostic graphroot-unshare-poc-reason: subgid-map-unavailable'|'diagnostic graphroot-unshare-poc-reason: tar-create-failed'|'diagnostic graphroot-unshare-poc-reason: tar-extract-failed'|'diagnostic graphroot-unshare-poc-reason: owner-mode-failed'|'diagnostic graphroot-unshare-poc-reason: user-xattr-failed'|'diagnostic graphroot-unshare-poc-reason: selinux-source-unavailable'|'diagnostic graphroot-unshare-poc-reason: selinux-label-failed'|'diagnostic graphroot-unshare-poc-reason: python-permission'|'diagnostic graphroot-unshare-poc-reason: python-file-missing'|'diagnostic graphroot-unshare-poc-reason: python-os-error'|'diagnostic graphroot-unshare-poc-reason: python-value-error'|'diagnostic graphroot-unshare-poc-reason: python-overflow'|'diagnostic graphroot-unshare-poc-reason: python-type-error'|'diagnostic graphroot-unshare-poc-reason: python-key-error'|'diagnostic graphroot-unshare-poc-reason: python-runtime-error'|'diagnostic graphroot-unshare-poc-reason: python-file-exists'|'diagnostic graphroot-unshare-poc-reason: python-not-directory'|'diagnostic graphroot-unshare-poc-reason: python-is-directory'|'diagnostic graphroot-unshare-poc-reason: python-blocking-io'|'diagnostic graphroot-unshare-poc-reason: python-interrupted'|'diagnostic graphroot-unshare-poc-reason: python-child-process'|'diagnostic graphroot-unshare-poc-reason: python-subprocess'|'diagnostic graphroot-unshare-poc-reason: python-unicode-decode'|'diagnostic graphroot-unshare-poc-reason: python-unicode-encode'|'diagnostic graphroot-unshare-poc-reason: python-index'|'diagnostic graphroot-unshare-poc-reason: python-assertion'|'diagnostic graphroot-unshare-poc-reason: python-name'|'diagnostic graphroot-unshare-poc-reason: python-import'|'diagnostic graphroot-unshare-poc-reason: python-module-missing'|'diagnostic graphroot-unshare-poc-reason: python-memory'|'diagnostic graphroot-unshare-poc-reason: python-other'|'diagnostic graphroot-unshare-poc-reason: no-poc-result'|'diagnostic graphroot-unshare-poc-reason: unshare-command-failed')
+        'diagnostic graphroot-unshare-poc-reason: receipt-occupied'|'diagnostic graphroot-unshare-poc-reason: receipt-create-failed'|'diagnostic graphroot-unshare-poc-reason: receipt-mode-failed'|'diagnostic graphroot-unshare-poc-reason: subgid-map-unavailable'|'diagnostic graphroot-unshare-poc-reason: tar-create-failed'|'diagnostic graphroot-unshare-poc-reason: tar-extract-failed'|'diagnostic graphroot-unshare-poc-reason: owner-mode-failed'|'diagnostic graphroot-unshare-poc-reason: user-xattr-failed'|'diagnostic graphroot-unshare-poc-reason: selinux-source-unavailable'|'diagnostic graphroot-unshare-poc-reason: selinux-label-failed'|'diagnostic graphroot-unshare-poc-reason: python-permission'|'diagnostic graphroot-unshare-poc-reason: python-file-missing'|'diagnostic graphroot-unshare-poc-reason: python-os-error'|'diagnostic graphroot-unshare-poc-reason: python-value-error'|'diagnostic graphroot-unshare-poc-reason: python-overflow'|'diagnostic graphroot-unshare-poc-reason: python-type-error'|'diagnostic graphroot-unshare-poc-reason: python-key-error'|'diagnostic graphroot-unshare-poc-reason: python-runtime-error'|'diagnostic graphroot-unshare-poc-reason: python-attribute-error'|'diagnostic graphroot-unshare-poc-reason: python-file-exists'|'diagnostic graphroot-unshare-poc-reason: python-not-directory'|'diagnostic graphroot-unshare-poc-reason: python-is-directory'|'diagnostic graphroot-unshare-poc-reason: python-blocking-io'|'diagnostic graphroot-unshare-poc-reason: python-interrupted'|'diagnostic graphroot-unshare-poc-reason: python-child-process'|'diagnostic graphroot-unshare-poc-reason: python-subprocess'|'diagnostic graphroot-unshare-poc-reason: python-unicode-decode'|'diagnostic graphroot-unshare-poc-reason: python-unicode-encode'|'diagnostic graphroot-unshare-poc-reason: python-unicode'|'diagnostic graphroot-unshare-poc-reason: python-index'|'diagnostic graphroot-unshare-poc-reason: python-assertion'|'diagnostic graphroot-unshare-poc-reason: python-name'|'diagnostic graphroot-unshare-poc-reason: python-eof'|'diagnostic graphroot-unshare-poc-reason: python-stop-iteration'|'diagnostic graphroot-unshare-poc-reason: python-not-implemented'|'diagnostic graphroot-unshare-poc-reason: python-import'|'diagnostic graphroot-unshare-poc-reason: python-module-missing'|'diagnostic graphroot-unshare-poc-reason: python-memory'|'diagnostic graphroot-unshare-poc-reason: python-other'|'diagnostic graphroot-unshare-poc-reason: no-poc-result'|'diagnostic graphroot-unshare-poc-reason: unshare-command-failed')
           printf '%s\n' "$line" ;;
         'diagnostic graphroot-unshare-owner-mode: pass'|'diagnostic graphroot-unshare-owner-mode: fail'|'diagnostic graphroot-unshare-xattr: pass'|'diagnostic graphroot-unshare-xattr: fail'|'diagnostic graphroot-unshare-selinux: pass'|'diagnostic graphroot-unshare-selinux: fail'|'diagnostic graphroot-unshare-selinux: unavailable'|'diagnostic graphroot-unshare-host-mapping: pass'|'diagnostic graphroot-unshare-host-mapping: fail')
           printf '%s\n' "$line" ;;
+        'diagnostic graphroot-unshare-poc-output: empty'|'diagnostic graphroot-unshare-poc-output: present'|'diagnostic graphroot-unshare-poc-status: zero'|'diagnostic graphroot-unshare-poc-status: nonzero')
+          printf '%s\n' "$line" ;;
+        'diagnostic graphroot-unshare-exception-line: '*)
+          exception_line="${line#diagnostic graphroot-unshare-exception-line: }"
+          [[ "$exception_line" =~ ^[0-9]{1,6}$ ]] && printf 'diagnostic graphroot-unshare-exception-line: %s\n' "$exception_line" ;;
       esac
     done
     if [[ -z "$rootless_output" ]]; then printf 'diagnostic graphroot-unshare-poc-reason: no-poc-output\n'; fi
@@ -215,6 +239,11 @@ diagnose_vm_backup_with_proc_root() {
             printf 'diagnostic backup-restore-backup-reason: %s\n' "$reason" ;;
           *) printf 'diagnostic backup-restore-backup-reason: unknown\n' ;;
         esac ;;
+      'diagnostic backup-restore-controller-site: '*|'diagnostic backup-restore-helper-site: '*)
+        site_line="${line##*: }"
+        if [[ "$site_line" =~ ^[0-9]{1,6}$ ]]; then
+          printf 'diagnostic %s: %s\n' "${line%%:*}" "$site_line"
+        fi ;;
       'Acceptance step backup-restore-backup: fail ('*) printf 'step backup-restore-backup: fail\n' ;;
       'acceptance: '*) printf 'acceptance: fail\n' ;;
     esac
