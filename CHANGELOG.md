@@ -17,6 +17,8 @@ has been runtime-qualified on secureblue or on a GPU.
 - Match systemd paths at the configured service-home roots so inert unit files
   inside rootless Podman image layers do not block backups or get treated as
   active user unit definitions.
+- Install the backup archive helper beside the tray controller so installed
+  tray backup and restore commands work outside the source checkout.
 
 ## 0.2.0
 

@@ -68,6 +68,8 @@ required = {
     f"{package_name}/localai/inspect-runtime-state.sh",
     f"{package_name}/localai/probe-container-writable-paths.sh",
     f"{package_name}/scripts/test-package-relocation.sh",
+    f"{package_name}/scripts/test-tray-install.sh",
+    f"{package_name}/lib/backup_archive.py",
 }
 excluded = re.compile(
     r"(^|/)(audit|dist|\.git|pki|certs|private)(/|$)"

@@ -97,6 +97,7 @@ manifest=(
   scripts/test-installed-copy.sh
   scripts/test-render-config.sh
   scripts/test-tray-adapter.py
+  scripts/test-tray-install.sh
   scripts/test-uninstall-config.sh
   scripts/test-installer-safety.sh
   scripts/test-runtime-paths.sh

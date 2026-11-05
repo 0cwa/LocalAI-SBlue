@@ -38,6 +38,11 @@ status_elevated=0
 
 die() { printf 'localaictl: %s\n' "$*" >&2; exit 1; }
 log() { printf '%s\n' "$*"; }
+backup_archive_helper="$repo_root/lib/backup_archive.py"
+if [[ ! -f "$backup_archive_helper" || -L "$backup_archive_helper" ]]; then
+  backup_archive_helper="$script_dir/backup_archive.py"
+fi
+[[ -f "$backup_archive_helper" && ! -L "$backup_archive_helper" ]] || die "shared backup archive helper is missing."
 
 if [[ -z "${LOCALAI_CONFIG_FILE:-}" && ! -e "$config_file" ]]; then
   # A repository checkout may use its editable config while developing. An
@@ -728,7 +733,7 @@ backup_locked() {
   [[ -e "$config_file" ]] && archive_args+=("${config_file#/}")
   for path in "${backup_roots[@]}"; do [[ -e "$path" ]] && archive_args+=("${path#/}"); done
   run_elevated_pipe "$tar_bin" "${archive_args[@]}" || die "backup archive creation failed"
-  run_elevated /usr/bin/python3 "$repo_root/lib/backup_archive.py" validate-created "$archive_file" "$config_file" "${backup_roots[@]}" || die "backup contains unsupported or unsafe filesystem entries"
+  run_elevated /usr/bin/python3 "$backup_archive_helper" validate-created "$archive_file" "$config_file" "${backup_roots[@]}" || die "backup contains unsupported or unsafe filesystem entries"
   rm -rf -- "$metadata_dir"
   backup_metadata_dir=""
   restore_backup_service_state || die "backup completed but one or more previously active services could not be restarted"
@@ -762,7 +767,7 @@ restore_archive() {
 restore_locked() {
   local source="$1" stage source_copy members collisions snapshot skip_links target answer item had_target=0 stage_base needs_confirmation=0
   local restore_mutation_started=0 restore_completed=0
-  local helper="$repo_root/lib/backup_archive.py"
+  local helper="$backup_archive_helper"
   [[ -f "$source" && ! -L "$source" ]] || die "restore source must be a regular, non-linked archive file"
   prepare_backup_roots
   source="$(realpath -e -- "$source")"
@@ -865,7 +870,7 @@ restore_locked() {
 restore_rollback() {
   local members="$1" collisions="$2" snapshot="$3" had_target="$4"
   local status=0
-  run_elevated /usr/bin/python3 "$repo_root/lib/backup_archive.py" rollback-new "$source" "$config_file" "${backup_roots[@]}" "$members" "$collisions" || { log "warning: could not remove all newly restored paths"; status=1; }
+  run_elevated /usr/bin/python3 "$backup_archive_helper" rollback-new "$source" "$config_file" "${backup_roots[@]}" "$members" "$collisions" || { log "warning: could not remove all newly restored paths"; status=1; }
   if [[ "$had_target" == 1 ]]; then
     run_elevated "$tar_bin" --extract --file "$snapshot" --directory / --xattrs --acls --selinux --numeric-owner --same-owner || { log "warning: could not restore the rollback snapshot"; status=1; }
   fi

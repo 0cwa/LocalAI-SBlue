@@ -43,6 +43,8 @@ printf 'Python syntax localai-tray/localai-tray.py\n'
 python3 -c 'import ast, pathlib; ast.parse(pathlib.Path("localai-tray/localai-tray.py").read_text())'
 printf 'Tray adapter tests\n'
 python3 scripts/test-tray-adapter.py
+printf 'Tray helper installation tests\n'
+bash scripts/test-tray-install.sh
 
 if command -v desktop-file-validate >/dev/null 2>&1; then
   printf 'Desktop entry validation localai-tray/localai-tray.desktop.in\n'

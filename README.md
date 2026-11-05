@@ -333,6 +333,9 @@ can be inspected and migrated safely before retrying.
 
 Create a protected archive with `localaictl`:
 
+The tray installation bundles the archive helper beside its controller, so
+these commands also work outside the source checkout.
+
 ```sh
 bin/localaictl backup /path/to/localai-backup.tar.gz
 ```

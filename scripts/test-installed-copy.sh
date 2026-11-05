@@ -13,7 +13,11 @@ mkdir -p "$install_dir/config"
 cp "$repo_root/VERSION" "$install_dir/VERSION"
 cp "$repo_root/bin/localaictl" "$install_dir/localaictl"
 cp "$repo_root/lib/config.sh" "$install_dir/config.sh"
+cp "$repo_root/lib/backup_archive.py" "$install_dir/backup_archive.py"
 chmod 0755 "$install_dir/localaictl"
+[[ ! -e "$tmp_dir/lib/backup_archive.py" && -f "$install_dir/backup_archive.py" ]]
+python3 "$install_dir/backup_archive.py" stage-check "$tmp_dir"
+rg -q '^  backup_archive_helper="\$script_dir/backup_archive\.py"$' "$repo_root/bin/localaictl"
 [[ "$("$install_dir/localaictl" --version)" == "localaictl $(<"$repo_root/VERSION")" ]]
 
 cat >"$install_dir/config/localai.conf" <<'EOF'

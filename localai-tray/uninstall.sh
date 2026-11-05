@@ -8,6 +8,7 @@ desktop_dir="$data_home/applications"
 icon_dir="$data_home/icons/hicolor/scalable/apps"
 
 rm -f "$bin_home/localai-tray" "$desktop_dir/localai.desktop" "$icon_dir/localai.svg"
+# Remove the controller and its side-by-side shared helpers together.
 rm -rf --one-file-system "$install_dir"
 
 if command -v update-desktop-database >/dev/null 2>&1; then

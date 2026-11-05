@@ -23,6 +23,7 @@ command -v systemctl >/dev/null 2>&1 || die "systemctl is required."
 [[ -f "$script_dir/../VERSION" ]] || die "VERSION is missing from the repository."
 [[ -f "$script_dir/../bin/localaictl" ]] || die "localaictl is missing from the repository."
 [[ -f "$script_dir/../lib/config.sh" ]] || die "shared config loader is missing from the repository."
+[[ -f "$script_dir/../lib/backup_archive.py" && ! -L "$script_dir/../lib/backup_archive.py" ]] || die "shared backup archive helper is missing from the repository."
 
 install -d -m 0755 "$install_dir" "$bin_home" "$desktop_dir" "$icon_dir"
 install -m 0644 "$script_dir/localai-tray.py" "$install_dir/localai-tray.py"
@@ -31,6 +32,7 @@ install -m 0644 "$script_dir/localai.svg" "$install_dir/localai.svg"
 install -m 0644 "$script_dir/../VERSION" "$install_dir/VERSION"
 install -m 0755 "$script_dir/../bin/localaictl" "$install_dir/localaictl"
 install -m 0644 "$script_dir/../lib/config.sh" "$install_dir/config.sh"
+install -m 0644 "$script_dir/../lib/backup_archive.py" "$install_dir/backup_archive.py"
 # The controller reads the shared /etc/localai/localai.conf on each command.
 # Do not install a per-user copy that becomes stale after config changes.
 install -m 0644 "$script_dir/localai.svg" "$icon_path"
