@@ -463,11 +463,24 @@ disable_tls_user_linger() {
 }
 
 remove_tls_user() {
+  local userdel_output userdel_status attempt
   [[ "$remove_user" == "1" ]] || return 0
   if getent passwd "$tls_user" >/dev/null; then
     [[ "$remove_user_confirmed" == "1" ]] || die "Refusing TLS service-account deletion without prior confirmation."
     log "Removing service user $tls_user"
-    run0_pipe /usr/sbin/userdel "$tls_user" || true
+    for ((attempt = 1; attempt <= 30; attempt += 1)); do
+      userdel_output=''
+      userdel_status=0
+      userdel_output="$(run0_pipe /usr/sbin/userdel "$tls_user" 2>&1)" || userdel_status=$?
+      if ! getent passwd "$tls_user" >/dev/null; then
+        return 0
+      fi
+      if [[ "$userdel_status" != 8 || "$userdel_output" != *"currently used by process"* ]]; then
+        die "Could not remove the TLS service account."
+      fi
+      if [[ "$attempt" -lt 30 ]]; then sleep 1; fi
+    done
+    die "Could not remove the TLS service account after waiting for its processes to exit."
   fi
 }
 

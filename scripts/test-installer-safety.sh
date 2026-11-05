@@ -1495,9 +1495,10 @@ run_tls_user_delete_after_approval() (
   tls_user=localai-tls
   remove_user=1
   remove_user_confirmed=1
+  printf present >"$scratch/tls-user-exists"
   # The function is called indirectly by a helper or test.
   # shellcheck disable=SC2329
-  getent() { return 0; }
+  getent() { [[ -f "$scratch/tls-user-exists" ]]; }
   # The function is called indirectly by a helper or test.
   # shellcheck disable=SC2329
   confirm() { printf 'unexpected-late-confirmation\n' >>"$TEST_ACCOUNT_CALLS"; return 1; }
@@ -1506,7 +1507,62 @@ run_tls_user_delete_after_approval() (
   log() { :; }
   # The function is called indirectly by a helper or test.
   # shellcheck disable=SC2329
-  run0_pipe() { printf '%s\n' "$*" >>"$TEST_ACCOUNT_CALLS"; }
+  run0_pipe() {
+    printf '%s\n' "$*" >>"$TEST_ACCOUNT_CALLS"
+    if [[ "${1:-}" == /usr/sbin/userdel ]]; then rm -f -- "$scratch/tls-user-exists"; fi
+  }
+  remove_tls_user
+)
+
+run_tls_user_delete_after_in_use_race() (
+  source_production_function "$repo_root/localai-podman-compose/uninstall.sh" remove_tls_user
+  tls_user=localai-tls
+  remove_user=1
+  remove_user_confirmed=1
+  printf present >"$scratch/tls-user-exists"
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
+  getent() { [[ -f "$scratch/tls-user-exists" ]]; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
+  log() { :; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
+  sleep() { [[ "$1" == 1 ]]; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
+  run0_pipe() {
+    printf '%s\n' "$*" >>"$TEST_ACCOUNT_CALLS"
+    if [[ "${1:-}" == /usr/sbin/userdel ]]; then
+      call_count="$(rg -c '^/usr/sbin/userdel localai-tls$' "$TEST_ACCOUNT_CALLS")"
+      if [[ "$call_count" == 1 ]]; then
+        printf 'user currently used by process 12345\n' >&2
+        return 8
+      fi
+      rm -f -- "$scratch/tls-user-exists"
+    fi
+  }
+  remove_tls_user
+)
+
+run_tls_user_delete_reports_persistent_failure() (
+  source_production_function "$repo_root/localai-podman-compose/uninstall.sh" remove_tls_user
+  tls_user=localai-tls
+  remove_user=1
+  remove_user_confirmed=1
+  printf present >"$scratch/tls-user-exists"
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
+  getent() { [[ -f "$scratch/tls-user-exists" ]]; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
+  log() { :; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
+  die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+  # The function is called indirectly by a helper or test.
+  # shellcheck disable=SC2329
+  run0_pipe() { return 1; }
   remove_tls_user
 )
 
@@ -1547,6 +1603,15 @@ run_tls_approved_user_removal || fail "explicit TLS account removal lifecycle fa
 run_tls_user_delete_after_approval || fail "approved TLS account deletion failed"
 rg -qx '/usr/sbin/userdel localai-tls' "$TEST_ACCOUNT_CALLS" || fail "TLS account was not deleted after approval"
 ! rg -q 'unexpected-late-confirmation' "$TEST_ACCOUNT_CALLS" || fail "TLS uninstaller prompted after process termination"
+
+: >"$TEST_ACCOUNT_CALLS"
+run_tls_user_delete_after_in_use_race || fail "transient TLS account-in-use race was not retried safely"
+[[ "$(rg -c '^/usr/sbin/userdel localai-tls$' "$TEST_ACCOUNT_CALLS")" == 2 ]] || fail "TLS account deletion did not retry once after a busy-user result"
+
+if run_tls_user_delete_reports_persistent_failure 2>"$scratch/tls-userdel-failure"; then
+  fail "persistent TLS account deletion failure was silently accepted"
+fi
+rg -qx 'ERROR: Could not remove the TLS service account\.' "$scratch/tls-userdel-failure" || fail "TLS account deletion failure was not reported"
 
 run_backend_account_removal_confirmation() (
   source_production_function "$repo_root/secureblue-localai-install/uninstall.sh" confirm_service_account_removal
