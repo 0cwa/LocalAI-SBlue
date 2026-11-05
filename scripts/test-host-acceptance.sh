@@ -366,6 +366,26 @@ if [[ "$result" != *'diagnostic-recheck: started'* || "$result" != *'diagnostic 
   printf 'same-overlay diagnostic hold/release regression failed\n' >&2; exit 1
 fi
 [[ -z "$(find "$vm_mock_dir/test-home/agent-scratch/LocalAI-SBlue/acceptance-vm" -mindepth 1 -print -quit)" ]]
+diagnostic_scratch="$vm_mock_dir/test-home/agent-scratch/LocalAI-SBlue/acceptance-vm"
+diagnostic_run="$diagnostic_scratch/run.control-test"
+mkdir -p "$diagnostic_run"
+chmod 0700 "$diagnostic_run"
+chmod 0700 "$diagnostic_scratch"
+read -r diagnostic_key_type diagnostic_key_data _ <"$vm_mock_dir/hostkey.pub"
+printf '[127.0.0.1]:23456 %s %s\n' "$diagnostic_key_type" "$diagnostic_key_data" >"$diagnostic_run/known_hosts"
+chmod 0600 "$diagnostic_run/known_hosts" "$vm_mock_dir/key"
+printf '23456\n%s\n%s\n' "$vm_mock_dir/key" "$diagnostic_run/known_hosts" >"$diagnostic_scratch/diagnostic-connection"
+: >"$diagnostic_scratch/diagnostic-active"
+chmod 0600 "$diagnostic_scratch/diagnostic-connection" "$diagnostic_scratch/diagnostic-active"
+if result="$(HOME="$vm_mock_dir/test-home" main --diagnose-vm-backup 2>/dev/null)"; then
+  printf 'VM diagnostic control accepted a failed backup probe\n' >&2; exit 1
+fi
+[[ "$result" == $'step backup-restore-backup: fail\ndiagnostic backup-restore-backup-reason: system-manager-tree' ]] || { printf 'VM diagnostic control did not sanitize its guest response\n' >&2; exit 1; }
+result="$(HOME="$vm_mock_dir/test-home" main --release-vm-diagnostic-pause)"
+[[ "$result" == 'diagnostic-pause: release-requested' && -f "$diagnostic_scratch/diagnostic-release" && ! -L "$diagnostic_scratch/diagnostic-release" ]]
+rm -f -- "$diagnostic_scratch/diagnostic-active" "$diagnostic_scratch/diagnostic-release" "$diagnostic_scratch/diagnostic-connection"
+rm -rf -- "$diagnostic_run"
+[[ -z "$(find "$diagnostic_scratch" -mindepth 1 -print -quit)" ]]
 if result="$(MOCK_INSTALL_FAIL=1 HOME="$vm_mock_dir/test-home" main --vm "$vm_mock_dir/base.qcow2" "$vm_mock_dir/key" "$vm_mock_dir/vars" "$vm_mock_dir/hostkey.pub" 2>/dev/null)"; then
   printf 'VM install failure was accepted\n' >&2; exit 1
 fi

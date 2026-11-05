@@ -7,9 +7,11 @@ export PATH
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 diagnostic_control_created=0
 diagnostic_control_scratch=''
+diagnostic_connection_created=0
 usage() {
   printf '%s\n' 'Usage: host-acceptance.sh --vm BASE.qcow2 SSH_KEY UEFI_VARS SSH_HOST_PUBLIC_KEY'
   printf '%s\n' '       host-acceptance.sh --host [--resume]'
+  printf '%s\n' '       host-acceptance.sh --diagnose-vm-backup'
   printf '%s\n' '       host-acceptance.sh --release-vm-diagnostic-pause'
   printf '%s\n' 'VM receipts go to stdout; host mode writes a receipt after reboot.'
 }
@@ -26,6 +28,53 @@ release_vm_diagnostic_pause() {
   (umask 077; set -o noclobber; : >"$release") || fail 'could not release VM diagnostic pause.'
   printf 'diagnostic-pause: release-requested\n'
 }
+diagnose_vm_backup() {
+  local scratch active connection port key known_hosts worker output line status=0 reason
+  local -a connection_fields=() ssh_args=()
+  [[ "$#" == 1 ]] || { usage >&2; exit 2; }
+  scratch="${HOME:?}/agent-scratch/LocalAI-SBlue/acceptance-vm"
+  active="$scratch/diagnostic-active"
+  connection="$scratch/diagnostic-connection"
+  [[ -d "$scratch" && ! -L "$scratch" && "$(stat -c '%u:%a' -- "$scratch")" == "$(id -u):700" ]] || fail 'VM diagnostic pause is not active.'
+  [[ -f "$active" && ! -L "$active" && "$(stat -c '%u:%a' -- "$active")" == "$(id -u):600" ]] || fail 'VM diagnostic pause is not active.'
+  [[ -f "$connection" && ! -L "$connection" && "$(stat -c '%u:%a' -- "$connection")" == "$(id -u):600" ]] || fail 'VM diagnostic connection is unavailable.'
+  mapfile -t connection_fields <"$connection"
+  [[ "${#connection_fields[@]}" == 3 ]] || fail 'VM diagnostic connection is invalid.'
+  port="${connection_fields[0]}"
+  key="${connection_fields[1]}"
+  known_hosts="${connection_fields[2]}"
+  if [[ ! "$port" =~ ^[0-9]{1,5}$ ]]; then fail 'VM diagnostic connection is invalid.'; fi
+  if (( 10#$port == 0 || 10#$port > 65535 )); then fail 'VM diagnostic connection is invalid.'; fi
+  [[ "$key" == /* && ! -L "$key" && -f "$key" && "$(stat -c '%u' -- "$key")" == "$(id -u)" ]] || fail 'VM diagnostic identity is unavailable.'
+  case "$(stat -c '%a' -- "$key")" in 400|600) ;; *) fail 'VM diagnostic identity is not private.' ;; esac
+  [[ "$known_hosts" == "$scratch"/run.*/known_hosts && ! -L "$known_hosts" && -f "$known_hosts" && "$(realpath -e -- "$known_hosts")" == "$known_hosts" && "$(stat -c '%u:%a' -- "$known_hosts")" == "$(id -u):600" ]] || fail 'VM diagnostic host key is unavailable.'
+  ssh-keygen -F "[127.0.0.1]:$port" -f "$known_hosts" >/dev/null 2>&1 || fail 'VM diagnostic host key is invalid.'
+  worker=/root/agent-scratch/LocalAI-SBlue/acceptance-source/scripts/acceptance-guest.sh
+  ssh_args=(-i "$key" -p "$port" -o BatchMode=yes -o ConnectTimeout=5
+    -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$known_hosts")
+  if output="$(timeout 1800s ssh "${ssh_args[@]}" root@127.0.0.1 "bash $worker diagnose-backup" 2>&1)"; then
+    status=0
+  else
+    status=$?
+  fi
+  while IFS= read -r line; do
+    case "$line" in
+      'command backup-restore-backup: localaictl backup with root-owned config and persistent marker'|'waiting backup-restore-backup: timeout 1800s'|'step backup-restore-backup: pass'|'step backup-restore-backup: fail'|'step backup-restore-backup: timeout')
+        printf '%s\n' "$line" ;;
+      'diagnostic backup-restore-backup-reason: '*)
+        reason="${line#diagnostic backup-restore-backup-reason: }"
+        case "$reason" in
+          service-stop|unit-ownership|capacity|unsafe-name|traversal-path|duplicate-member|link-cross-root|link-escape|hardlink|system-manager-tree|path-outside-roots|special-member|nested-member|privileged-mode|file-capability|config-member|persistent-root-type|missing-metadata|archive-read|unit-tree-validation|symlink|archive-validation|tar|lock-contention|config-guard|other)
+            printf 'diagnostic backup-restore-backup-reason: %s\n' "$reason" ;;
+          *) printf 'diagnostic backup-restore-backup-reason: unknown\n' ;;
+        esac ;;
+      'Acceptance step backup-restore-backup: fail ('*) printf 'step backup-restore-backup: fail\n' ;;
+      'acceptance: '*) printf 'acceptance: fail\n' ;;
+    esac
+  done <<<"$output"
+  unset output
+  return "$status"
+}
 bounded_vm_diagnostic_pause() {
   local scratch="$1" duration="$2" active release elapsed=0
   (( duration > 0 )) || return 0
@@ -33,15 +82,19 @@ bounded_vm_diagnostic_pause() {
   release="$scratch/diagnostic-release"
   [[ ! -e "$active" && ! -L "$active" && ! -e "$release" && ! -L "$release" ]] || fail 'VM diagnostic control path is already occupied.'
   (umask 077; set -o noclobber; : >"$active") || fail 'could not prepare VM diagnostic pause.'
-  chmod 0600 -- "$active"
   diagnostic_control_created=1
+  chmod 0600 -- "$active"
   printf 'diagnostic-pause: active\n'
   while (( elapsed < duration )); do
-    [[ -f "$release" && ! -L "$release" ]] && break
+    kill -0 "$qemu_pid" 2>/dev/null || fail 'VM exited during diagnostic pause.'
+    if [[ -e "$release" || -L "$release" ]]; then
+      [[ -f "$release" && ! -L "$release" && "$(stat -c '%u:%a' -- "$release")" == "$(id -u):600" ]] || fail 'VM diagnostic release path is unsafe.'
+      break
+    fi
     sleep 1
     ((elapsed += 1))
   done
-  if [[ -f "$release" && ! -L "$release" ]]; then
+  if [[ -f "$release" && ! -L "$release" && "$(stat -c '%u:%a' -- "$release")" == "$(id -u):600" ]]; then
     printf 'diagnostic-pause: released\n'
   else
     printf 'diagnostic-pause: expired\n'
@@ -53,6 +106,10 @@ main() {
 if [[ "${1:-}" == --release-vm-diagnostic-pause ]]; then
   release_vm_diagnostic_pause "$@"
   return 0
+fi
+if [[ "${1:-}" == --diagnose-vm-backup ]]; then
+  diagnose_vm_backup "$@"
+  return $?
 fi
 if [[ "${1:-}" == --host ]]; then
   failure_scope=host-orchestration
@@ -75,8 +132,8 @@ if [[ "${1:-}" == --host ]]; then
 fi
 [[ "$#" == 5 && "$1" == --vm ]] || { usage >&2; exit 2; }
 local diagnostic_pause_seconds="${LOCALAI_ACCEPTANCE_DIAGNOSTIC_PAUSE_SECONDS:-0}"
-if [[ ! "$diagnostic_pause_seconds" =~ ^[0-9]{1,3}$ ]] || (( diagnostic_pause_seconds > 300 )); then
-  fail 'VM diagnostic pause must be an integer from 0 through 300 seconds.'
+if [[ ! "$diagnostic_pause_seconds" =~ ^[0-9]{1,4}$ ]] || (( diagnostic_pause_seconds > 1800 )); then
+  fail 'VM diagnostic pause must be an integer from 0 through 1800 seconds.'
 fi
 base="$(realpath -e -- "$2")" || fail 'base image does not exist.'
 key="$(realpath -e -- "$3")" || fail 'SSH key does not exist.'
@@ -118,6 +175,9 @@ cleanup() {
   if [[ "$diagnostic_control_created" == 1 ]]; then
     rm -f -- "$diagnostic_control_scratch/diagnostic-active" "$diagnostic_control_scratch/diagnostic-release"
   fi
+  if [[ "$diagnostic_connection_created" == 1 ]]; then
+    rm -f -- "$diagnostic_control_scratch/diagnostic-connection"
+  fi
   rm -rf -- "$work"
 }
 trap cleanup EXIT
@@ -127,6 +187,11 @@ trap 'exit 143' TERM
 qemu-img create -q -f qcow2 -F qcow2 -b "$base" "$work/overlay.qcow2" || fail 'cannot create VM overlay.'
 cp -- "$vars" "$work/vars.fd"
 port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+connection="$scratch/diagnostic-connection"
+[[ ! -e "$connection" && ! -L "$connection" ]] || fail 'VM diagnostic connection path is already occupied.'
+(umask 077; set -o noclobber; printf '%s\n%s\n%s\n' "$port" "$key" "$work/known_hosts" >"$connection") || fail 'could not prepare VM diagnostic connection.'
+diagnostic_connection_created=1
+chmod 0600 -- "$connection"
 # QEMU's comma-separated drive syntax escapes a literal comma as two commas.
 overlay_arg="${work//,/,,}/overlay.qcow2"
 vars_arg="${work//,/,,}/vars.fd"
