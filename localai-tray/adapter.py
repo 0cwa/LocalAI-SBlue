@@ -45,8 +45,8 @@ _LOG_TERMINALS = {
 LOG_TERMINALS = tuple(_LOG_TERMINALS)
 _LOGS_WAIT_SCRIPT = (
     '"$1" logs "$2"; result=$?; '
-    'printf "\\nLog command exited with status %s.\\n" "$result"; '
-    'read -r -p "Press Enter to close this terminal..." _; '
+    'printf "\\nLog command exited with status %s.\\nPress Enter to close this terminal...\\n" "$result" >&2; '
+    'IFS= read -r _; '
     'exit "$result"'
 )
 

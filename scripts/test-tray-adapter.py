@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import importlib.util
 from pathlib import Path
+import subprocess
+from subprocess import TimeoutExpired
 from unittest.mock import Mock
 
 module_path = Path(__file__).parents[1] / "localai-tray" / "adapter.py"
@@ -119,7 +121,30 @@ assert script == adapter._LOGS_WAIT_SCRIPT
 assert injection_attempt not in script
 assert terminal_args[-2:] == [injection_attempt, "backend"]
 assert '"$1" logs "$2"' in script
-assert 'read -r -p "Press Enter to close this terminal..."' in script
+assert 'IFS= read -r _' in script
+wait_args = adapter.log_terminal_args("konsole", "/usr/bin/true", "backend")
+process = subprocess.Popen(
+    wait_args[1:],
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    text=True,
+)
+try:
+    try:
+        process.wait(timeout=0.1)
+    except TimeoutExpired:
+        pass
+    else:
+        raise AssertionError("the log terminal wrapper must wait for user input after logs finish")
+    stdout, stderr = process.communicate(input="\n", timeout=1)
+except BaseException:
+    process.kill()
+    process.wait()
+    raise
+assert process.returncode == 0
+assert "Log command exited with status 0." in stderr
+assert "Press Enter to close this terminal..." in stderr
 for invalid_terminal, invalid_component in (("unknown", "backend"), ("konsole", "all")):
     try:
         adapter.log_terminal_args(invalid_terminal, "localaictl", invalid_component)
