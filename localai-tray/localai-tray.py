@@ -18,7 +18,10 @@ from adapter import (
     doctor_summary,
     endpoint,
     has_unavailable_manager,
+    log_terminal_args,
+    LOG_TERMINALS,
     menu_entries,
+    open_logs_after_confirmation,
     parse_start_requested,
     parse_status,
     should_start_after_status,
@@ -245,29 +248,25 @@ class LocalAITray(QSystemTrayIcon):
         self._controller.run("doctor")
 
     def open_logs(self, component: str) -> None:
-        if component not in {"backend", "tls"}:
-            return
-        answer = QMessageBox.warning(
-            None,
-            f"Open {component} logs?",
-            "Logs may contain secrets. They will be opened in a terminal and will not be shown in the tray. Review and sanitize them before sharing.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Cancel,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
-            return
+        def confirm() -> bool:
+            answer = QMessageBox.warning(
+                None,
+                f"Open {component} logs?",
+                "Logs may contain secrets. They will be opened in a terminal and will not be shown in the tray. Review and sanitize them before sharing.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            return answer == QMessageBox.StandardButton.Yes
 
-        terminals = (
-            ("konsole", ["-e"]),
-            ("kgx", ["--"]),
-            ("gnome-terminal", ["--wait", "--"]),
-            ("xterm", ["-e"]),
-        )
-        for terminal, prefix in terminals:
+        open_logs_after_confirmation(component, confirm, self._launch_logs_in_terminal)
+
+    def _launch_logs_in_terminal(self, component: str) -> None:
+        for terminal in LOG_TERMINALS:
             executable = QStandardPaths.findExecutable(terminal)
             if not executable:
                 continue
-            started = QProcess.startDetached(executable, [*prefix, self._controller.control, "logs", component])
+            args = log_terminal_args(terminal, self._controller.control, component)
+            started = QProcess.startDetached(executable, args)
             if isinstance(started, tuple):
                 started = started[0]
             if started:

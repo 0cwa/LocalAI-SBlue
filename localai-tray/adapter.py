@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from urllib.parse import urlsplit
 
 
@@ -34,6 +35,20 @@ _SERVICE_STATES = {
     "unknown",
     "disabled",
 }
+
+_LOG_TERMINALS = {
+    "konsole": ("-e",),
+    "kgx": ("--",),
+    "gnome-terminal": ("--wait", "--"),
+    "xterm": ("-e",),
+}
+LOG_TERMINALS = tuple(_LOG_TERMINALS)
+_LOGS_WAIT_SCRIPT = (
+    '"$1" logs "$2"; result=$?; '
+    'printf "\\nLog command exited with status %s.\\n" "$result"; '
+    'read -r -p "Press Enter to close this terminal..." _; '
+    'exit "$result"'
+)
 
 
 def command_args(action: str) -> list[str]:
@@ -141,3 +156,32 @@ def should_start_after_status(start_requested: bool, status: dict[str, object] |
 
 def menu_entries(actions: dict[str, object]) -> tuple[object | None, ...]:
     return tuple(None if name is None else actions[name] for name in MENU_STRUCTURE)
+
+
+def log_terminal_args(terminal: str, control: str, component: str) -> list[str]:
+    if component not in {"backend", "tls"}:
+        raise ValueError("unsupported LocalAI log component")
+    try:
+        prefix = _LOG_TERMINALS[terminal]
+    except KeyError as error:
+        raise ValueError("unsupported terminal") from error
+    return [
+        *prefix,
+        "/usr/bin/bash",
+        "-c",
+        _LOGS_WAIT_SCRIPT,
+        "localai-tray-logs",
+        control,
+        component,
+    ]
+
+
+def open_logs_after_confirmation(
+    component: str,
+    confirm: Callable[[], bool],
+    launch: Callable[[str], None],
+) -> bool:
+    if component not in {"backend", "tls"} or not confirm():
+        return False
+    launch(component)
+    return True

@@ -267,8 +267,9 @@ each time it checks status; polling never requests elevation. If a manager
 state is unavailable, the tray suggests `localaictl status --elevated` in a
 terminal. Backend and TLS log actions require confirmation first and then open
 the logs in a terminal; logs may contain secrets and must be reviewed and
-sanitized before sharing. Remove the launcher with
-`localai-tray/uninstall.sh`.
+sanitized before sharing. The terminal stays open after the log command exits
+until you press Enter, so the output remains available to review. Remove the
+launcher with `localai-tray/uninstall.sh`.
 
 ## Lifecycle acceptance
 

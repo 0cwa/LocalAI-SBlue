@@ -5,7 +5,7 @@ has been runtime-qualified on secureblue or on a GPU.
 
 ## Unreleased
 
-- Add tray endpoint diagnostics, safe endpoint copying, and warning-gated terminal log access while keeping backend and TLS states independent.
+- Add tray endpoint diagnostics, safe endpoint copying, and warning-gated terminal log access that stays open for review while keeping backend and TLS states independent.
 - Probe all configured writable LocalAI paths inside the existing container and document which paths hold persistent data or scratch files.
 
 ## 0.2.0

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import importlib.util
 from pathlib import Path
+from unittest.mock import Mock
 
 module_path = Path(__file__).parents[1] / "localai-tray" / "adapter.py"
 spec = importlib.util.spec_from_file_location("localai_tray_adapter", module_path)
@@ -93,5 +94,38 @@ assert adapter.parse_start_requested(["--start"]) is True
 assert adapter.should_start_after_status(True, unavailable) is True
 assert adapter.should_start_after_status(True, plain) is False
 assert adapter.should_start_after_status(False, unavailable) is False
+
+# The warning callback must finish before a terminal launch is requested.
+events = []
+confirm_logs = Mock(side_effect=lambda: events.append("warning") or True)
+launch_logs = Mock(side_effect=lambda component: events.append(("launch", component)))
+assert adapter.open_logs_after_confirmation("backend", confirm_logs, launch_logs)
+assert events == ["warning", ("launch", "backend")]
+launch_logs.assert_called_once_with("backend")
+
+cancel_events = []
+cancel_logs = Mock(side_effect=lambda: cancel_events.append("warning") or False)
+cancel_launch = Mock(side_effect=lambda component: cancel_events.append(("launch", component)))
+assert not adapter.open_logs_after_confirmation("tls", cancel_logs, cancel_launch)
+assert cancel_events == ["warning"]
+cancel_launch.assert_not_called()
+
+# The wrapper is fixed text; controller paths and components occupy distinct
+# positional argv entries and cannot become shell syntax.
+injection_attempt = "localaictl; printf injected"
+terminal_args = adapter.log_terminal_args("konsole", injection_attempt, "backend")
+script = terminal_args[terminal_args.index("-c") + 1]
+assert script == adapter._LOGS_WAIT_SCRIPT
+assert injection_attempt not in script
+assert terminal_args[-2:] == [injection_attempt, "backend"]
+assert '"$1" logs "$2"' in script
+assert 'read -r -p "Press Enter to close this terminal..."' in script
+for invalid_terminal, invalid_component in (("unknown", "backend"), ("konsole", "all")):
+    try:
+        adapter.log_terminal_args(invalid_terminal, "localaictl", invalid_component)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("unsupported terminal or log component must be rejected")
 
 print("tray adapter tests passed")
