@@ -153,6 +153,33 @@ diagnose_vm_backup_with_proc_root() {
   qemu_process_matches "$qemu_pid" "$qemu_start" "$port" "$expected_exe" "$proc_root" || fail 'VM diagnostic QEMU process identity is stale or mismatched.'
   worker=/root/agent-scratch/LocalAI-SBlue/acceptance-source/scripts/acceptance-guest.sh
   isolated_ssh_args ssh_args "$key" "$port" "$known_hosts" 5
+  # Refresh only the acceptance diagnostic worker in this disposable guest.
+  # The remote command and target are fixed, and the connection remains bound
+  # to the recorded QEMU process and pinned host key.
+  if ! timeout 30s ssh "${ssh_args[@]}" root@127.0.0.1 \
+    "install -o root -g root -m 0644 /dev/stdin $worker" \
+    <"$repo_root/scripts/acceptance-guest.sh" >/dev/null 2>&1; then
+    fail 'could not refresh the fixed VM diagnostic worker.'
+  fi
+  printf 'diagnostic-worker: refreshed\n'
+  local rootless_output=''
+  if rootless_output="$(timeout 240s ssh "${ssh_args[@]}" root@127.0.0.1 \
+    "env LOCALAI_ACCEPTANCE_MODE=host LOCALAI_ACCEPTANCE_RECEIPT=/var/lib/localai-acceptance-run/receipt bash $worker --rootless-archive-roundtrip >/dev/null 2>&1; status=\$?; if [ \$status -eq 0 ]; then printf 'diagnostic graphroot-unshare-poc-run: pass\\n'; else printf 'diagnostic graphroot-unshare-poc-run: fail\\n'; fi; grep -E '^diagnostic graphroot-unshare-(poc-reason|setup-reason|owner-mode|xattr|selinux|host-mapping): ' /var/lib/localai-acceptance-run/receipt | tail -n 6" 2>/dev/null)"; then
+    printf '%s\n' "$rootless_output" | while IFS= read -r line; do
+      case "$line" in
+        'diagnostic graphroot-unshare-poc-run: pass'|'diagnostic graphroot-unshare-poc-run: fail') printf '%s\n' "$line" ;;
+        'diagnostic graphroot-unshare-setup-reason: config-load'|'diagnostic graphroot-unshare-setup-reason: state-directory'|'diagnostic graphroot-unshare-setup-reason: temp-directory'|'diagnostic graphroot-unshare-setup-reason: service-uid'|'diagnostic graphroot-unshare-setup-reason: directory-owner'|'diagnostic graphroot-unshare-setup-reason: directory-mode'|'diagnostic graphroot-unshare-setup-reason: probe-mode'|'diagnostic graphroot-unshare-setup-reason: probe-owner') printf '%s\n' "$line" ;;
+        'diagnostic graphroot-unshare-poc-reason: subgid-map-unavailable'|'diagnostic graphroot-unshare-poc-reason: tar-create-failed'|'diagnostic graphroot-unshare-poc-reason: tar-extract-failed'|'diagnostic graphroot-unshare-poc-reason: owner-mode-failed'|'diagnostic graphroot-unshare-poc-reason: user-xattr-failed'|'diagnostic graphroot-unshare-poc-reason: selinux-source-unavailable'|'diagnostic graphroot-unshare-poc-reason: selinux-label-failed'|'diagnostic graphroot-unshare-poc-reason: python-permission'|'diagnostic graphroot-unshare-poc-reason: python-file-missing'|'diagnostic graphroot-unshare-poc-reason: python-os-error'|'diagnostic graphroot-unshare-poc-reason: python-value-error'|'diagnostic graphroot-unshare-poc-reason: python-overflow'|'diagnostic graphroot-unshare-poc-reason: python-type-error'|'diagnostic graphroot-unshare-poc-reason: python-key-error'|'diagnostic graphroot-unshare-poc-reason: python-runtime-error'|'diagnostic graphroot-unshare-poc-reason: python-other'|'diagnostic graphroot-unshare-poc-reason: no-poc-result'|'diagnostic graphroot-unshare-poc-reason: unshare-command-failed')
+          printf '%s\n' "$line" ;;
+        'diagnostic graphroot-unshare-owner-mode: pass'|'diagnostic graphroot-unshare-owner-mode: fail'|'diagnostic graphroot-unshare-xattr: pass'|'diagnostic graphroot-unshare-xattr: fail'|'diagnostic graphroot-unshare-selinux: pass'|'diagnostic graphroot-unshare-selinux: fail'|'diagnostic graphroot-unshare-selinux: unavailable'|'diagnostic graphroot-unshare-host-mapping: pass'|'diagnostic graphroot-unshare-host-mapping: fail')
+          printf '%s\n' "$line" ;;
+      esac
+    done
+    if [[ -z "$rootless_output" ]]; then printf 'diagnostic graphroot-unshare-poc-reason: no-poc-output\n'; fi
+  else
+    printf 'diagnostic graphroot-unshare-poc-reason: ssh-unavailable\n'
+  fi
+  unset rootless_output
   if output="$(timeout 1800s ssh "${ssh_args[@]}" root@127.0.0.1 "bash $worker diagnose-backup" 2>&1)"; then
     status=0
   else
@@ -165,7 +192,7 @@ diagnose_vm_backup_with_proc_root() {
       'diagnostic backup-restore-backup-reason: '*)
         reason="${line#diagnostic backup-restore-backup-reason: }"
         case "$reason" in
-          service-stop|unit-ownership|capacity|destination-parent-unsafe|destination-exists|destination-directory|destination-overlap|configured-paths|archive-file-type|unsafe-name|traversal-path|duplicate-member|link-cross-root|link-escape|hardlink|system-manager-tree|path-outside-roots|special-member|nested-member|privileged-mode|file-capability|config-member|persistent-root-type|missing-metadata|archive-read|persistent-root-metadata|unit-path-outside-roots|unit-ancestor-metadata-missing|unit-ancestor-metadata-weakened|unit-tree-omitted|unit-tree-extra-entry|unit-tree-type-mismatch|unit-tree-file-mismatch|unit-tree-link-mismatch|unit-tree-unsupported-link|unit-tree-unexpected|unit-tree-entries-differ|unit-tree-check-exception|unit-tree-validation|symlink|archive-validation|helper-invocation|helper-validation|helper-exception|helper-no-diagnostic|helper-unclassified|tar|lock-contention|config-guard|other)
+          service-stop|service-restart|unit-ownership|capacity|destination-parent-unsafe|destination-exists|destination-directory|destination-overlap|configured-paths|archive-file-type|unsafe-name|traversal-path|duplicate-member|link-cross-root|link-escape|hardlink|system-manager-tree|path-outside-roots|special-member|nested-member|privileged-mode|file-capability|config-member|persistent-root-type|missing-metadata|archive-read|persistent-root-metadata|unit-path-outside-roots|unit-ancestor-metadata-missing|unit-ancestor-metadata-weakened|unit-tree-omitted|unit-tree-extra-entry|unit-tree-type-mismatch|unit-tree-file-mismatch|unit-tree-link-mismatch|unit-tree-unsupported-link|unit-tree-unexpected|unit-tree-entries-differ|unit-tree-check-exception|unit-tree-validation|symlink|archive-validation|helper-invocation|helper-validation|helper-exception|helper-no-diagnostic|helper-unclassified|rootless-context|rootless-mapping|rootless-archive|archive-metadata|tar|lock-contention|config-guard|other)
             printf 'diagnostic backup-restore-backup-reason: %s\n' "$reason" ;;
           *) printf 'diagnostic backup-restore-backup-reason: unknown\n' ;;
         esac ;;

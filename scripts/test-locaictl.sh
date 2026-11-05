@@ -174,6 +174,22 @@ if [[ " $* " == *" is-active "* ]]; then
     *) printf 'inactive\n' ;;
   esac
 fi
+if [[ " $* " == *" show --property=ExecStartPre --value "* ]]; then
+  if [[ "${LOCALAI_FAKE_MISSING_RESTORE_GUARD:-}" != backend && " $* " == *" localai.service "* ]]; then
+    printf '/usr/bin/test ! -e /var/lib/.localaictl-backup-restore.pending\n'
+  fi
+  if [[ "${LOCALAI_FAKE_MISSING_RESTORE_GUARD:-}" != tls && " $* " == *" localai-tls-compose.service "* ]]; then
+    printf '/usr/bin/test ! -e /var/lib/.localaictl-backup-restore.pending\n'
+  fi
+fi
+if [[ " $* " == *" show --property=Conditions --value "* ]]; then
+  if [[ "${LOCALAI_FAKE_MISSING_RESTORE_GUARD:-}" != socket && " $* " == *" localai-tls-forward.socket "* ]]; then
+    printf 'ConditionPathExists=!/var/lib/.localaictl-backup-restore.pending\n'
+  fi
+  if [[ "${LOCALAI_FAKE_MISSING_RESTORE_GUARD:-}" != forward-service && " $* " == *" localai-tls-forward.service "* ]]; then
+    printf 'ConditionPathExists=!/var/lib/.localaictl-backup-restore.pending\n'
+  fi
+fi
 if [[ " $* " == *" show localai.service --property=DropInPaths --value "* ]]; then
   printf '\n'
 fi
@@ -561,6 +577,10 @@ mkdir -p "$tmp_dir/backup-state" "$tmp_dir/backup-tls" "$tmp_dir/backup-cache" "
 mkdir -p "$tmp_dir/backup-state/.config/systemd/user"
 printf '# Managed by LocalAI secureblue installer.\nDescription=LocalAI OpenAI-compatible API and web UI container\n' >"$tmp_dir/backup-state/.config/systemd/user/localai.service"
 chmod 0644 "$tmp_dir/backup-state/.config/systemd/user/localai.service"
+mkdir -p "$tmp_dir/backup-tls/compose"
+printf 'services:\n  caddy:\n    image: trusted-test-baseline\n' >"$tmp_dir/backup-tls/compose/localai-tls-compose.yaml"
+chmod 0755 "$tmp_dir/backup-tls/compose"
+chmod 0644 "$tmp_dir/backup-tls/compose/localai-tls-compose.yaml"
 mkdir -p "$tmp_dir/backup-tls/.config/systemd/user"
 printf '# Managed by LocalAI secureblue TLS installer.\nDescription=LocalAI TLS reverse proxy compose stack\n' >"$tmp_dir/backup-tls/.config/systemd/user/localai-tls-compose.service"
 chmod 0644 "$tmp_dir/backup-tls/.config/systemd/user/localai-tls-compose.service"
@@ -863,6 +883,7 @@ with tempfile.TemporaryDirectory(prefix="owner-policy-test-", dir=os.environ["TM
         helper.validate_id_map(f"0:1001:1;1:200000:65536", 1001, "svc", "/etc/subuid")
         helper.validate_id_map(f"0:1001:1;1:300000:65536", 1001, "svc", "/etc/subgid")
     unsafe_policies = (
+        ("svc:4294967290:10\n", "svc:400000:100\n", "root:x:0:0:root:/root:/bin/bash\nsvc:x:1001:1001:svc:/nonexistent:/sbin/nologin\n", "root:x:0:\nsvc:x:1001:\n"),
         ("svc:200000:100\nother:200050:100\n", "svc:400000:100\n", "root:x:0:0:root:/root:/bin/bash\nsvc:x:1001:1001:svc:/nonexistent:/sbin/nologin\n", "root:x:0:\nsvc:x:1001:\n"),
         ("svc:200000:100\n", "svc:400000:100\nother:400050:100\n", "root:x:0:0:root:/root:/bin/bash\nsvc:x:1001:1001:svc:/nonexistent:/sbin/nologin\n", "root:x:0:\nsvc:x:1001:\n"),
         ("svc:200000:100\n", "svc:400000:100\n", "intruder:x:200050:1002::/:/sbin/nologin\n", "root:x:0:\nsvc:x:1001:\n"),
@@ -1264,7 +1285,66 @@ with tempfile.TemporaryDirectory(prefix="graphroot-outer-", dir=os.environ["TMPD
             else:
                 raise SystemExit("nested graphroot archive accepted a different live destination")
 PY
-stop_count_before="$(rg -c ' stop localai.service$' "$tmp_dir/commands" || true)"
+python3 - "$repo_root/lib" "$tmp_dir" <<'PY'
+import io
+import os
+import sys
+import tarfile
+import tempfile
+from contextlib import redirect_stderr
+from unittest.mock import patch
+
+sys.path.insert(0, sys.argv[1])
+import backup_archive as helper
+
+with tempfile.TemporaryDirectory(prefix="trusted-compose-test-", dir=sys.argv[2]) as work:
+    live_root = os.path.join(work, "tls-compose")
+    os.mkdir(live_root, 0o700)
+    live_file = os.path.join(live_root, "localai-tls-compose.yaml")
+    with open(live_file, "wb") as stream:
+        stream.write(b"services:\n  caddy:\n    image: trusted\n")
+    os.chmod(live_file, 0o644)
+    archive_path = os.path.join(work, "backup.tar.gz")
+    staged_root = os.path.join(work, "stage")
+    os.mkdir(staged_root, 0o700)
+
+    def write_bundle(payload):
+        with tarfile.open(archive_path, "w:gz") as archive:
+            root = tarfile.TarInfo(live_root.lstrip("/") + "/")
+            root.type, root.mode = tarfile.DIRTYPE, 0o700
+            root.uid, root.gid = os.getuid(), os.getgid()
+            archive.addfile(root)
+            member = tarfile.TarInfo(live_file.lstrip("/"))
+            member.size, member.mode = len(payload), 0o644
+            member.uid, member.gid = os.getuid(), os.getgid()
+            archive.addfile(member, io.BytesIO(payload))
+        os.makedirs(os.path.join(staged_root, live_root.lstrip("/")), mode=0o700, exist_ok=True)
+        with open(os.path.join(staged_root, live_file.lstrip("/")), "wb") as stream:
+            stream.write(payload)
+        os.chmod(os.path.join(staged_root, live_file.lstrip("/")), 0o644)
+
+    trusted = b"services:\n  caddy:\n    image: trusted\n"
+    write_bundle(trusted)
+    helper.trusted_compose_tree(archive_path, staged_root, live_root)
+    malicious = b"services:\n  attacker:\n    image: untrusted\n"
+    write_bundle(malicious)
+    with redirect_stderr(io.StringIO()):
+        try:
+            helper.trusted_compose_tree(archive_path, staged_root, live_root)
+        except SystemExit:
+            pass
+        else:
+            raise SystemExit("restore accepted a changed TLS Compose workload")
+PY
+for missing_restore_guard in backend tls socket forward-service; do
+  stop_count_before="$(rg -c ' stop localai.service$' "$tmp_dir/commands" || true)"
+  if LOCALAI_FAKE_MISSING_RESTORE_GUARD="$missing_restore_guard" "$repo_root/bin/localaictl" restore --yes "$backup_archive" >/dev/null 2>&1; then
+    printf 'restore proceeded with an old effective %s unit lacking the durable marker guard\n' "$missing_restore_guard" >&2
+    exit 1
+  fi
+  stop_count_after="$(rg -c ' stop localai.service$' "$tmp_dir/commands" || true)"
+  [[ "$stop_count_before" == "$stop_count_after" ]]
+done
 if LOCALAI_FAKE_WRONG_TLS_UNIT_OWNER=true "$repo_root/bin/localaictl" backup "$tmp_dir/wrong-tls-owner.tar.gz" >/dev/null 2>&1; then
   printf 'backup accepted a TLS unit with the wrong owner\n' >&2
   exit 1

@@ -280,7 +280,7 @@ def subid_ranges(account: str, filename: str, aliases: set[str] | None = None) -
                 if len(fields) != 3 or not fields[1].isdecimal() or not fields[2].isdecimal():
                     fail("cannot verify rootless subordinate ID ranges")
                 start, length = int(fields[1]), int(fields[2])
-                if length < 1:
+                if length < 1 or start + length > 2**32:
                     fail("cannot verify rootless subordinate ID ranges")
                 all_ranges.append((fields[0], start, start + length))
                 if fields[0] in account_names:
@@ -1217,6 +1217,81 @@ def unit_trees(
     return sorted(directories)
 
 
+def trusted_compose_tree(archive_path: str, stage: str, configured_root: str) -> None:
+    """Require a restored TLS Compose tree to match the installed baseline."""
+    if (not configured_root.startswith("/") or os.path.normpath(configured_root) != configured_root or
+            configured_root == "/"):
+        fail("configured TLS Compose tree path is invalid")
+    prefix = configured_root.lstrip("/")
+    live_root = "/" + prefix
+    archive_entries: dict[str, tarfile.TarInfo] = {}
+    try:
+        with tarfile.open(archive_path, "r:gz") as archive:
+            for info in archive:
+                name = clean_member_name(info.name)
+                if name == prefix or name.startswith(prefix + "/"):
+                    archive_entries[name] = info
+    except (OSError, tarfile.TarError):
+        fail("cannot read configured TLS Compose tree from backup")
+    if not os.path.lexists(live_root) and not archive_entries:
+        return
+    if (not os.path.isdir(live_root) or os.path.islink(live_root) or
+            prefix not in archive_entries or not archive_entries[prefix].isdir()):
+        fail("backup TLS Compose tree root differs from the installed tree")
+    live_entries: set[str] = set()
+    for current, directories, files in os.walk(live_root, topdown=True, followlinks=False):
+        for entry in directories + files:
+            path = os.path.join(current, entry)
+            metadata = os.lstat(path)
+            if stat.S_ISLNK(metadata.st_mode):
+                fail("installed TLS Compose tree contains an unsupported link")
+            if not (stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)):
+                fail("installed TLS Compose tree contains an unsupported file type")
+            live_entries.add(os.path.relpath(path, "/"))
+        directories[:] = [entry for entry in directories if not os.path.islink(os.path.join(current, entry))]
+    if set(archive_entries) != live_entries | {prefix}:
+        fail("backup TLS Compose tree entries differ from the installed tree")
+    with tarfile.open(archive_path, "r:gz") as archive:
+        for name, info in archive_entries.items():
+            target = os.path.join("/", name)
+            staged = os.path.join(stage, name)
+            live = os.lstat(target)
+            if (info.uid, info.gid, stat.S_IMODE(info.mode), info.isdir(), info.isfile()) != (
+                    live.st_uid, live.st_gid, stat.S_IMODE(live.st_mode),
+                    stat.S_ISDIR(live.st_mode), stat.S_ISREG(live.st_mode)):
+                fail("backup TLS Compose tree metadata differs from the installed tree")
+            if info.isfile() and info.size != live.st_size:
+                fail("backup TLS Compose file differs from the installed tree")
+            if info.isfile():
+                archived = archive.extractfile(info)
+                if archived is None:
+                    fail("backup TLS Compose file differs from the installed tree")
+                with open(target, "rb") as installed:
+                    installed_digest = hashlib.file_digest(installed, "sha256").digest()
+                if hashlib.file_digest(archived, "sha256").digest() != installed_digest:
+                    fail("backup TLS Compose file differs from the installed tree")
+                if stage and not same_file_bytes(os.path.join(stage, name), target):
+                    fail("staged TLS Compose file differs from the installed tree")
+            live_xattrs = {
+                key: os.getxattr(target, key, follow_symlinks=False)
+                for key in os.listxattr(target, follow_symlinks=False) if key != "security.selinux"
+            }
+            archived_xattrs = {
+                key.removeprefix("SCHILY.xattr."): value.encode() if isinstance(value, str) else value
+                for key, value in info.pax_headers.items() if key.startswith("SCHILY.xattr.") and key != "SCHILY.xattr.security.selinux"
+            }
+            if archived_xattrs != live_xattrs:
+                fail("backup TLS Compose tree xattrs differ from the installed tree")
+            if stage:
+                staged = os.path.join(stage, name)
+                staged_xattrs = {
+                    key: os.getxattr(staged, key, follow_symlinks=False)
+                    for key in os.listxattr(staged, follow_symlinks=False) if key != "security.selinux"
+                }
+                if staged_xattrs != live_xattrs:
+                    fail("staged TLS Compose tree xattrs differ from the installed tree")
+
+
 def nearest_existing_path(path: str) -> str:
     current = os.path.abspath(path)
     leaf = current
@@ -1690,7 +1765,7 @@ def main() -> None:
             destinations = rest[1:]
         space_check(sys.argv[2], sys.argv[3], collision_file, destinations, staged=staged, rootless_context=rootless_context)
         return
-    if len(sys.argv) < 4 or sys.argv[1] not in {"validate", "validate-created", "members0", "collisions0", "destinations", "skip-links0", "unit-trees0", "rollback-new", "copy-source", "rootless-present", "sync-destinations"}:
+    if len(sys.argv) < 4 or sys.argv[1] not in {"validate", "validate-created", "members0", "collisions0", "destinations", "skip-links0", "unit-trees0", "trusted-compose", "rollback-new", "copy-source", "rootless-present", "sync-destinations"}:
         raise SystemExit(2)
     mode, archive, config = sys.argv[1:4]
     rest = sys.argv[4:]
@@ -1708,6 +1783,11 @@ def main() -> None:
         return
     if mode == "sync-destinations":
         sync_restore_filesystems(archive, config, rest, rootless_context)
+        return
+    if mode == "trusted-compose":
+        if len(rest) != 2:
+            raise SystemExit(2)
+        trusted_compose_tree(archive, rest[0], rest[1])
         return
     if mode == "rollback-new":
         if len(rest) < 3:

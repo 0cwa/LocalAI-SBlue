@@ -95,19 +95,49 @@ service_podman() {
     --setenv=PATH=/usr/bin:/bin -- /usr/bin/podman "$@"
 }
 
+rootless_poc_failure_category() {
+  local result="$1"
+  case "$result" in
+    *'poc: subgid-map-unavailable'*) printf 'subgid-map-unavailable' ;;
+    *'poc: tar-create-failed'*) printf 'tar-create-failed' ;;
+    *'poc: tar-extract-failed'*) printf 'tar-extract-failed' ;;
+    *'poc: owner-mode-failed'*) printf 'owner-mode-failed' ;;
+    *'poc: user-xattr-failed'*) printf 'user-xattr-failed' ;;
+    *'poc: selinux-source-unavailable'*) printf 'selinux-source-unavailable' ;;
+    *'poc: selinux-label-failed'*) printf 'selinux-label-failed' ;;
+    *'poc: python-PermissionError'*) printf 'python-permission' ;;
+    *'poc: python-FileNotFoundError'*) printf 'python-file-missing' ;;
+    *'poc: python-OSError'*) printf 'python-os-error' ;;
+    *'poc: python-ValueError'*) printf 'python-value-error' ;;
+    *'poc: python-OverflowError'*) printf 'python-overflow' ;;
+    *'poc: python-TypeError'*) printf 'python-type-error' ;;
+    *'poc: python-KeyError'*) printf 'python-key-error' ;;
+    *'poc: python-RuntimeError'*) printf 'python-runtime-error' ;;
+    *'poc: python-other'*) printf 'python-other' ;;
+    *) printf 'no-poc-result' ;;
+  esac
+}
+
+record_rootless_poc_setup_failure() {
+  local receipt_path="$1" category="$2"
+  [[ -f "$receipt_path" && ! -L "$receipt_path" ]] || return 1
+  printf 'diagnostic graphroot-unshare-setup-reason: %s\n' "$category" >>"$receipt_path"
+  return 1
+}
+
 rootless_archive_roundtrip_poc() {
   local receipt_path="${LOCALAI_ACCEPTANCE_RECEIPT:-}" probe_script result status=0 uid service_user
   [[ -n "$receipt_path" && -f "$receipt_path" && ! -L "$receipt_path" ]] || return 1
   # shellcheck disable=SC1091
   # shellcheck source=../lib/config.sh
   source "$repo_root/lib/config.sh"
-  localai_config_load_compat /etc/localai/localai.conf "$repo_root/localai/localai.lock" || return 1
+  localai_config_load_compat /etc/localai/localai.conf "$repo_root/localai/localai.lock" || { record_rootless_poc_setup_failure "$receipt_path" config-load; return 1; }
   service_user="$LOCALAI_SERVICE_USER"
-  [[ -d "$LOCALAI_STATE_DIR" && ! -L "$LOCALAI_STATE_DIR" ]] || return 1
-  rootless_poc_dir="$(mktemp -d "$LOCALAI_STATE_DIR/.localaictl-unshare-poc.XXXXXX")" || return 1
-  uid="$(id -u "$service_user")" || return 1
-  chown "$service_user:$service_user" "$rootless_poc_dir" || return 1
-  chmod 0700 "$rootless_poc_dir" || return 1
+  [[ -d "$LOCALAI_STATE_DIR" && ! -L "$LOCALAI_STATE_DIR" ]] || { record_rootless_poc_setup_failure "$receipt_path" state-directory; return 1; }
+  rootless_poc_dir="$(mktemp -d "$LOCALAI_STATE_DIR/.localaictl-unshare-poc.XXXXXX")" || { record_rootless_poc_setup_failure "$receipt_path" temp-directory; return 1; }
+  uid="$(id -u "$service_user")" || { record_rootless_poc_setup_failure "$receipt_path" service-uid; return 1; }
+  chown "$service_user:$service_user" "$rootless_poc_dir" || { record_rootless_poc_setup_failure "$receipt_path" directory-owner; return 1; }
+  chmod 0700 "$rootless_poc_dir" || { record_rootless_poc_setup_failure "$receipt_path" directory-mode; return 1; }
   probe_script="$rootless_poc_dir/probe.py"
   cat >"$probe_script" <<'PY'
 import os
@@ -185,13 +215,17 @@ except BaseException as error:
     print("poc: python-" + (type(error).__name__ if type(error).__name__ in known else "other"))
     raise SystemExit(0)
 PY
-  chmod 0644 "$probe_script" || { rm -rf -- "$rootless_poc_dir"; return 1; }
-  chown localai:localai "$probe_script" || { rm -rf -- "$rootless_poc_dir"; return 1; }
+  chmod 0644 "$probe_script" || { rm -rf -- "$rootless_poc_dir"; record_rootless_poc_setup_failure "$receipt_path" probe-mode; return 1; }
+  chown "$service_user:$service_user" "$probe_script" || { rm -rf -- "$rootless_poc_dir"; record_rootless_poc_setup_failure "$receipt_path" probe-owner; return 1; }
   if result="$(service_podman unshare /usr/bin/python3 "$probe_script" "$rootless_poc_dir" "$service_user" 2>&1)"; then
     status=0
   else
     status=$?
   fi
+  local poc_reason
+  poc_reason="$(rootless_poc_failure_category "$result")"
+  if (( status != 0 )); then poc_reason=unshare-command-failed; fi
+  printf 'diagnostic graphroot-unshare-poc-reason: %s\n' "$poc_reason" >>"$receipt_path"
   if [[ "$result" == *'poc: namespace-owner-mode-pass'* ]]; then
     printf 'diagnostic graphroot-unshare-owner-mode: pass\n' >>"$receipt_path"
   else
@@ -409,7 +443,7 @@ backup_acceptance_step() {
   local destination="$1" status=0 reason=other output=''
   printf 'command backup-restore-backup: localaictl backup with root-owned config and persistent marker\n' >>"$receipt"
   printf 'waiting backup-restore-backup: timeout 1800s\n' >>"$receipt"
-  if output="$(timeout --kill-after=10s 1800s "$controller" backup "$destination" 2>&1 >/dev/null)"; then
+  if output="$(timeout --kill-after=10s 1800s "$controller" backup "$destination" 2>&1)"; then
     printf 'step backup-restore-backup: pass\n' >>"$receipt"
   else
     status=$?
@@ -458,6 +492,11 @@ backup_acceptance_step() {
       *"already running"*) reason=lock-contention ;;
       *"configuration file must"*) reason=config-guard ;;
       *"shared backup archive helper is missing"*|*"command not found"*|*"No such file or directory"*|*"could not invoke"*) reason=helper-invocation ;;
+      *"backup completed but one or more previously active services could not be restarted"*) reason=service-restart ;;
+      *"cannot verify the LocalAI service account"*|*"cannot verify rootless"*|*"rootless service account does not exist"*) reason=rootless-context ;;
+      *"subordinate ID"*|*"user namespace mapping"*|*"rootless namespace"*) reason=rootless-mapping ;;
+      *"rootless archive"*|*"rootless graphroot archive"*|*"rootless graphroot extraction"*) reason=rootless-archive ;;
+      *"backup metadata"*) reason=archive-metadata ;;
       *"Traceback"*|*"TypeError"*|*"ValueError"*|*"PermissionError"*|*"AttributeError"*) reason=helper-exception ;;
       *"unsupported or unsafe filesystem entries"*|*"backup contains an unsafe"*|*"backup contains unsupported"*|*"symbolic link"*|*"file capability"*|*"setuid or setgid"*) reason=helper-validation ;;
       "") reason=helper-no-diagnostic ;;
