@@ -936,8 +936,138 @@ backup() {
   log "Backup created: $destination"
 }
 
+rootless_tar_failure_category() {
+  local error="$1"
+  case "$error" in
+    *"Cannot open: Permission denied"*) printf 'source-open-permission' ;;
+    *"Cannot read: Permission denied"*) printf 'source-read-permission' ;;
+    *"Cannot get extended attributes: Permission denied"*) printf 'xattr-read-permission' ;;
+    *"Cannot set extended attributes: Permission denied"*) printf 'xattr-write-permission' ;;
+    *"Cannot get ACL"*"Permission denied"*) printf 'acl-read-permission' ;;
+    *"Cannot set ACL"*"Permission denied"*) printf 'acl-write-permission' ;;
+    *"Cannot stat: Permission denied"*) printf 'source-stat-permission' ;;
+    *"Cannot change ownership"*"Permission denied"*) printf 'ownership-permission' ;;
+    *"Permission denied"*) printf 'permission' ;;
+    *"No space left on device"*|*"quota exceeded"*) printf 'capacity' ;;
+    *"File changed as we read it"*|*"file changed as we read it"*|*"file changed while"*) printf 'source-changed' ;;
+    *"unrecognized option"*|*"invalid option"*) printf 'unsupported-option' ;;
+    *"No such file or directory"*|*"Cannot stat"*) printf 'source-path' ;;
+    *"Operation not permitted"*) printf 'operation-not-permitted' ;;
+    *"Failed to connect"*|*"Failed to open bus"*) printf 'service-manager' ;;
+    *"xattr"*|*"extended attribute"*) printf 'xattr' ;;
+    "") printf 'empty-error' ;;
+    *) printf 'other' ;;
+  esac
+}
+
+rootless_tar_member_metadata_category() {
+  local graphroot="$1" error="$2" category
+  category="$(printf '%s\n%s\n' "$graphroot" "$error" | /usr/bin/python3 -c '
+import os
+import pwd
+import re
+import stat
+import sys
+
+graphroot = sys.stdin.readline().rstrip("\n")
+error = sys.stdin.read()
+try:
+    root = os.path.normpath(graphroot)
+    root_parent = os.path.dirname(root)
+    candidate = None
+    for line in error.splitlines():
+        match = re.search(r"tar: (.+): Cannot open: Permission denied", line)
+        if match:
+            candidate = match.group(1)
+            break
+    if candidate is None:
+        print("member-unidentified")
+        raise SystemExit(0)
+    path = os.path.normpath(candidate if os.path.isabs(candidate) else os.path.join(root_parent, candidate))
+    if os.path.commonpath((root, path)) != root:
+        print("member-outside-graphroot")
+        raise SystemExit(0)
+    relative = os.path.relpath(path, root)
+    components = relative.split(os.sep)
+    current = root
+    for component in components[:-1]:
+        current = os.path.join(current, component)
+        ancestor = os.lstat(current)
+        if not stat.S_ISDIR(ancestor.st_mode) or stat.S_ISLNK(ancestor.st_mode):
+            print("member-path-unsafe")
+            raise SystemExit(0)
+    info = os.lstat(path)
+    kind = "directory" if stat.S_ISDIR(info.st_mode) else "regular" if stat.S_ISREG(info.st_mode) else "symlink" if stat.S_ISLNK(info.st_mode) else "special"
+    first = relative.split(os.sep, 1)[0]
+    path_class = {
+        "overlay": "overlay-layer",
+        "overlay-images": "image-metadata",
+        "overlay-containers": "container-metadata",
+        "overlay-layers": "layer-metadata",
+        "overlay-locks": "overlay-locks",
+        "volumes": "volume-data",
+        "libpod": "libpod-metadata",
+        "tmp": "temporary-data",
+        "mounts": "mount-metadata",
+        "containers": "container-state",
+        "storage.lock": "storage-lock",
+        "bolt_state.db": "storage-database",
+        "bolt_state.db.lock": "storage-lock",
+        "metadata.db": "storage-database",
+        "db.sql": "storage-database",
+        "network": "network-metadata",
+        ".lock": "storage-lock",
+        "userns.lock": "storage-lock",
+        "overlay.lock": "storage-lock",
+    }.get(first)
+    if path_class is None:
+        if os.sep in relative:
+            path_class = "other-root-subtree"
+        elif first.startswith("."):
+            path_class = "hidden-root-entry"
+        elif first.endswith(".lock"):
+            path_class = "root-lock-entry"
+        elif first.endswith(".db"):
+            path_class = "root-database-entry"
+        elif first.endswith((".json", ".conf", ".yaml", ".yml")):
+            path_class = "root-metadata-entry"
+        else:
+            path_class = "other-root-entry"
+    service_uid = int(os.environ.get("LOCALAI_DIAGNOSTIC_SERVICE_UID", "-1"))
+    service_name = pwd.getpwuid(service_uid).pw_name
+    if info.st_uid == service_uid:
+        owner = "service"
+    elif info.st_uid == 0:
+        owner = "host-root"
+    else:
+        mapped = False
+        with open("/etc/subuid", encoding="ascii") as mappings:
+            for row in mappings:
+                fields = row.rstrip("\n").split(":")
+                if len(fields) != 3 or not fields[1].isdigit() or not fields[2].isdigit():
+                    continue
+                if fields[0] not in (service_name, str(service_uid)):
+                    continue
+                start, length = int(fields[1]), int(fields[2])
+                if start <= info.st_uid < start + length:
+                    mapped = True
+                    break
+        owner = "subuid" if mapped else "other"
+    mode = stat.S_IMODE(info.st_mode)
+    print(f"member-{kind}-owner-{owner}-mode-{mode:04o}-path-{path_class}")
+except (OSError, ValueError, OverflowError, KeyError):
+    print("member-metadata-unavailable")
+')" || category=member-metadata-unavailable
+  if [[ "$category" =~ ^member-(regular|directory|symlink|special)-owner-(service|subuid|host-root|other)-mode-[0-7][0-7][0-7][0-7]-path-(overlay-layer|image-metadata|container-metadata|layer-metadata|overlay-locks|volume-data|libpod-metadata|temporary-data|mount-metadata|container-state|storage-lock|storage-database|network-metadata|hidden-root-entry|root-lock-entry|root-database-entry|root-metadata-entry|other-root-entry|other-root-subtree)$ ||
+        "$category" =~ ^member-(unidentified|outside-graphroot|metadata-unavailable|path-unsafe)$ ]]; then
+    printf '%s' "$category"
+  else
+    printf 'member-metadata-unavailable'
+  fi
+}
+
 backup_locked() {
-  local exclude_models=0 archive_file metadata_dir stage_base archive_args=() path rootless_nested=''
+  local exclude_models=0 archive_file metadata_dir stage_base archive_args=() path rootless_nested='' rootless_tar_error='' rootless_tar_category rootless_tar_member_category
   local -a backup_space_args=()
   if [[ "${1:-}" == --exclude-models ]]; then exclude_models=1; shift; fi
   [[ "${1:-}" == --archive-file && "$#" == 2 ]] || die "internal backup requires an archive stream target"
@@ -973,8 +1103,39 @@ backup_locked() {
     fi
     rootless_nested="$metadata_dir/$ROOTLESS_GRAPHROOT_MEMBER"
     [[ ! -e "$rootless_nested" && ! -L "$rootless_nested" ]] || die "rootless graphroot staging file already exists"
-    run_rootless_podman "$tar_bin" --create --file - --xattrs --acls --selinux --numeric-owner \
-      --sparse --directory "${rootless_graphroot%/*}" "${rootless_graphroot##*/}" 2>/dev/null >"$rootless_nested" || die "rootless graphroot archive creation failed"
+    if [[ "${LOCALAI_ACCEPTANCE_DIAGNOSTIC:-}" == 1 ]]; then
+      if rootless_tar_error="$(set -o pipefail; run_rootless_podman "$tar_bin" --create --file - --xattrs --acls --selinux --numeric-owner \
+        --sparse --directory "${rootless_graphroot%/*}" "${rootless_graphroot##*/}" 2>&1 >"$rootless_nested" | /usr/bin/python3 -c '
+import sys
+
+limit = 8192
+tail = bytearray()
+while True:
+    chunk = sys.stdin.buffer.read(4096)
+    if not chunk:
+        break
+    tail.extend(chunk)
+    if len(tail) > limit:
+        del tail[:-limit]
+sys.stdout.buffer.write(tail)
+' )"; then
+        :
+      else
+        rootless_tar_category="$(rootless_tar_failure_category "$rootless_tar_error")"
+        printf 'localaictl: diagnostic-rootless-tar-failure: %s\n' "$rootless_tar_category" >&2
+        if [[ "$rootless_tar_category" == source-open-permission ]]; then
+          rootless_tar_member_category="$(LOCALAI_DIAGNOSTIC_SERVICE_UID="$(service_uid "$LOCALAI_SERVICE_USER")" rootless_tar_member_metadata_category "$rootless_graphroot" "$rootless_tar_error")"
+          printf 'localaictl: diagnostic-rootless-tar-member: %s\n' "$rootless_tar_member_category" >&2
+          unset rootless_tar_member_category
+        fi
+        unset rootless_tar_error
+        die "rootless graphroot archive creation failed"
+      fi
+      unset rootless_tar_error
+    else
+      run_rootless_podman "$tar_bin" --create --file - --xattrs --acls --selinux --numeric-owner \
+        --sparse --directory "${rootless_graphroot%/*}" "${rootless_graphroot##*/}" 2>/dev/null >"$rootless_nested" || die "rootless graphroot archive creation failed"
+    fi
     chmod 0600 "$rootless_nested"
   fi
   {

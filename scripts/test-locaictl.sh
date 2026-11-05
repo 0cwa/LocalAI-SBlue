@@ -8,9 +8,43 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 TEST_REPO_ROOT="$repo_root"
 source "$repo_root/scripts/test-support.sh"
 test_sanitize_localai_environment
+# shellcheck disable=SC1090
+source <(sed -n '/^rootless_tar_failure_category() {$/,/^}/p' "$repo_root/bin/localaictl")
+# shellcheck disable=SC1090
+source <(sed -n '/^rootless_tar_member_metadata_category() {$/,/^}/p' "$repo_root/bin/localaictl")
+[[ "$(rootless_tar_failure_category 'tar: cannot write: Permission denied')" == permission ]]
+[[ "$(rootless_tar_failure_category 'tar: synthetic: Cannot open: Permission denied')" == source-open-permission ]]
+[[ "$(rootless_tar_failure_category 'tar: synthetic: Cannot read: Permission denied')" == source-read-permission ]]
+[[ "$(rootless_tar_failure_category 'tar: synthetic: Cannot get extended attributes: Permission denied')" == xattr-read-permission ]]
+[[ "$(rootless_tar_failure_category 'tar: synthetic: Cannot set extended attributes: Permission denied')" == xattr-write-permission ]]
+[[ "$(rootless_tar_failure_category 'tar: synthetic: Cannot get ACL: Permission denied')" == acl-read-permission ]]
+[[ "$(rootless_tar_failure_category 'tar: synthetic: Cannot set ACL: Permission denied')" == acl-write-permission ]]
+[[ "$(rootless_tar_failure_category 'tar: synthetic: Cannot stat: Permission denied')" == source-stat-permission ]]
+[[ "$(rootless_tar_failure_category 'tar: synthetic: Cannot change ownership: Permission denied')" == ownership-permission ]]
+[[ "$(rootless_tar_failure_category 'tar: write failed: No space left on device')" == capacity ]]
+[[ "$(rootless_tar_failure_category 'tar: file changed as we read it')" == source-changed ]]
+[[ "$(rootless_tar_failure_category 'tar: unrecognized option -- test')" == unsupported-option ]]
+[[ "$(rootless_tar_failure_category 'tar: Cannot stat: No such file or directory')" == source-path ]]
+[[ "$(rootless_tar_failure_category 'tar: Operation not permitted')" == operation-not-permitted ]]
+[[ "$(rootless_tar_failure_category 'Failed to connect to bus')" == service-manager ]]
+[[ "$(rootless_tar_failure_category 'tar: xattr failed')" == xattr ]]
+[[ "$(rootless_tar_failure_category '')" == empty-error ]]
+[[ "$(rootless_tar_failure_category 'synthetic unclassified diagnostic')" == other ]]
 tmp_dir="$(test_mktemp_dir localaictl-test)"
 trap 'rm -rf "$tmp_dir"' EXIT
 export TMPDIR="$tmp_dir"
+mkdir -p "$tmp_dir/storage"
+printf 'synthetic fixture\n' >"$tmp_dir/storage/member"
+chmod 0640 "$tmp_dir/storage/member"
+[[ "$(LOCALAI_DIAGNOSTIC_SERVICE_UID="$(id -u)" rootless_tar_member_metadata_category "$tmp_dir/storage" 'tar: storage/member: Cannot open: Permission denied')" == member-regular-owner-service-mode-0640-path-other-root-entry ]]
+printf 'synthetic lock\n' >"$tmp_dir/storage/storage.lock"
+chmod 0600 "$tmp_dir/storage/storage.lock"
+[[ "$(LOCALAI_DIAGNOSTIC_SERVICE_UID="$(id -u)" rootless_tar_member_metadata_category "$tmp_dir/storage" 'tar: storage/storage.lock: Cannot open: Permission denied')" == member-regular-owner-service-mode-0600-path-storage-lock ]]
+[[ "$(LOCALAI_DIAGNOSTIC_SERVICE_UID="$(id -u)" rootless_tar_member_metadata_category "$tmp_dir/storage" 'synthetic diagnostic with no path')" == member-unidentified ]]
+[[ "$(LOCALAI_DIAGNOSTIC_SERVICE_UID="$(id -u)" rootless_tar_member_metadata_category "$tmp_dir/storage" 'tar: ../outside: Cannot open: Permission denied')" == member-outside-graphroot ]]
+mkdir -p "$tmp_dir/outside"
+ln -s "$tmp_dir/outside" "$tmp_dir/storage/link"
+[[ "$(LOCALAI_DIAGNOSTIC_SERVICE_UID="$(id -u)" rootless_tar_member_metadata_category "$tmp_dir/storage" 'tar: storage/link/member: Cannot open: Permission denied')" == member-path-unsafe ]]
 
 cat >"$tmp_dir/config" <<'EOF'
 LOCALAI_TLS_ENABLED=true

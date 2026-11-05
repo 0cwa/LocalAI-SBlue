@@ -511,6 +511,24 @@ backup_acceptance_step() {
   else
     status=$?
     case "$output" in
+      *"diagnostic-rootless-tar-failure: source-open-permission"*) reason=rootless-tar-source-open-permission ;;
+      *"diagnostic-rootless-tar-failure: source-read-permission"*) reason=rootless-tar-source-read-permission ;;
+      *"diagnostic-rootless-tar-failure: xattr-read-permission"*) reason=rootless-tar-xattr-read-permission ;;
+      *"diagnostic-rootless-tar-failure: xattr-write-permission"*) reason=rootless-tar-xattr-write-permission ;;
+      *"diagnostic-rootless-tar-failure: acl-read-permission"*) reason=rootless-tar-acl-read-permission ;;
+      *"diagnostic-rootless-tar-failure: acl-write-permission"*) reason=rootless-tar-acl-write-permission ;;
+      *"diagnostic-rootless-tar-failure: source-stat-permission"*) reason=rootless-tar-source-stat-permission ;;
+      *"diagnostic-rootless-tar-failure: ownership-permission"*) reason=rootless-tar-ownership-permission ;;
+      *"diagnostic-rootless-tar-failure: permission"*) reason=rootless-tar-permission ;;
+      *"diagnostic-rootless-tar-failure: capacity"*) reason=rootless-tar-capacity ;;
+      *"diagnostic-rootless-tar-failure: source-changed"*) reason=rootless-tar-source-changed ;;
+      *"diagnostic-rootless-tar-failure: unsupported-option"*) reason=rootless-tar-unsupported-option ;;
+      *"diagnostic-rootless-tar-failure: source-path"*) reason=rootless-tar-source-path ;;
+      *"diagnostic-rootless-tar-failure: operation-not-permitted"*) reason=rootless-tar-operation-not-permitted ;;
+      *"diagnostic-rootless-tar-failure: service-manager"*) reason=rootless-tar-service-manager ;;
+      *"diagnostic-rootless-tar-failure: xattr"*) reason=rootless-tar-xattr ;;
+      *"diagnostic-rootless-tar-failure: empty-error"*) reason=rootless-tar-empty-error ;;
+      *"diagnostic-rootless-tar-failure: other"*) reason=rootless-tar-other ;;
       *"could not stop "*|*"could not verify that "*|*"cannot determine a stable "*" service state"*) reason=service-stop ;;
       *"not verifiably managed"*|*"unit is not owned"*|*"unit owner"*|*"service unit is not"*) reason=unit-ownership ;;
       *"insufficient free disk space"*|*"No space left on device"*|*"quota exceeded"*) reason=capacity ;;
@@ -578,6 +596,9 @@ backup_acceptance_step() {
     esac
     printf 'step backup-restore-backup: %s\n' "$([[ "$status" == 124 ]] && printf timeout || printf fail)" >>"$receipt"
     printf 'diagnostic backup-restore-backup-reason: %s\n' "$reason" >>"$receipt"
+    if [[ "$output" =~ diagnostic-rootless-tar-member:\ (member-(regular|directory|symlink|special)-owner-(service|subuid|host-root|other)-mode-([0-7]{4})-path-(overlay-layer|image-metadata|container-metadata|layer-metadata|overlay-locks|volume-data|libpod-metadata|temporary-data|mount-metadata|container-state|storage-lock|storage-database|network-metadata|hidden-root-entry|root-lock-entry|root-database-entry|root-metadata-entry|other-root-entry|other-root-subtree)|member-unidentified|member-outside-graphroot|member-metadata-unavailable|member-path-unsafe) ]]; then
+      printf 'diagnostic backup-restore-rootless-tar-member: %s\n' "${BASH_REMATCH[1]}" >>"$receipt"
+    fi
     if [[ "$output" =~ diagnostic-controller-site:([0-9]{1,6}) ]]; then
       printf 'diagnostic backup-restore-controller-site: %s\n' "${BASH_REMATCH[1]}" >>"$receipt"
     fi
