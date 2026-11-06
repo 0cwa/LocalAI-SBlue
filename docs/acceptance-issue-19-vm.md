@@ -54,3 +54,36 @@ was saved as
 `issue-19-vm-receipt-9e267a8-20261105-run1.txt` in task scratch (SHA-256
 `9c79f98756b0b637e8cfc33a046266232fc88af5bcaf0ea29c8dcf57cf644bf5`); no
 keys, credentials, raw logs, or VM overlays are part of this repository.
+
+## Rebased-head backend revalidation
+
+Date: 2026-11-06. Result: **pass** in a fresh disposable VM against the
+rebased PR head. This run used the #17 VM mode and covered the current backend,
+backup/restore, upgrade, and uninstall paths. The runner reported `scope:
+backend only; TLS not exercised`; the TLS behavior above remains qualified by
+the earlier issue-19 run at its recorded source commit.
+
+- Tested source commit: `e7f81414b8825d023a4b6e29170f144736f22c5b`.
+- Project version: `0.2.0`; source archive SHA-256:
+  `4f4a245b314ef51e449819801e4182e9a54773990ae555d0e4f099c03616d4cf`.
+- OS: secureblue 44 kinoite-main-hardened; deployment
+  `a21fc280bc53cfbb3c80622ec36cac9a1f574899623dadb731314c5c79efa817`.
+- Kernel `6.19.14-300.fc44.x86_64`, Podman `5.8.2`, systemd `259`; SELinux
+  enforcing; container-domain user namespaces requested.
+- CPU image `docker.io/localai/localai:latest`, digest
+  `sha256:ac48a6f50d9a7557df457c4abd886c0fd2eec74cc53265ecfce226393b6445f4`.
+- Install, first-admin bootstrap, reboot, explicit start, status, logs, image
+  inspection, doctor, rootless archive round-trip, backup/restore, all four
+  enabled/disabled and running/stopped upgrade states, configuration/data
+  preservation, conservative uninstall, and unrelated-container preservation
+  passed.
+- Sanitized runner output is in task scratch as
+  `issue-19-vm/receipt.txt` (SHA-256
+  `45853a38b5ef2d751512a6bea2dd148be1524d8475d11d002f948611f2ea101b`). The
+  throwaway overlay was removed by the runner.
+
+The rebase added the issue-20 restore-in-progress guard to the TLS Compose
+unit. `scripts/test-render-config.sh` now asserts that exact guard is present
+in both backend and TLS unit templates; the mocked lifecycle test also checks
+that TLS starts are blocked while the marker remains. No physical-host or GPU
+qualification is implied by either VM run.
