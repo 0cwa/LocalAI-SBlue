@@ -1013,6 +1013,14 @@ valid = make_archive([
 ])
 if "storage/overlay/layer/diff/tool" not in validate(valid):
     raise SystemExit("nested graphroot archive member was not validated")
+image_privileged_modes = make_archive([
+    directory("storage/"),
+    regular("storage/overlay/layer/diff/usr/bin/passwd", mode=0o4755, uid=0, gid=0),
+    regular("storage/overlay/layer/diff/usr/bin/write", mode=0o2755, uid=0, gid=0),
+])
+validated_privileged_members = validate(image_privileged_modes)
+if not {"storage/overlay/layer/diff/usr/bin/passwd", "storage/overlay/layer/diff/usr/bin/write"}.issubset(validated_privileged_members):
+    raise SystemExit("rootless image special modes were not preserved")
 for unsafe_root_mode in (0o000, 0o500, 0o1700, 0o2700):
     rejects(make_archive([directory("storage/", mode=unsafe_root_mode)]))
 rejects(valid, "0:1002:1;1:200000:65536")

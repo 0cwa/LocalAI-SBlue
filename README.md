@@ -390,8 +390,11 @@ the backup to an installation with the same LocalAI subordinate ID mapping;
 restoring it onto a host with different mappings is refused. Restore moves the
 old GraphRoot aside on the same filesystem, extracts the validated inner tar
 using `podman unshare`, and returns the old tree if restore fails. The inner
-archive is never extracted as host root. Existing service unit trees remain
-required on the destination host as described below.
+archive is never extracted as host root. Setuid and setgid bits in this archive
+are retained because namespace root maps to the service account; they cannot
+raise host privileges beyond that account. Ordinary persistent paths still
+reject these bits. Existing service unit trees remain required on the
+destination host as described below.
 
 Restore preserves validated ownership and non-SELinux xattrs. It rejects ACL
 metadata and archived SELinux labels on ordinary persistent paths, then applies

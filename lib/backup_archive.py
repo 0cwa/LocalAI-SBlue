@@ -684,10 +684,11 @@ def validate_graphroot_tar(
                     fail("rootless archive contains an unsupported special file")
                 if not mapped_id(info.uid, uid_map) or not mapped_id(info.gid, gid_map):
                     fail("rootless archive contains an unmapped owner or group")
-                if info.mode & 0o4000 and info.uid == 0:
-                    fail("rootless archive has setuid ownership mapped to the service account")
-                if info.mode & 0o2000 and info.gid == 0:
-                    fail("rootless archive has setgid ownership mapped to the service group")
+                # In podman-unshare archives, namespace ID 0 maps to the
+                # service account. Special mode bits on those files cannot
+                # grant host privileges beyond that account and are common in
+                # container image layers. Ordinary persistent roots still
+                # reject all setuid/setgid bits.
                 if any(key.lower().endswith("security.capability") and value for key, value in info.pax_headers.items()):
                     fail("rootless archive contains a file capability xattr")
                 if any("acl" in key.lower() and value for key, value in info.pax_headers.items()):

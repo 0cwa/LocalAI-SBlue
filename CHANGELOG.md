@@ -39,6 +39,9 @@ has been runtime-qualified on secureblue or on a GPU.
 - Omit the installer's regenerable state `build/` assets from backups and create
   backup acceptance markers with configured service-account ownership and
   verified SELinux labels.
+- Preserve setuid/setgid bits in validated rootless image archives where
+  namespace root maps to the service account; ordinary persistent paths still
+  reject these bits.
 
 ## 0.2.0
 
