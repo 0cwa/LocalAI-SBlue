@@ -345,6 +345,9 @@ run_elevated_pipe "$tmp_dir/journalctl" sample >/dev/null
 rg -q '^run0 -i ' "$tmp_dir/commands"
 rg -q '^run0 -i --pipe ' "$tmp_dir/commands"
 : >"$tmp_dir/commands"
+LOCALAI_ACCEPTANCE_DIAGNOSTIC=1 run_elevated "$tmp_dir/systemctl" sample
+rg -q '^run0 -i /usr/bin/env LOCALAI_ACCEPTANCE_DIAGNOSTIC=1 ' "$tmp_dir/commands"
+: >"$tmp_dir/commands"
 
 mkdir -p "$tmp_dir/systemd"
 printf '[Socket]\nFreeBind=true\n' >"$tmp_dir/systemd/localai-tls-forward.socket"

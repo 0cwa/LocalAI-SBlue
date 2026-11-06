@@ -281,6 +281,8 @@ include_rootless_graphroot() {
 run_elevated() {
   if is_effectively_root; then
     "$@"
+  elif [[ "${LOCALAI_ACCEPTANCE_DIAGNOSTIC:-}" == 1 ]]; then
+    "$run0_bin" -i /usr/bin/env LOCALAI_ACCEPTANCE_DIAGNOSTIC=1 "$@"
   else
     "$run0_bin" -i "$@"
   fi
