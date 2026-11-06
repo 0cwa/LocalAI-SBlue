@@ -375,7 +375,11 @@ remove_tls_user_unit_enablement() {
     owner="$(/usr/bin/stat -c '%u' -- "$link")" || die "Could not inspect TLS unit enablement ownership."
     [[ "$owner" == "$expected_uid" ]] || die "Refusing to remove TLS unit enablement not owned by the service account."
     target="$(/usr/bin/readlink -- "$link")" || die "Could not inspect TLS unit enablement target."
-    resolved_target="$(/usr/bin/realpath -m -- "$wants_dir/$target")" || die "Could not resolve TLS unit enablement target."
+    if [[ "$target" == /* ]]; then
+      resolved_target="$(/usr/bin/realpath -m -- "$target")" || die "Could not resolve TLS unit enablement target."
+    else
+      resolved_target="$(/usr/bin/realpath -m -- "$wants_dir/$target")" || die "Could not resolve TLS unit enablement target."
+    fi
     expected_target="$(/usr/bin/realpath -m -- "$unit_dir/$unit")" || die "Could not resolve managed TLS unit path."
     [[ "$resolved_target" == "$expected_target" ]] || die "Refusing to remove a TLS enablement link with an unexpected target."
     log "Removing stale TLS user-unit enablement link for $unit"

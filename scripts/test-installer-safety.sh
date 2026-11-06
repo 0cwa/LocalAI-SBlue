@@ -870,7 +870,7 @@ printf 'TLS uninstall removes only managed user-unit enablement links checks\n'
   : > "$unit_dir/$tls_service_name"
   : > "$unit_dir/$legacy_tls_service_name"
   : > "$scratch/unrelated-unit.service"
-  ln -s "../$tls_service_name" "$wants_dir/$tls_service_name"
+  ln -s "$unit_dir/$tls_service_name" "$wants_dir/$tls_service_name"
   ln -s "../$legacy_tls_service_name" "$wants_dir/$legacy_tls_service_name"
   ln -s "$scratch/unrelated-unit.service" "$wants_dir/unrelated.service"
   # shellcheck disable=SC2329
