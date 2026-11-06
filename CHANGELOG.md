@@ -24,8 +24,8 @@ has been runtime-qualified on secureblue or on a GPU.
   same-filesystem no-replace renames with identity-checked cleanup.
 - Retry only read-only rootless Podman and GraphRoot probes briefly after
   transient systemd user-bus errors; state-changing commands remain single-shot.
-- Reduce VM restore acceptance failures to an allowlisted reason and controller
-  line number without retaining raw command output.
+- Reduce VM restore acceptance failures to an allowlisted reason and source
+  line numbers without retaining raw command output.
 - Include configured external GraphRoots, check backup/restore capacity on
   their actual filesystems, and refuse restores when the installed graph path
   or subordinate UID/GID mappings differ from the archive.

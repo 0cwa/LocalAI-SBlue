@@ -558,6 +558,9 @@ restore_acceptance_step() {
   if [[ "$output" =~ diagnostic-controller-site:([0-9]{1,6}) ]]; then
     printf 'diagnostic backup-restore-restore-controller-site: %s\n' "${BASH_REMATCH[1]}" >>"$receipt"
   fi
+  if [[ "$output" =~ diagnostic-helper-site:([0-9]{1,6}) ]]; then
+    printf 'diagnostic backup-restore-restore-helper-site: %s\n' "${BASH_REMATCH[1]}" >>"$receipt"
+  fi
   return 1
 }
 

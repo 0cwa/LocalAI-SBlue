@@ -169,7 +169,8 @@ case "$1" in
   restore)
     if [[ "${TEST_RESTORE_FAIL:-0}" == 1 ]]; then
       printf 'localaictl: rootless graphroot extraction failed; rollback will run before services restart\n' >&2
-      printf 'localaictl: diagnostic-controller-site:1314\n' >&2
+      printf 'localaictl: diagnostic-controller-site:1215\n' >&2
+      printf 'localaictl: diagnostic-helper-site:708\n' >&2
       exit 1
     fi
     cp -- "$TEST_WORK/saved-config" "$TEST_CONFIG"
@@ -264,7 +265,8 @@ EOF
     printf 'failed restore diagnostic fixture was accepted\n' >&2; exit 1
   fi
   rg -q '^diagnostic backup-restore-restore-reason: rootless-extraction$' "$receipt" || { printf 'restore failure was not reduced to an allowlisted category\n' >&2; exit 1; }
-  rg -q '^diagnostic backup-restore-restore-controller-site: 1314$' "$receipt" || { printf 'restore controller site was not reduced to a line number\n' >&2; exit 1; }
+  rg -q '^diagnostic backup-restore-restore-controller-site: 1215$' "$receipt" || { printf 'restore controller site was not reduced to a line number\n' >&2; exit 1; }
+  rg -q '^diagnostic backup-restore-restore-helper-site: 708$' "$receipt" || { printf 'restore helper site was not reduced to a line number\n' >&2; exit 1; }
   if rg -q 'rootless graphroot extraction failed' "$receipt"; then
     printf 'raw restore error text leaked into the acceptance receipt\n' >&2; exit 1
   fi
