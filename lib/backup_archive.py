@@ -537,11 +537,40 @@ def create_graphroot_noreplace(path: str, service_uid: int, service_gid: int) ->
             os.close(parent_fd)
 
 
-def remove_tree_at(parent_fd: int, name: str) -> None:
+def fd_mount_id(fd: int) -> int:
+    try:
+        with open(f"/proc/self/fdinfo/{fd}", encoding="ascii") as stream:
+            for line in stream:
+                key, separator, value = line.partition(":")
+                if separator and key == "mnt_id":
+                    mount_id = int(value.strip())
+                    if mount_id > 0:
+                        return mount_id
+    except (OSError, ValueError):
+        pass
+    fail("cannot verify rootless graphroot mount identity")
+
+
+def remove_tree_at(parent_fd: int, name: str, expected_mount_id: int) -> None:
     try:
         metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     except FileNotFoundError:
         return
+    try:
+        path_fd = os.open(
+            name,
+            getattr(os, "O_PATH", os.O_RDONLY) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_fd,
+        )
+    except OSError:
+        fail("rootless graphroot changed during safe removal")
+    try:
+        opened_metadata = os.fstat(path_fd)
+        if ((opened_metadata.st_dev, opened_metadata.st_ino) != (metadata.st_dev, metadata.st_ino) or
+                fd_mount_id(path_fd) != expected_mount_id):
+            fail("rootless graphroot mount changed during safe removal")
+    finally:
+        os.close(path_fd)
     if stat.S_ISDIR(metadata.st_mode):
         child_fd = os.open(
             name,
@@ -550,10 +579,11 @@ def remove_tree_at(parent_fd: int, name: str) -> None:
         )
         try:
             child_metadata = os.fstat(child_fd)
-            if (child_metadata.st_dev, child_metadata.st_ino) != (metadata.st_dev, metadata.st_ino):
-                fail("rootless graphroot changed during safe removal")
+            if ((child_metadata.st_dev, child_metadata.st_ino) != (metadata.st_dev, metadata.st_ino) or
+                    fd_mount_id(child_fd) != expected_mount_id):
+                fail("rootless graphroot mount changed during safe removal")
             for child in os.listdir(child_fd):
-                remove_tree_at(child_fd, child)
+                remove_tree_at(child_fd, child, expected_mount_id)
         finally:
             os.close(child_fd)
         try:
@@ -578,7 +608,21 @@ def remove_graphroot_nofollow(path: str, expected_device: int, expected_inode: i
             fail("rootless graphroot removal identity does not match")
         if graphroot_mounts(path):
             fail("rootless graphroot removal contains a mount point")
-        remove_tree_at(parent_fd, name)
+        parent_mount_id = fd_mount_id(parent_fd)
+        root_fd = os.open(
+            name,
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_fd,
+        )
+        try:
+            root_metadata = os.fstat(root_fd)
+            root_mount_id = fd_mount_id(root_fd)
+            if ((root_metadata.st_dev, root_metadata.st_ino) != (metadata.st_dev, metadata.st_ino) or
+                    root_mount_id != parent_mount_id):
+                fail("rootless graphroot mount changed during safe removal")
+        finally:
+            os.close(root_fd)
+        remove_tree_at(parent_fd, name, parent_mount_id)
     finally:
         os.close(parent_fd)
 

@@ -36,24 +36,15 @@ export TMPDIR="$tmp_dir"
 mkdir -p "$tmp_dir/storage"
 printf 'synthetic fixture\n' >"$tmp_dir/storage/member"
 chmod 0640 "$tmp_dir/storage/member"
-[[ "$(LOCALAI_DIAGNOSTIC_SERVICE_UID="$(id -u)" rootless_tar_member_metadata_category "$tmp_dir/storage" 'tar: storage/member: Cannot open: Permission denied')" == member-regular-owner-service-mode-0640-family-other-persistence-unknown ]]
-printf 'synthetic lock\n' >"$tmp_dir/storage/storage.lock"
-chmod 0600 "$tmp_dir/storage/storage.lock"
-[[ "$(LOCALAI_DIAGNOSTIC_SERVICE_UID="$(id -u)" rootless_tar_member_metadata_category "$tmp_dir/storage" 'tar: storage/storage.lock: Cannot open: Permission denied')" == member-regular-owner-service-mode-0600-family-lock-persistence-unknown ]]
-printf 'synthetic database\n' >"$tmp_dir/storage/state.db"
-chmod 0600 "$tmp_dir/storage/state.db"
-[[ "$(LOCALAI_DIAGNOSTIC_SERVICE_UID="$(id -u)" rootless_tar_member_metadata_category "$tmp_dir/storage" 'tar: storage/state.db: Cannot open: Permission denied')" == member-regular-owner-service-mode-0600-family-db-persistence-persistent ]]
-printf 'synthetic index\n' >"$tmp_dir/storage/index"
-chmod 0600 "$tmp_dir/storage/index"
-[[ "$(LOCALAI_DIAGNOSTIC_SERVICE_UID="$(id -u)" rootless_tar_member_metadata_category "$tmp_dir/storage" 'tar: storage/index: Cannot open: Permission denied')" == member-regular-owner-service-mode-0600-family-index-persistence-persistent ]]
-printf 'synthetic config\n' >"$tmp_dir/storage/storage.conf"
-chmod 0600 "$tmp_dir/storage/storage.conf"
-[[ "$(LOCALAI_DIAGNOSTIC_SERVICE_UID="$(id -u)" rootless_tar_member_metadata_category "$tmp_dir/storage" 'tar: storage/storage.conf: Cannot open: Permission denied')" == member-regular-owner-service-mode-0600-family-config-persistence-persistent ]]
-[[ "$(LOCALAI_DIAGNOSTIC_SERVICE_UID="$(id -u)" rootless_tar_member_metadata_category "$tmp_dir/storage" 'synthetic diagnostic with no path')" == member-unidentified ]]
-[[ "$(LOCALAI_DIAGNOSTIC_SERVICE_UID="$(id -u)" rootless_tar_member_metadata_category "$tmp_dir/storage" 'tar: ../outside: Cannot open: Permission denied')" == member-outside-graphroot ]]
+[[ "$(LOCALAI_DIAGNOSTIC_SERVICE_UID="$(id -u)" rootless_tar_member_metadata_category "$tmp_dir/storage" 'tar: storage/member: Cannot open: Permission denied' "$tmp_dir/storage/.localaictl-backup-restore-marker")" == member-regular-owner-service-mode-0640-path-other-root-entry ]]
+printf 'synthetic marker\n' >"$tmp_dir/storage/.localaictl-backup-restore-marker"
+chmod 0600 "$tmp_dir/storage/.localaictl-backup-restore-marker"
+[[ "$(LOCALAI_DIAGNOSTIC_SERVICE_UID="$(id -u)" rootless_tar_member_metadata_category "$tmp_dir/storage" 'tar: storage/.localaictl-backup-restore-marker: Cannot open: Permission denied' "$tmp_dir/storage/.localaictl-backup-restore-marker")" == member-acceptance-marker-owner-service-mode-0600-persistence-fixture ]]
+[[ "$(LOCALAI_DIAGNOSTIC_SERVICE_UID="$(id -u)" rootless_tar_member_metadata_category "$tmp_dir/storage" 'synthetic diagnostic with no path' "$tmp_dir/storage/.localaictl-backup-restore-marker")" == member-unidentified ]]
+[[ "$(LOCALAI_DIAGNOSTIC_SERVICE_UID="$(id -u)" rootless_tar_member_metadata_category "$tmp_dir/storage" 'tar: ../outside: Cannot open: Permission denied' "$tmp_dir/storage/.localaictl-backup-restore-marker")" == member-outside-graphroot ]]
 mkdir -p "$tmp_dir/outside"
 ln -s "$tmp_dir/outside" "$tmp_dir/storage/link"
-[[ "$(LOCALAI_DIAGNOSTIC_SERVICE_UID="$(id -u)" rootless_tar_member_metadata_category "$tmp_dir/storage" 'tar: storage/link/member: Cannot open: Permission denied')" == member-path-unsafe ]]
+[[ "$(LOCALAI_DIAGNOSTIC_SERVICE_UID="$(id -u)" rootless_tar_member_metadata_category "$tmp_dir/storage" 'tar: storage/link/member: Cannot open: Permission denied' "$tmp_dir/storage/.localaictl-backup-restore-marker")" == member-path-unsafe ]]
 
 cat >"$tmp_dir/config" <<'EOF'
 LOCALAI_TLS_ENABLED=true
@@ -1181,6 +1172,17 @@ with tempfile.TemporaryDirectory(prefix="graphroot-home-mode-", dir=os.environ["
                 raise SystemExit("graphroot accepted special root mode bits")
 
 with tempfile.TemporaryDirectory(prefix="graphroot-rename-", dir=os.environ["TMPDIR"]) as parent:
+    with patch.object(builtins, "open", return_value=io.StringIO("pos:\t0\nflags:\t0100000\n")), \
+         contextlib.redirect_stderr(io.StringIO()) as missing_mount_id:
+        try:
+            helper.fd_mount_id(123)
+        except SystemExit:
+            pass
+        else:
+            raise SystemExit("rootless graphroot removal accepted missing fd mount identity")
+    if "cannot verify rootless graphroot mount identity" not in missing_mount_id.getvalue():
+        raise SystemExit("missing mount identity refusal lacked its fixed category")
+
     source = os.path.join(parent, "store")
     destination = os.path.join(parent, "store.rollback")
     os.mkdir(source, 0o700)
@@ -1201,6 +1203,31 @@ with tempfile.TemporaryDirectory(prefix="graphroot-rename-", dir=os.environ["TMP
     with open(sentinel, "w", encoding="ascii") as stream:
         stream.write("keep")
     os.symlink(sentinel, os.path.join(destination, "outside-link"))
+    mount_like = os.path.join(destination, "mount-like")
+    os.mkdir(mount_like)
+    mount_sentinel = os.path.join(mount_like, "preserve-me")
+    with open(mount_sentinel, "w", encoding="ascii") as stream:
+        stream.write("synthetic mount payload")
+    mount_inode = os.stat(mount_like).st_ino
+    real_fd_mount_id = helper.fd_mount_id
+
+    def synthetic_mount_id(fd):
+        actual = real_fd_mount_id(fd)
+        return actual + 1 if os.fstat(fd).st_ino == mount_inode else actual
+
+    with patch.object(helper, "graphroot_mounts", return_value=[]), \
+         patch.object(helper, "fd_mount_id", side_effect=synthetic_mount_id), \
+         contextlib.redirect_stderr(io.StringIO()) as mount_error:
+        try:
+            helper.remove_graphroot_nofollow(destination, device, inode)
+        except SystemExit:
+            pass
+        else:
+            raise SystemExit("rootless graphroot removal crossed a changed mount ID")
+    if "mount changed during safe removal" not in mount_error.getvalue():
+        raise SystemExit("rootless graphroot mount refusal lacked its fixed category")
+    if not os.path.isfile(mount_sentinel):
+        raise SystemExit("rootless graphroot removal deleted data below a changed mount ID")
     helper.remove_graphroot_nofollow(destination, device, inode)
     if not os.path.isfile(sentinel):
         raise SystemExit("rootless graphroot cleanup followed a symbolic link")

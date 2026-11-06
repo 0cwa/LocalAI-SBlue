@@ -961,8 +961,8 @@ rootless_tar_failure_category() {
 }
 
 rootless_tar_member_metadata_category() {
-  local graphroot="$1" error="$2" category
-  category="$(printf '%s\n%s\n' "$graphroot" "$error" | /usr/bin/python3 -c '
+  local graphroot="$1" error="$2" expected_marker="$3" category
+  category="$(printf '%s\n%s\n%s\n' "$graphroot" "$expected_marker" "$error" | /usr/bin/python3 -c '
 import os
 import pwd
 import re
@@ -970,6 +970,7 @@ import stat
 import sys
 
 graphroot = sys.stdin.readline().rstrip("\n")
+expected_marker = sys.stdin.readline().rstrip("\n")
 error = sys.stdin.read()
 try:
     root = os.path.normpath(graphroot)
@@ -998,44 +999,7 @@ try:
             raise SystemExit(0)
     info = os.lstat(path)
     kind = "directory" if stat.S_ISDIR(info.st_mode) else "regular" if stat.S_ISREG(info.st_mode) else "symlink" if stat.S_ISLNK(info.st_mode) else "special"
-    first = relative.split(os.sep, 1)[0]
-    path_class = {
-        "overlay": "overlay-layer",
-        "overlay-images": "image-metadata",
-        "overlay-containers": "container-metadata",
-        "overlay-layers": "layer-metadata",
-        "overlay-locks": "overlay-locks",
-        "volumes": "volume-data",
-        "libpod": "libpod-metadata",
-        "tmp": "temporary-data",
-        "mounts": "mount-metadata",
-        "containers": "container-state",
-        "storage.lock": "storage-lock",
-        "bolt_state.db": "storage-database",
-        "bolt_state.db.lock": "storage-lock",
-        "metadata.db": "storage-database",
-        "db.sql": "storage-database",
-        "network": "network-metadata",
-        ".lock": "storage-lock",
-        "userns.lock": "storage-lock",
-        "overlay.lock": "storage-lock",
-    }.get(first)
-    if path_class is None:
-        path_class = "other-root-subtree" if os.sep in relative else "other-root-entry"
-    if os.sep not in relative:
-        name = first.casefold()
-        if "lock" in name:
-            family, persistence = "lock", "unknown"
-        elif name.endswith((".db", ".sqlite", ".sqlite3")) or name == "db.sql":
-            family, persistence = "db", "persistent"
-        elif "index" in name:
-            family, persistence = "index", "persistent"
-        elif name.endswith((".conf", ".json", ".toml", ".yaml", ".yml")):
-            family, persistence = "config", "persistent"
-        else:
-            family, persistence = "other", "unknown"
-    else:
-        family, persistence = "other", "unknown"
+    path_class = "other-root-subtree" if os.sep in relative else "other-root-entry"
     service_uid = int(os.environ.get("LOCALAI_DIAGNOSTIC_SERVICE_UID", "-1"))
     service_name = pwd.getpwuid(service_uid).pw_name
     if info.st_uid == service_uid:
@@ -1057,14 +1021,14 @@ try:
                     break
         owner = "subuid" if mapped else "other"
     mode = stat.S_IMODE(info.st_mode)
-    if os.sep not in relative:
-        print(f"member-{kind}-owner-{owner}-mode-{mode:04o}-family-{family}-persistence-{persistence}")
+    if path == os.path.normpath(expected_marker):
+        print(f"member-acceptance-marker-owner-{owner}-mode-{mode:04o}-persistence-fixture")
     else:
         print(f"member-{kind}-owner-{owner}-mode-{mode:04o}-path-{path_class}")
 except (OSError, ValueError, OverflowError, KeyError):
     print("member-metadata-unavailable")
 ')" || category=member-metadata-unavailable
-  if [[ "$category" =~ ^member-(regular|directory|symlink|special)-owner-(service|subuid|host-root|other)-mode-[0-7][0-7][0-7][0-7]-family-(lock|db|index|config|other)-persistence-(persistent|unknown)$ ||
+  if [[ "$category" =~ ^member-acceptance-marker-owner-(service|subuid|host-root|other)-mode-[0-7][0-7][0-7][0-7]-persistence-fixture$ ||
         "$category" =~ ^member-(regular|directory|symlink|special)-owner-(service|subuid|host-root|other)-mode-[0-7][0-7][0-7][0-7]-path-(overlay-layer|image-metadata|container-metadata|layer-metadata|overlay-locks|volume-data|libpod-metadata|temporary-data|mount-metadata|container-state|storage-lock|storage-database|network-metadata|hidden-root-entry|root-lock-entry|root-database-entry|root-metadata-entry|other-root-entry|other-root-subtree)$ ||
         "$category" =~ ^member-(unidentified|outside-graphroot|metadata-unavailable|path-unsafe)$ ]]; then
     printf '%s' "$category"
@@ -1131,7 +1095,7 @@ sys.stdout.buffer.write(tail)
         rootless_tar_category="$(rootless_tar_failure_category "$rootless_tar_error")"
         printf 'localaictl: diagnostic-rootless-tar-failure: %s\n' "$rootless_tar_category" >&2
         if [[ "$rootless_tar_category" == source-open-permission ]]; then
-          rootless_tar_member_category="$(LOCALAI_DIAGNOSTIC_SERVICE_UID="$(service_uid "$LOCALAI_SERVICE_USER")" rootless_tar_member_metadata_category "$rootless_graphroot" "$rootless_tar_error")"
+          rootless_tar_member_category="$(LOCALAI_DIAGNOSTIC_SERVICE_UID="$(service_uid "$LOCALAI_SERVICE_USER")" rootless_tar_member_metadata_category "$rootless_graphroot" "$rootless_tar_error" "$LOCALAI_STATE_DIR/.local/share/containers/storage/.localaictl-backup-restore-marker")"
           printf 'localaictl: diagnostic-rootless-tar-member: %s\n' "$rootless_tar_member_category" >&2
           unset rootless_tar_member_category
         fi

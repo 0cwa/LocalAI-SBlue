@@ -12,6 +12,7 @@ source "$repo_root/lib/acceptance.sh"
 
 host_receipt_ready=0
 rootless_poc_dir=''
+ROOTLESS_TAR_ACCEPTANCE_MARKER=0
 record_early_failure_category() {
   local category='' receipt_path="${LOCALAI_ACCEPTANCE_RECEIPT:-}"
   case "${LOCALAI_ACCEPTANCE_MODE:-vm}:$receipt_path" in
@@ -503,11 +504,12 @@ check() {
 }
 
 backup_acceptance_step() {
-  local destination="$1" status=0 reason=other output=''
-  printf 'command backup-restore-backup: localaictl backup with root-owned config and persistent marker\n' >>"$receipt"
-  printf 'waiting backup-restore-backup: timeout 1800s\n' >>"$receipt"
+  local destination="$1" result_label="${2:-backup-restore-backup}" status=0 reason=other output=''
+  ROOTLESS_TAR_ACCEPTANCE_MARKER=0
+  printf 'command %s: localaictl backup with root-owned config and persistent marker\n' "$result_label" >>"$receipt"
+  printf 'waiting %s: timeout 1800s\n' "$result_label" >>"$receipt"
   if output="$(LOCALAI_ACCEPTANCE_DIAGNOSTIC=1 timeout --kill-after=10s 1800s "$controller" backup "$destination" 2>&1)"; then
-    printf 'step backup-restore-backup: pass\n' >>"$receipt"
+    printf 'step %s: pass\n' "$result_label" >>"$receipt"
   else
     status=$?
     case "$output" in
@@ -583,9 +585,9 @@ backup_acceptance_step() {
       *"shared backup archive helper is missing"*|*"command not found"*|*"No such file or directory"*|*"could not invoke"*) reason=helper-invocation ;;
       *"backup completed but one or more previously active services could not be restarted"*) reason=service-restart ;;
       *"cannot verify the LocalAI service account"*|*"cannot verify rootless"*|*"rootless service account does not exist"*) reason=rootless-context ;;
-      *"service-home ancestry has unexpected ownership"*) reason=graphroot-ancestor-owner ;;
-      *"service-home ancestry is publicly traversable"*) reason=graphroot-ancestor-mode ;;
-      *"service-home ancestry has special permission bits"*) reason=graphroot-ancestor-special ;;
+      *"service-home ancestry has unexpected ownership"*) reason='graphroot-ancestor-owner' ;;
+      *"service-home ancestry is publicly traversable"*) reason='graphroot-ancestor-mode' ;;
+      *"service-home ancestry has special permission bits"*) reason='graphroot-ancestor-special' ;;
       *"subordinate ID"*|*"user namespace mapping"*|*"rootless namespace"*) reason=rootless-mapping ;;
       *"rootless archive"*|*"rootless graphroot archive"*|*"rootless graphroot extraction"*) reason=rootless-archive ;;
       *"backup metadata"*) reason=archive-metadata ;;
@@ -594,10 +596,13 @@ backup_acceptance_step() {
       "") reason=helper-no-diagnostic ;;
       *) reason=helper-unclassified ;;
     esac
-    printf 'step backup-restore-backup: %s\n' "$([[ "$status" == 124 ]] && printf timeout || printf fail)" >>"$receipt"
-    printf 'diagnostic backup-restore-backup-reason: %s\n' "$reason" >>"$receipt"
-    if [[ "$output" =~ diagnostic-rootless-tar-member:\ (member-(regular|directory|symlink|special)-owner-(service|subuid|host-root|other)-mode-([0-7]{4})-family-(lock|db|index|config|other)-persistence-(persistent|unknown)|member-(regular|directory|symlink|special)-owner-(service|subuid|host-root|other)-mode-([0-7]{4})-path-(overlay-layer|image-metadata|container-metadata|layer-metadata|overlay-locks|volume-data|libpod-metadata|temporary-data|mount-metadata|container-state|storage-lock|storage-database|network-metadata|hidden-root-entry|root-lock-entry|root-database-entry|root-metadata-entry|other-root-entry|other-root-subtree)|member-unidentified|member-outside-graphroot|member-metadata-unavailable|member-path-unsafe) ]]; then
-      printf 'diagnostic backup-restore-rootless-tar-member: %s\n' "${BASH_REMATCH[1]}" >>"$receipt"
+    printf 'step %s: %s\n' "$result_label" "$([[ "$status" == 124 ]] && printf timeout || printf fail)" >>"$receipt"
+    printf 'diagnostic %s-reason: %s\n' "$result_label" "$reason" >>"$receipt"
+    if [[ "$output" =~ diagnostic-rootless-tar-member:\ (member-acceptance-marker-owner-(service|subuid|host-root|other)-mode-([0-7]{4})-persistence-fixture|member-(regular|directory|symlink|special)-owner-(service|subuid|host-root|other)-mode-([0-7]{4})-path-(other-root-entry|other-root-subtree)|member-unidentified|member-outside-graphroot|member-metadata-unavailable|member-path-unsafe) ]]; then
+      printf 'diagnostic %s-member: %s\n' "$result_label" "${BASH_REMATCH[1]}" >>"$receipt"
+      if [[ "${BASH_REMATCH[1]}" == member-acceptance-marker-owner-host-root-mode-0600-persistence-fixture ]]; then
+        ROOTLESS_TAR_ACCEPTANCE_MARKER=1
+      fi
     fi
     if [[ "$output" =~ diagnostic-controller-site:([0-9]{1,6}) ]]; then
       printf 'diagnostic backup-restore-controller-site: %s\n' "${BASH_REMATCH[1]}" >>"$receipt"
@@ -614,11 +619,58 @@ backup_acceptance_step() {
   return "$status"
 }
 
+retry_backup_with_acceptance_marker_owner() {
+  local marker_path marker_root service_user service_uid service_gid graphroot backup_path
+  # shellcheck disable=SC1091
+  source "$repo_root/lib/config.sh"
+  localai_config_load_compat /etc/localai/localai.conf "$repo_root/localai/localai.lock" >/dev/null || {
+    printf 'diagnostic acceptance-marker-owner-retry: config-unavailable\n' >>"$receipt"
+    return 1
+  }
+  service_user="$LOCALAI_SERVICE_USER"
+  service_uid="$(id -u "$service_user" 2>/dev/null)" || return 1
+  service_gid="$(id -g "$service_user" 2>/dev/null)" || return 1
+  marker_path="$LOCALAI_STATE_DIR/.local/share/containers/storage/.localaictl-backup-restore-marker"
+  marker_root="${marker_path%/.localaictl-backup-restore-marker}"
+  graphroot="$(service_podman info --format '{{.Store.GraphRoot}}' 2>/dev/null)" || {
+    printf 'diagnostic acceptance-marker-owner-retry: graphroot-unavailable\n' >>"$receipt"
+    return 1
+  }
+  [[ "$graphroot" == "$marker_root" && "$(realpath -m -- "$graphroot")" == "$graphroot" ]] || {
+    printf 'diagnostic acceptance-marker-owner-retry: graphroot-mismatch\n' >>"$receipt"
+    return 1
+  }
+  [[ -f "$marker_path" && ! -L "$marker_path" && "$(stat -c '%u:%a' -- "$marker_path" 2>/dev/null)" == 0:600 ]] || {
+    printf 'diagnostic acceptance-marker-owner-retry: marker-metadata-mismatch\n' >>"$receipt"
+    return 1
+  }
+  matchpathcon -V "$marker_path" >/dev/null 2>&1 || {
+    printf 'diagnostic acceptance-marker-owner-retry: marker-label-mismatch\n' >>"$receipt"
+    return 1
+  }
+  printf 'diagnostic acceptance-marker-owner-before: root-mode-0600\n' >>"$receipt"
+  chown -- "$service_uid:$service_gid" "$marker_path" 2>/dev/null || {
+    printf 'diagnostic acceptance-marker-owner-retry: chown-failed\n' >>"$receipt"
+    return 1
+  }
+  [[ "$(stat -c '%u:%g:%a' -- "$marker_path" 2>/dev/null)" == "$service_uid:$service_gid:600" ]] || {
+    printf 'diagnostic acceptance-marker-owner-retry: chown-verification-failed\n' >>"$receipt"
+    return 1
+  }
+  matchpathcon -V "$marker_path" >/dev/null 2>&1 || {
+    printf 'diagnostic acceptance-marker-owner-retry: relabel-required\n' >>"$receipt"
+    return 1
+  }
+  printf 'diagnostic acceptance-marker-owner-after: service-mode-0600\n' >>"$receipt"
+  backup_path="$work/diagnostic-backup-after-marker-owner.tar.gz"
+  backup_acceptance_step "$backup_path" backup-restore-backup-after-marker-owner
+}
+
 backup_restore_roundtrip() {
   local test_work="$1" config_path="$2" backup_path
   backup_path="$test_work/backup-restore.tar.gz"
   local config_copy="$test_work/backup-restore-config.before" marker_path graph_marker marker_value graph_value config_stat marker_stat graph_stat config_mode
-  local path existing covered bytes source_bytes=0 needed available
+  local path existing covered bytes source_bytes=0 needed available graph_service_user graph_service_uid graph_service_gid graph_service_home graphroot
   local -a configured_paths backup_roots=()
   # shellcheck disable=SC1091
   source "$repo_root/lib/config.sh"
@@ -671,11 +723,23 @@ backup_restore_roundtrip() {
   printf '%s\n' "$marker_value" >"$marker_path"
   chmod 0600 -- "$marker_path"
   marker_stat="$(stat -c '%u:%a' -- "$marker_path")"
-  mkdir -p -- "${graph_marker%/*}"
+  graph_service_user="$LOCALAI_SERVICE_USER"
+  graph_service_uid="$(id -u "$graph_service_user")" || fail 'cannot identify graph storage service owner.'
+  graph_service_gid="$(id -g "$graph_service_user")" || fail 'cannot identify graph storage service group.'
+  graph_service_home="$(getent passwd "$graph_service_user" | cut -d: -f6)" || fail 'cannot identify graph storage service home.'
+  graphroot="$(service_podman info --format '{{.Store.GraphRoot}}')" || fail 'cannot identify configured graph storage root.'
+  [[ "$graphroot" == "${graph_marker%/*}" && "$(realpath -e -- "$graphroot")" == "$graphroot" && -d "$graphroot" && ! -L "$graphroot" ]] || fail 'graph storage acceptance marker is outside the configured graph root.'
   graph_value='localai graph storage backup restore acceptance marker'
-  printf '%s\n' "$graph_value" >"$graph_marker"
-  chmod 0600 -- "$graph_marker"
+  # shellcheck disable=SC2016
+  systemd-run --user --machine="${graph_service_user}@.host" --wait --pipe --collect \
+    --setenv="HOME=$graph_service_home" --setenv="XDG_RUNTIME_DIR=/run/user/$graph_service_uid" \
+    --setenv="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$graph_service_uid/bus" \
+    --setenv=PATH=/usr/bin:/bin -- /usr/bin/bash -c 'umask 077; printf "%s\n" "$1" >"$2"; chmod 0600 -- "$2"' \
+    acceptance-graph-marker "$graph_value" "$graph_marker" >/dev/null || fail 'cannot create graph storage acceptance marker as the service user.'
+  restorecon -F -- "$graph_marker" >/dev/null 2>&1 || fail 'cannot label graph storage acceptance marker.'
+  matchpathcon -V "$graph_marker" >/dev/null 2>&1 || fail 'graph storage acceptance marker label does not match policy.'
   graph_stat="$(stat -c '%u:%a' -- "$graph_marker")"
+  [[ "$graph_stat" == "$graph_service_uid:600" && "$(stat -c '%g' -- "$graph_marker")" == "$graph_service_gid" ]] || fail 'graph storage acceptance marker owner or mode is incorrect.'
   printf '# localai backup restore acceptance marker\n' >>"$config_path"
   check_unit active disabled || fail 'backend was not active before backup acceptance.'
   backup_acceptance_step "$backup_path" || fail 'backup acceptance command failed.'
@@ -687,6 +751,8 @@ backup_restore_roundtrip() {
   check_unit active disabled || fail 'restore did not return the backend to its previous active state.'
   [[ "$(<"$marker_path")" == "$marker_value" && "$(stat -c '%u:%a' -- "$marker_path")" == "$marker_stat" ]] || fail 'persistent data marker was not restored with its ownership and mode.'
   [[ "$(<"$graph_marker")" == "$graph_value" && "$(stat -c '%u:%a' -- "$graph_marker")" == "$graph_stat" ]] || fail 'Podman graph storage marker was not restored with its ownership and mode.'
+  [[ "$(stat -c '%g' -- "$graph_marker")" == "$graph_service_gid" ]] || fail 'Podman graph storage marker group changed during restore.'
+  matchpathcon -V "$graph_marker" >/dev/null 2>&1 || fail 'Podman graph storage marker SELinux label does not match policy.'
   grep -Fqx '# localai backup restore acceptance marker' "$config_path" || fail 'configuration marker was not restored.'
   if grep -Fq '# damaged backup restore acceptance marker' "$config_path"; then
     fail 'damaged configuration marker survived restore.'
@@ -720,7 +786,11 @@ installer="$repo_root/secureblue-localai-install/install.sh"
 controller="$repo_root/bin/localaictl"
 
 if [[ "$phase" == diagnose-backup ]]; then
-  backup_acceptance_step "$work/diagnostic-backup.tar.gz" || exit 1
+  if backup_acceptance_step "$work/diagnostic-backup.tar.gz"; then
+    exit 0
+  fi
+  [[ "$ROOTLESS_TAR_ACCEPTANCE_MARKER" == 1 ]] || exit 1
+  retry_backup_with_acceptance_marker_owner || exit 1
   exit 0
 fi
 
