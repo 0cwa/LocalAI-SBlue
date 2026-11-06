@@ -116,6 +116,18 @@ service_podman() {
     --setenv=PATH=/usr/bin:/bin -- /usr/bin/podman "$@"
 }
 
+service_podman_graphroot() {
+  local attempt output
+  for attempt in 1 2 3; do
+    if output="$(service_podman info --format '{{.Store.GraphRoot}}' 2>/dev/null)"; then
+      printf '%s\n' "$output"
+      return 0
+    fi
+    (( attempt < 3 )) || return 1
+    sleep 1
+  done
+}
+
 rootless_poc_failure_category() {
   local result="$1"
   case "$result" in
@@ -738,7 +750,7 @@ backup_restore_roundtrip() {
   }
   create_service_marker "$marker_value" "$marker_path" 'persistent data'
   marker_stat="$(stat -c '%u:%g:%a' -- "$marker_path")"
-  graphroot="$(service_podman info --format '{{.Store.GraphRoot}}')" || fail 'cannot identify configured graph storage root.'
+  graphroot="$(service_podman_graphroot)" || fail 'cannot identify configured graph storage root.'
   [[ "$graphroot" == "${graph_marker%/*}" && "$(realpath -e -- "$graphroot")" == "$graphroot" && -d "$graphroot" && ! -L "$graphroot" ]] || fail 'graph storage acceptance marker is outside the configured graph root.'
   graph_value='localai graph storage backup restore acceptance marker'
   create_service_marker "$graph_value" "$graph_marker" 'graph storage'

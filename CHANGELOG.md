@@ -22,6 +22,8 @@ has been runtime-qualified on secureblue or on a GPU.
 - Store rootless Podman GraphRoot as a separately validated nested archive,
   create and extract it through the LocalAI user namespace, and roll back by
   same-filesystem no-replace renames with identity-checked cleanup.
+- Retry only read-only rootless Podman and GraphRoot probes briefly after
+  transient systemd user-bus errors; state-changing commands remain single-shot.
 - Include configured external GraphRoots, check backup/restore capacity on
   their actual filesystems, and refuse restores when the installed graph path
   or subordinate UID/GID mappings differ from the archive.

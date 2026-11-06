@@ -134,6 +134,8 @@ fi
   # shellcheck disable=SC1090
   source <(sed -n '/^backup_acceptance_step() {$/,/^}/p' "$repo_root/scripts/acceptance-guest.sh")
   # shellcheck disable=SC1090
+  source <(sed -n '/^service_podman_graphroot() {$/,/^}/p' "$repo_root/scripts/acceptance-guest.sh")
+  # shellcheck disable=SC1090
   source <(sed -n '/^backup_restore_roundtrip() {$/,/^}/p' "$repo_root/scripts/acceptance-guest.sh")
   test_work="$work/backup-restore"
   mkdir -m 0700 "$test_work"
@@ -179,6 +181,9 @@ EOF
   LOCALAI_SERVICE_USER="$(id -un)"
   export LOCALAI_SERVICE_USER
   export TEST_GRAPHROOT="$test_work/state/.local/share/containers/storage"
+  export TEST_GRAPHROOT_INFO_CALLS="$test_work/graphroot-info-calls"
+  export TEST_GRAPHROOT_INFO_FAILURE_MARKER="$test_work/graphroot-info-failed-once"
+  export TEST_GRAPHROOT_INFO_FAIL_FIRST=1
   export TEST_LABEL_CALLS="$test_work/label-calls"
   : >"$receipt"
   : >"$TEST_LABEL_CALLS"
@@ -201,6 +206,11 @@ EOF
   check_unit() { [[ "$1:$2" == active:disabled ]]; }
   service_podman() {
     [[ "$1" == info && "$2" == --format && "$3" == "{{.Store.GraphRoot}}" ]] || return 2
+    printf 'attempt\n' >>"$TEST_GRAPHROOT_INFO_CALLS"
+    if [[ "${TEST_GRAPHROOT_INFO_FAIL_FIRST:-0}" == 1 && ! -e "$TEST_GRAPHROOT_INFO_FAILURE_MARKER" ]]; then
+      : >"$TEST_GRAPHROOT_INFO_FAILURE_MARKER"
+      return 1
+    fi
     printf '%s\n' "$TEST_GRAPHROOT"
   }
   systemd-run() {
@@ -231,6 +241,7 @@ EOF
   # Use the actual shared step runner with its command output redirected.
   source "$repo_root/lib/acceptance.sh"
   if (backup_restore_roundtrip "$test_work" "$config_path") >"$test_work/step-output" 2>&1; then :; else cat "$test_work/step-output" >&2; exit 1; fi
+  [[ "$(wc -l <"$TEST_GRAPHROOT_INFO_CALLS")" == 2 ]] || { printf 'GraphRoot query did not retry once after its transient failure\n' >&2; exit 1; }
   [[ ! -e "$TEST_MARKER" ]] || { printf 'acceptance fixture marker was not cleaned\n' >&2; exit 1; }
   [[ ! -e "$TEST_GRAPH_MARKER" ]] || { printf 'acceptance graph fixture marker was not cleaned\n' >&2; exit 1; }
   cmp -s "$config_path" "$test_work/config-original" || { printf 'acceptance fixture config was not restored\n' >&2; exit 1; }

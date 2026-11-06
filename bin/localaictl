@@ -115,6 +115,24 @@ rootless_gid_map=''
 rootless_service_home=''
 ROOTLESS_GRAPHROOT_MEMBER=rootless-graphroot.tar
 
+# These Podman commands only inspect the service store. A short retry handles
+# transient user-manager bus resets without repeating any state-changing action.
+run_rootless_readonly() {
+  local home="$1" uid="$2" attempt output
+  shift 2
+  for attempt in 1 2 3; do
+    if output="$(run_elevated /usr/bin/systemd-run --user --machine="${LOCALAI_SERVICE_USER}@.host" --wait --pipe --collect --quiet \
+      --setenv="HOME=$home" --setenv="XDG_RUNTIME_DIR=/run/user/$uid" \
+      --setenv="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" --setenv=PATH=/usr/bin:/bin \
+      -- "$@" 2>/dev/null)"; then
+      printf '%s' "$output"
+      return 0
+    fi
+    (( attempt < 3 )) || return 1
+    sleep 1
+  done
+}
+
 query_rootless_context() {
   local context_file="$1" check_quiescent="${2:-1}" uid gid home info maps running map_pattern='^[0-9:;]+$'
   local -a map_lines=()
@@ -123,26 +141,17 @@ query_rootless_context() {
   home="$(run_elevated /usr/bin/getent passwd "$LOCALAI_SERVICE_USER" | /usr/bin/cut -d: -f6)" || die "cannot verify the LocalAI service home"
   rootless_service_home="$home"
   [[ "$home" == /* && "$home" != / && "$home" != *$'\n'* && "$home" != *$'\r'* && "$(realpath -m -- "$home")" == "$home" ]] || die "LocalAI service home is not canonical"
-  info="$(run_elevated /usr/bin/systemd-run --user --machine="${LOCALAI_SERVICE_USER}@.host" --wait --pipe --collect --quiet \
-    --setenv="HOME=$home" --setenv="XDG_RUNTIME_DIR=/run/user/$uid" \
-    --setenv="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" --setenv=PATH=/usr/bin:/bin \
-    -- /usr/bin/podman info --format '{{.Store.GraphRoot}}' 2>/dev/null)" || die "cannot verify the LocalAI rootless container store"
+  info="$(run_rootless_readonly "$home" "$uid" /usr/bin/podman info --format '{{.Store.GraphRoot}}')" || die "cannot verify the LocalAI rootless container store"
   rootless_graphroot="$info"
   [[ "$rootless_graphroot" == /* && "$rootless_graphroot" != / && "$rootless_graphroot" != *$'\n'* && "$rootless_graphroot" != *$'\r'* && "$(realpath -m -- "$rootless_graphroot")" == "$rootless_graphroot" ]] || die "LocalAI rootless graphroot is not canonical"
-  maps="$(run_elevated /usr/bin/systemd-run --user --machine="${LOCALAI_SERVICE_USER}@.host" --wait --pipe --collect --quiet \
-    --setenv="HOME=$home" --setenv="XDG_RUNTIME_DIR=/run/user/$uid" \
-    --setenv="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" --setenv=PATH=/usr/bin:/bin \
-    -- /usr/bin/podman unshare /usr/bin/python3 -c 'from pathlib import Path; print(";".join(":".join(row.split()) for row in Path("/proc/self/uid_map").read_text().splitlines())); print(";".join(":".join(row.split()) for row in Path("/proc/self/gid_map").read_text().splitlines()))' 2>/dev/null)" || die "cannot verify the LocalAI user namespace mappings"
+  maps="$(run_rootless_readonly "$home" "$uid" /usr/bin/podman unshare /usr/bin/python3 -c 'from pathlib import Path; print(";".join(":".join(row.split()) for row in Path("/proc/self/uid_map").read_text().splitlines())); print(";".join(":".join(row.split()) for row in Path("/proc/self/gid_map").read_text().splitlines()))')" || die "cannot verify the LocalAI user namespace mappings"
   mapfile -t map_lines <<<"$maps"
   [[ "${#map_lines[@]}" == 2 ]] || die "LocalAI user namespace mappings are invalid"
   rootless_uid_map="${map_lines[0]}"
   rootless_gid_map="${map_lines[1]}"
   [[ "$rootless_uid_map" =~ $map_pattern && "$rootless_gid_map" =~ $map_pattern ]] || die "LocalAI user namespace mappings are invalid"
   if [[ "$check_quiescent" == 1 ]]; then
-    running="$(run_elevated /usr/bin/systemd-run --user --machine="${LOCALAI_SERVICE_USER}@.host" --wait --pipe --collect --quiet \
-      --setenv="HOME=$home" --setenv="XDG_RUNTIME_DIR=/run/user/$uid" \
-      --setenv="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" --setenv=PATH=/usr/bin:/bin \
-      -- /usr/bin/podman ps --format '{{.ID}}' 2>/dev/null)" || die "cannot verify LocalAI container state"
+    running="$(run_rootless_readonly "$home" "$uid" /usr/bin/podman ps --format '{{.ID}}')" || die "cannot verify LocalAI container state"
     [[ -z "$running" ]] || die "rootless graphroot is in use by a running container"
   fi
   [[ ! -e "$rootless_graphroot" || -d "$rootless_graphroot" ]] || die "LocalAI rootless graphroot is not a directory"

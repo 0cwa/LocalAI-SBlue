@@ -124,6 +124,11 @@ if [[ "${1:-}" == /usr/bin/systemd-run ]]; then
     esac
   done
   if [[ "${1:-}" == /usr/bin/podman && "${2:-}" == info ]]; then
+    if [[ "${LOCALAI_FAKE_GRAPHROOT_INFO_FAIL_ONCE:-false}" == true &&
+          ! -e "${LOCALAI_FAKE_GRAPHROOT_INFO_MARKER:?}" ]]; then
+      : >"${LOCALAI_FAKE_GRAPHROOT_INFO_MARKER}"
+      exit 75
+    fi
     printf '%s/nonexistent-graphroot\n' "${LOCALAI_FAKE_STATE_DIR:?}"
     exit 0
   fi
@@ -289,6 +294,7 @@ export LOCALAI_FAKE_LOG="$tmp_dir/commands"
 export LOCALAI_FAKE_STATE_DIR="$tmp_dir/service-state"
 export LOCALAI_FAKE_TRANSACTION_MARKER="$tmp_dir/service-state/restore.pending"
 export LOCALAI_FAKE_BACKUP_HELPER="$repo_root/lib/backup_archive.py"
+export LOCALAI_FAKE_GRAPHROOT_INFO_MARKER="$tmp_dir/graphroot-info-failed-once"
 export LOCALAI_FAKE_LOCK_FILE="$tmp_dir/backup.lock"
 export XDG_RUNTIME_DIR="$tmp_dir"
 export LOCALAI_RESTORE_STAGE_BASE="$tmp_dir/restore-stage"
@@ -677,11 +683,14 @@ export LOCALAI_RESTORECON_BIN="$tmp_dir/restorecon"
 : >"$tmp_dir/commands"
 rm -f "$tmp_dir/systemd/localai-tls-forward.socket"
 backup_archive="$tmp_dir/backup.tar.gz"
+export LOCALAI_FAKE_GRAPHROOT_INFO_FAIL_ONCE=true
 if ! "$repo_root/bin/localaictl" backup --exclude-models "$backup_archive" 2>"$tmp_dir/backup-warning"; then
   cat "$tmp_dir/backup-warning" >&2
   cat "$tmp_dir/commands" >&2
   exit 1
 fi
+[[ -f "$LOCALAI_FAKE_GRAPHROOT_INFO_MARKER" ]] || { printf 'backup did not recover from a transient read-only GraphRoot query failure\n' >&2; exit 1; }
+unset LOCALAI_FAKE_GRAPHROOT_INFO_FAIL_ONCE
 chmod 0655 "$tmp_dir/backup-state/database.db"
 if "$repo_root/bin/localaictl" backup "$tmp_dir/world-executable-database.tar.gz" 2>"$tmp_dir/world-executable-database-warning"; then
   printf 'backup accepted a world-executable database under a private data root\n' >&2
