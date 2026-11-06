@@ -136,6 +136,8 @@ fi
   # shellcheck disable=SC1090
   source <(sed -n '/^service_podman_graphroot() {$/,/^}/p' "$repo_root/scripts/acceptance-guest.sh")
   # shellcheck disable=SC1090
+  source <(sed -n '/^restore_acceptance_step() {$/,/^}/p' "$repo_root/scripts/acceptance-guest.sh")
+  # shellcheck disable=SC1090
   source <(sed -n '/^backup_restore_roundtrip() {$/,/^}/p' "$repo_root/scripts/acceptance-guest.sh")
   test_work="$work/backup-restore"
   mkdir -m 0700 "$test_work"
@@ -165,6 +167,11 @@ case "$1" in
     printf 'suppressed fixture output\n'
     ;;
   restore)
+    if [[ "${TEST_RESTORE_FAIL:-0}" == 1 ]]; then
+      printf 'localaictl: rootless graphroot extraction failed; rollback will run before services restart\n' >&2
+      printf 'localaictl: diagnostic-controller-site:1314\n' >&2
+      exit 1
+    fi
     cp -- "$TEST_WORK/saved-config" "$TEST_CONFIG"
     cp -- "$TEST_WORK/saved-marker" "$TEST_MARKER"
     cp -- "$TEST_WORK/saved-graph-marker" "$TEST_GRAPH_MARKER"
@@ -253,6 +260,14 @@ EOF
   rg -q '^waiting backup-restore-backup: timeout 1800s$' "$receipt" || { printf 'backup acceptance timeout was not recorded\n' >&2; exit 1; }
   rg -q '^step backup-restore-backup: pass$' "$receipt" || { printf 'backup acceptance result was not recorded\n' >&2; exit 1; }
   rg -q '^step backup-restore-restore: pass$' "$receipt" || { printf 'restore acceptance result was not recorded\n' >&2; exit 1; }
+  if TEST_RESTORE_FAIL=1 restore_acceptance_step "$test_work/failing-restore.tar.gz"; then
+    printf 'failed restore diagnostic fixture was accepted\n' >&2; exit 1
+  fi
+  rg -q '^diagnostic backup-restore-restore-reason: rootless-extraction$' "$receipt" || { printf 'restore failure was not reduced to an allowlisted category\n' >&2; exit 1; }
+  rg -q '^diagnostic backup-restore-restore-controller-site: 1314$' "$receipt" || { printf 'restore controller site was not reduced to a line number\n' >&2; exit 1; }
+  if rg -q 'rootless graphroot extraction failed' "$receipt"; then
+    printf 'raw restore error text leaked into the acceptance receipt\n' >&2; exit 1
+  fi
   if TEST_BACKUP_FAIL=1 backup_acceptance_step "$test_work/failing-backup.tar.gz"; then
     printf 'failed backup diagnostic fixture was accepted\n' >&2; exit 1
   fi

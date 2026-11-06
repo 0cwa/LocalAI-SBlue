@@ -515,6 +515,52 @@ check() {
   return 1
 }
 
+restore_acceptance_step() {
+  local archive="$1" status=0 reason=other output=''
+  printf 'command backup-restore-restore: localaictl restore and verify config/SELinux and data markers\n' >>"$receipt"
+  printf 'waiting backup-restore-restore: timeout 1800s\n' >>"$receipt"
+  if output="$(LOCALAI_ACCEPTANCE_DIAGNOSTIC=1 timeout --kill-after=10s 1800s "$controller" restore --yes "$archive" 2>&1)"; then
+    printf 'step backup-restore-restore: pass\n' >>"$receipt"
+    return 0
+  else
+    status=$?
+  fi
+  case "$output" in
+    *"backup or restore is already running"*) reason=lock-contention ;;
+    *"a previous backup restore is incomplete"*) reason=restore-pending ;;
+    *"restore staging must be on a disk-backed filesystem"*) reason=staging-filesystem ;;
+    *"insufficient disk space"*) reason=capacity ;;
+    *"could not safely copy restore archive"*) reason=archive-copy ;;
+    *"backup contains unsupported or unsafe filesystem entries"*) reason=archive-validation ;;
+    *"could not extract backup into private staging"*) reason=archive-extraction ;;
+    *"restore paths are unsafe"*) reason=destination-validation ;;
+    *"backup rootless graphroot status could not be verified"*|*"backup rootless graphroot archive was not staged safely"*) reason=rootless-archive ;;
+    *"rootless graphroot changed while services stopped"*|*"backup contents or LocalAI storage settings changed while services stopped"*) reason=storage-changed ;;
+    *"could not prepare rollback snapshot"*) reason=rollback-snapshot ;;
+    *"could not create the durable restore safety marker"*) reason=restore-marker ;;
+    *"rootless graphroot extraction failed"*) reason=rootless-extraction ;;
+    *"SELinux label"*|*"SELinux labels"*) reason=selinux-label ;;
+    *"restore failed"*) reason=restore-copy ;;
+    *"could not durably flush restored data"*) reason=sync ;;
+    *"rollback was incomplete"*|*"could not safely remove the partially restored rootless graphroot"*|*"could not restore the previous rootless graphroot"*) reason=rollback-incomplete ;;
+    *"restore completed but the durable safety marker could not be cleared"*) reason=restore-marker-clear ;;
+    *"restore completed but one or more previously active services could not be restarted"*) reason=service-restart ;;
+    *"cannot verify"*|*"Failed to start transient service unit"*|*"Connection reset by peer"*|*"Transport endpoint is not connected"*) reason=service-manager ;;
+    "") reason=empty-error ;;
+    *) reason=other ;;
+  esac
+  if [[ "$status" == 124 ]]; then
+    printf 'step backup-restore-restore: timeout\n' >>"$receipt"
+  else
+    printf 'step backup-restore-restore: fail\n' >>"$receipt"
+  fi
+  printf 'diagnostic backup-restore-restore-reason: %s\n' "$reason" >>"$receipt"
+  if [[ "$output" =~ diagnostic-controller-site:([0-9]{1,6}) ]]; then
+    printf 'diagnostic backup-restore-restore-controller-site: %s\n' "${BASH_REMATCH[1]}" >>"$receipt"
+  fi
+  return 1
+}
+
 backup_acceptance_step() {
   local destination="$1" result_label="${2:-backup-restore-backup}" status=0 reason=other output=''
   ROOTLESS_TAR_ACCEPTANCE_MARKER=0
@@ -762,7 +808,7 @@ backup_restore_roundtrip() {
   printf 'damaged marker\n' >"$marker_path"
   printf 'damaged graph marker\n' >"$graph_marker"
   printf '# damaged backup restore acceptance marker\n' >>"$config_path"
-  step backup-restore-restore 1800 "$controller" restore --yes "$backup_path" || fail 'restore acceptance command failed.'
+  restore_acceptance_step "$backup_path" || fail 'restore acceptance command failed.'
   check_unit active disabled || fail 'restore did not return the backend to its previous active state.'
   [[ "$(<"$marker_path")" == "$marker_value" && "$(stat -c '%u:%g:%a' -- "$marker_path")" == "$marker_stat" ]] || fail 'persistent data marker was not restored with its ownership and mode.'
   matchpathcon -V "$marker_path" >/dev/null 2>&1 || fail 'persistent data marker SELinux label does not match policy.'
