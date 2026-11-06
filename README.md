@@ -399,9 +399,11 @@ destination host as described below.
 Restore preserves validated ownership and non-SELinux xattrs. It rejects ACL
 metadata and archived SELinux labels on ordinary persistent paths, then applies
 and verifies the destination policy labels. Rootless GraphRoot SELinux labels
-are accepted only when they match the stopped installed store. It starts
-services in dependency order and restores their previous active state. `--yes`
-does not remove unrelated files from state directories.
+are accepted when the SELinux user, role, type, and sensitivity match the
+stopped installed store. Podman-managed MCS category ranges may change between backup
+and restore; Podman reassigns those ranges when the restored service starts.
+Restore starts services in dependency order and restores their previous active
+state. `--yes` does not remove unrelated files from state directories.
 
 Before changing live state, restore writes a root-owned durable marker at
 `/var/lib/.localaictl-backup-restore.pending`. The backend unit refuses to start

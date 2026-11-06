@@ -349,6 +349,40 @@ LOCALAI_ACCEPTANCE_DIAGNOSTIC=1 run_elevated "$tmp_dir/systemctl" sample
 rg -q '^run0 -i /usr/bin/env LOCALAI_ACCEPTANCE_DIAGNOSTIC=1 ' "$tmp_dir/commands"
 : >"$tmp_dir/commands"
 
+(
+  # Read indirectly by the extracted helper function.
+  # shellcheck disable=SC2034
+  RESTORE_ROOTLESS_SELINUX_RANGE_CHANGE_ALLOWED=1
+  # shellcheck disable=SC2034
+  backup_archive_helper="$tmp_dir/backup-helper"
+  # shellcheck disable=SC2034
+  rootless_context_file="$tmp_dir/rootless-context"
+  # shellcheck disable=SC2329
+  run_elevated() { printf '%s\n' "$@" >"$tmp_dir/backup-helper-args"; }
+  # shellcheck disable=SC1090
+  source <(sed -n '/^run_backup_helper() {$/,/^}/p' "$repo_root/bin/localaictl")
+  run_backup_helper unit-trees0 /archive /config /root /stage /state /tls
+)
+rg -Fxq -- '--allow-rootless-selinux-range-change' "$tmp_dir/backup-helper-args"
+(
+  # Read indirectly by the extracted helper function.
+  # shellcheck disable=SC2034
+  RESTORE_ROOTLESS_SELINUX_RANGE_CHANGE_ALLOWED=0
+  # shellcheck disable=SC2034
+  backup_archive_helper="$tmp_dir/backup-helper"
+  # shellcheck disable=SC2034
+  rootless_context_file=''
+  # shellcheck disable=SC2329
+  run_elevated() { printf '%s\n' "$@" >"$tmp_dir/backup-helper-args"; }
+  # shellcheck disable=SC1090
+  source <(sed -n '/^run_backup_helper() {$/,/^}/p' "$repo_root/bin/localaictl")
+  run_backup_helper validate /archive /config /root
+)
+if rg -q '^--allow-rootless-selinux-range-change$' "$tmp_dir/backup-helper-args"; then
+  printf 'ordinary validation allowed a rootless MCS category change\n' >&2
+  exit 1
+fi
+
 mkdir -p "$tmp_dir/systemd"
 printf '[Socket]\nFreeBind=true\n' >"$tmp_dir/systemd/localai-tls-forward.socket"
 
@@ -1011,7 +1045,7 @@ def validate(raw, uid_value=uid_map, gid_value=gid_map):
         return helper.validate_graphroot_tar(io.BytesIO(raw), rootless_path, uid_map, gid_map,
                                              uid_value, gid_value, "localai")
 
-def validate_with_selinux(raw, expected_label):
+def validate_with_selinux(raw, expected_label, check_selinux_range=True):
     rootless_baseline = expected_label.encode()
     def has_live_baseline(path):
         return os.fspath(path) != rootless_path
@@ -1021,7 +1055,8 @@ def validate_with_selinux(raw, expected_label):
          patch.object(helper.os.path, "lexists", side_effect=has_live_baseline), \
          patch.object(helper.os, "getxattr", return_value=rootless_baseline):
         return helper.validate_graphroot_tar(io.BytesIO(raw), rootless_path, uid_map, gid_map,
-                                             uid_map, gid_map, "localai")
+                                             uid_map, gid_map, "localai",
+                                             check_selinux_range=check_selinux_range)
 
 def rejects(raw, uid_value=uid_map, gid_value=gid_map):
     with contextlib.redirect_stderr(io.StringIO()):
@@ -1055,6 +1090,40 @@ duplicate_labels = make_archive([
 ])
 if "storage/overlay/layer/diff/tool" not in validate_with_selinux(duplicate_labels, selinux_label):
     raise SystemExit("identical rootless SELinux label metadata was not validated")
+range_mismatch = make_archive([
+    directory("storage/"),
+    regular("storage/overlay/layer/diff/private-member", pax={
+        "SCHILY.xattr.security.selinux": selinux_label,
+    }),
+])
+if "storage/overlay/layer/diff/private-member" not in validate_with_selinux(
+        range_mismatch, "system_u:object_r:container_file_t:s0:c1,c2", check_selinux_range=False):
+    raise SystemExit("rootless archive rejected a Podman-managed MCS range change")
+with tempfile.TemporaryDirectory(prefix="unit-trees-range-test-", dir=os.environ["TMPDIR"]) as parent:
+    unit_archive = os.path.join(parent, "empty.tar.gz")
+    with helper.tarfile.open(unit_archive, "w:gz"):
+        pass
+    with patch.object(helper, "validate_archive", return_value=[]) as validate_unit_archive:
+        helper.unit_trees(
+            unit_archive, parent, "/etc/localai/localai.conf", [], [],
+            check_rootless_selinux_range=False,
+        )
+    if validate_unit_archive.call_args.kwargs.get("check_rootless_selinux_range") is not False:
+        raise SystemExit("unit-tree validation dropped the restore-only SELinux range policy")
+try:
+    validate_with_selinux(range_mismatch, "system_u:object_r:container_file_t:s0:c1,c2")
+except SystemExit:
+    pass
+else:
+    raise SystemExit("rootless archive accepted an MCS range change outside restore")
+try:
+    validate_with_selinux(
+        range_mismatch, "system_u:object_r:other_t:s0:c1,c2", check_selinux_range=False
+    )
+except SystemExit:
+    pass
+else:
+    raise SystemExit("rootless archive accepted a changed SELinux type while allowing range changes")
 labelled_target_name = "storage/overlay/layer/diff/labelled-target"
 labelled_link_name = "storage/overlay/layer/diff/labelled-hardlink"
 labelled_link = helper.tarfile.TarInfo(labelled_link_name)

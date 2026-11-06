@@ -26,6 +26,8 @@ has been runtime-qualified on secureblue or on a GPU.
   transient systemd user-bus errors; state-changing commands remain single-shot.
 - Reduce VM restore acceptance failures to an allowlisted reason and source
   line numbers without retaining raw command output.
+- Allow Podman to reassign dynamic rootless GraphRoot MCS ranges when restoring
+  a same-host backup, while checking the stable SELinux identity and sensitivity.
 - Include configured external GraphRoots, check backup/restore capacity on
   their actual filesystems, and refuse restores when the installed graph path
   or subordinate UID/GID mappings differ from the archive.

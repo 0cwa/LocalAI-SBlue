@@ -219,6 +219,15 @@ def unsafe_archive_attributes(info: tarfile.TarInfo) -> bool:
     return False
 
 
+def rootless_selinux_context_matches_without_mcs(archived: bytes, installed: bytes) -> bool:
+    if not archived or not installed:
+        return False
+    archived_fields = archived.decode("utf-8", "surrogateescape").split(":")
+    installed_fields = installed.decode("utf-8", "surrogateescape").split(":")
+    return (len(archived_fields) >= 4 and len(installed_fields) >= 4 and
+            archived_fields[:4] == installed_fields[:4])
+
+
 def read_metadata(archive: tarfile.TarFile) -> dict[str, str]:
     members = [info for info in archive if clean_member_name(info.name) == "metadata"]
     if len(members) != 1 or not members[0].isfile():
@@ -656,6 +665,8 @@ def validate_graphroot_tar(
     live_uid_map_value: str,
     live_gid_map_value: str,
     service_user: str,
+    *,
+    check_selinux_range: bool = True,
 ) -> list[str]:
     preflight_tar_stream(archive_file)
     try:
@@ -743,6 +754,9 @@ def validate_graphroot_tar(
                     fail("rootless archive contains conflicting SELinux labels")
                 archived_label = target_labels[0] if target_labels else b""
         if archived_label != live_label:
+            if (not check_selinux_range and
+                    rootless_selinux_context_matches_without_mcs(archived_label, live_label)):
+                continue
             fail("rootless archive SELinux label differs from its installed baseline")
     for name, info in members.items():
         if info.islnk():
@@ -769,6 +783,7 @@ def validate_archive(
     *,
     require_root_config: bool = True,
     rootless_context: dict[str, str | int] | None = None,
+    check_rootless_selinux_range: bool = True,
 ) -> list[str]:
     preflight_gzip_archive(archive)
     config_name = config.lstrip("/")
@@ -901,6 +916,7 @@ def validate_archive(
                 str(rootless_context["uid_map"]),
                 str(rootless_context["gid_map"]),
                 str(rootless_context["service_user"]),
+                check_selinux_range=check_rootless_selinux_range,
             )
     elif rootless_context is not None and os.path.lexists(str(rootless_context["graphroot"])):
         fail("backup omits the installed rootless graphroot")
@@ -1230,8 +1246,16 @@ def unit_trees(
     roots: list[str],
     expected_roots: list[str],
     rootless_context: dict[str, str | int] | None = None,
+    *,
+    check_rootless_selinux_range: bool = True,
 ) -> list[str]:
-    names = validate_archive(archive_path, config, roots, rootless_context=rootless_context)
+    names = validate_archive(
+        archive_path,
+        config,
+        roots,
+        rootless_context=rootless_context,
+        check_rootless_selinux_range=check_rootless_selinux_range,
+    )
     directories: dict[str, set[str]] = {}
     archive_prefixes = {systemd_tree_prefix(name, "user", expected_roots) for name in names}
     for index, root in enumerate(expected_roots):
@@ -1859,6 +1883,12 @@ def main() -> None:
     mode, archive, config = sys.argv[1:4]
     rest = sys.argv[4:]
     rootless_context = None
+    allow_rootless_selinux_range_change = "--allow-rootless-selinux-range-change" in rest
+    if allow_rootless_selinux_range_change:
+        rest.remove("--allow-rootless-selinux-range-change")
+        if mode not in {"validate", "validate-created", "members0", "collisions0",
+                        "destinations", "skip-links0", "unit-trees0", "rootless-present"}:
+            raise SystemExit(2)
     if "--rootless-context" in rest:
         index = rest.index("--rootless-context")
         if index + 1 >= len(rest):
@@ -1884,7 +1914,13 @@ def main() -> None:
         raise SystemExit(rollback_new(rest[-2], rest[-1], config, rest[:-2]))
     if mode == "rootless-present":
         roots = rest
-        validate_archive(archive, config, roots, rootless_context=rootless_context)
+        validate_archive(
+            archive,
+            config,
+            roots,
+            rootless_context=rootless_context,
+            check_rootless_selinux_range=not allow_rootless_selinux_range_change,
+        )
         with tarfile.open(archive, "r:gz") as source:
             present = any(clean_member_name(info.name) == ROOTLESS_GRAPHROOT_MEMBER for info in source)
         print("1" if present else "0")
@@ -1896,6 +1932,7 @@ def main() -> None:
         roots,
         require_root_config=mode != "validate-created" or os.geteuid() == 0,
         rootless_context=rootless_context,
+        check_rootless_selinux_range=not allow_rootless_selinux_range_change,
     )
     if mode == "destinations":
         if not rest:
@@ -1909,7 +1946,15 @@ def main() -> None:
     if mode == "unit-trees0":
         if len(rest) < 3:
             raise SystemExit(2)
-        for name in unit_trees(archive, rest[-3], config, roots, rest[-2:], rootless_context):
+        for name in unit_trees(
+            archive,
+            rest[-3],
+            config,
+            roots,
+            rest[-2:],
+            rootless_context,
+            check_rootless_selinux_range=not allow_rootless_selinux_range_change,
+        ):
             sys.stdout.buffer.write(os.fsencode(name) + b"\0")
     if mode in {"members0", "collisions0"}:
         write_names(names, mode, config, roots)

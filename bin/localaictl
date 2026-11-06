@@ -36,6 +36,7 @@ audit_dir="${LOCALAI_AUDIT_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/localai/au
 dry_run=0
 status_elevated=0
 RESTORE_STACK_POLICY_SET=0
+RESTORE_ROOTLESS_SELINUX_RANGE_CHANGE_ALLOWED=0
 RESTORE_TLS_ENABLED=false
 RESTORE_TLS_PUBLIC_SOCKET=false
 RESTORE_TLS_PUBLIC_HOST=''
@@ -176,11 +177,18 @@ PY
 
 run_backup_helper() {
   local mode="$1"
+  local -a helper_options=()
   shift
+  if [[ "${RESTORE_ROOTLESS_SELINUX_RANGE_CHANGE_ALLOWED:-0}" == 1 ]]; then
+    case "$mode" in
+      validate|validate-created|members0|collisions0|destinations|skip-links0|unit-trees0|rootless-present)
+        helper_options=(--allow-rootless-selinux-range-change) ;;
+    esac
+  fi
   if [[ -n "${rootless_context_file:-}" ]]; then
-    run_elevated /usr/bin/python3 "$backup_archive_helper" "$mode" "$@" --rootless-context "$rootless_context_file"
+    run_elevated /usr/bin/python3 "$backup_archive_helper" "$mode" "$@" "${helper_options[@]}" --rootless-context "$rootless_context_file"
   else
-    run_elevated /usr/bin/python3 "$backup_archive_helper" "$mode" "$@"
+    run_elevated /usr/bin/python3 "$backup_archive_helper" "$mode" "$@" "${helper_options[@]}"
   fi
 }
 
@@ -1214,6 +1222,10 @@ restore_locked() {
   run_backup_helper space-check "$source" "$stage" || die "insufficient disk space for a safe restore stage"
   run_elevated /usr/bin/python3 "$helper" copy-source "$source" "$config_file" "${backup_roots[@]}" "$source_copy" || die "could not safely copy restore archive"
   source="$source_copy"
+  # Podman assigns fresh private MCS categories when it starts the restored
+  # container. Check the stable SELinux identity and sensitivity at both
+  # validation points, and let Podman reapply those dynamic categories.
+  RESTORE_ROOTLESS_SELINUX_RANGE_CHANGE_ALLOWED=1
   run_backup_helper validate "$source" "$config_file" "${backup_roots[@]}" || die "backup contains unsupported or unsafe filesystem entries"
   run_elevated "$tar_bin" --extract --gzip --file "$source" --directory "$stage" --xattrs --acls --no-selinux --numeric-owner --same-owner || die "could not extract backup into private staging"
   run_backup_helper destinations "$source" "$config_file" "${backup_roots[@]}" "$stage" || die "restore paths are unsafe"
