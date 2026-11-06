@@ -6,8 +6,9 @@ backend-only evidence; TLS, physical-host behavior and GPUs were not tested.
 - OS: secureblue 44 kinoite-main-hardened; deployment
   `a21fc280bc53cfbb3c80622ec36cac9a1f574899623dadb731314c5c79efa817`.
 - Kernel `6.19.14-300.fc44.x86_64`, Podman `5.8.2`, systemd `259`.
-- Project version `0.2.0`; tested source archive SHA-256
-  `3cf4ed9c90829815d1004e37c74aa322e7c117bda8759877e515f31f698cc029`.
+- Source commit `998681dcebca301bd4190ceb819fc671154fff70`; project version
+  `0.2.0`; tested source archive SHA-256
+  `19fa854a49df8c0e0b46298c1da2e013694b0ac8b578ad3b802b12aa7e31129c`.
 - CPU image `docker.io/localai/localai:latest`, resolved digest
   `sha256:ac48a6f50d9a7557df457c4abd886c0fd2eec74cc53265ecfce226393b6445f4`.
 - SELinux enforcing; container-domain user namespaces requested. The isolated
@@ -21,9 +22,8 @@ UID/GID mappings. Explicit start, status, logs, image and container inspection,
 doctor, and first-administrator registration passed; the guarded socket was
 blocked before registration and active afterwards.
 
-Backup and restore both passed with root-owned configuration, persistent data
-markers, and SELinux checks. Podman reassigned the dynamic GraphRoot MCS range
-when the restored service started. All four upgrade combinations passed:
+Backup and restore passed with root-owned configuration, persistent data and
+GraphRoot markers, and SELinux checks. All four upgrade combinations passed:
 running and boot-disabled, running and boot-enabled, stopped and boot-enabled,
 and stopped and boot-disabled. The run preserved configuration, data, and an
 unrelated container through conservative uninstall.
