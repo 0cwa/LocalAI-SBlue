@@ -176,7 +176,12 @@ EOF
   # Functions and globals are consumed by the extracted production helpers.
   # shellcheck disable=SC2034
   repo_root="$repo_root" mode=vm receipt="$test_work/receipt" progress='' controller="$test_work/fake-locaictl" work="$test_work" host_receipt_ready=0
+  LOCALAI_SERVICE_USER="$(id -un)"
+  export LOCALAI_SERVICE_USER
+  export TEST_GRAPHROOT="$test_work/state/.local/share/containers/storage"
+  export TEST_LABEL_CALLS="$test_work/label-calls"
   : >"$receipt"
+  : >"$TEST_LABEL_CALLS"
   fail() {
     case "$*" in
       *'cannot load configured persistent paths'*) printf 'test acceptance failure: config-load\n' >&2 ;;
@@ -194,7 +199,32 @@ EOF
     exit 1
   }
   check_unit() { [[ "$1:$2" == active:disabled ]]; }
-  matchpathcon() { [[ "$1" == -V ]]; }
+  service_podman() {
+    [[ "$1" == info && "$2" == --format && "$3" == "{{.Store.GraphRoot}}" ]] || return 2
+    printf '%s\n' "$TEST_GRAPHROOT"
+  }
+  systemd-run() {
+    [[ "$1" == --user ]] || return 2
+    while [[ "$#" -gt 0 && "$1" != -- ]]; do shift; done
+    [[ "$1" == -- ]] || return 2
+    shift
+    # shellcheck disable=SC2016
+    [[ "$1" == /usr/bin/bash && "$2" == -c && "$3" == 'umask 077; printf "%s\n" "$1" >"$2"; chmod 0600 -- "$2"' &&
+       "$4" == acceptance-graph-marker && "$6" == "$TEST_GRAPH_MARKER" ]] || return 2
+    "$@"
+  }
+  restorecon() {
+    [[ "$1" == -F && "$2" == -- && "$3" == "$TEST_GRAPH_MARKER" ]] || return 2
+    printf 'restorecon: graph-marker\n' >>"$TEST_LABEL_CALLS"
+  }
+  matchpathcon() {
+    [[ "$1" == -V ]] || return 2
+    case "$2" in
+      "$TEST_CONFIG") printf 'matchpathcon: config\n' >>"$TEST_LABEL_CALLS" ;;
+      "$TEST_GRAPH_MARKER") printf 'matchpathcon: graph-marker\n' >>"$TEST_LABEL_CALLS" ;;
+      *) return 2 ;;
+    esac
+  }
   stat() {
     if [[ " $* " == *" $TEST_CONFIG "* ]]; then printf '0:600\n'; else command stat "$@"; fi
   }
@@ -205,6 +235,8 @@ EOF
   [[ ! -e "$TEST_MARKER" ]] || { printf 'acceptance fixture marker was not cleaned\n' >&2; exit 1; }
   [[ ! -e "$TEST_GRAPH_MARKER" ]] || { printf 'acceptance graph fixture marker was not cleaned\n' >&2; exit 1; }
   cmp -s "$config_path" "$test_work/config-original" || { printf 'acceptance fixture config was not restored\n' >&2; exit 1; }
+  [[ "$(rg -c '^restorecon: graph-marker$' "$TEST_LABEL_CALLS")" == 1 ]] || { printf 'graph marker restorecon check was not recorded\n' >&2; exit 1; }
+  [[ "$(rg -c '^matchpathcon: graph-marker$' "$TEST_LABEL_CALLS")" == 2 ]] || { printf 'graph marker label verification calls were not recorded\n' >&2; exit 1; }
   rg -q '^command backup-restore-backup:' "$receipt" || { printf 'backup acceptance command was not recorded\n' >&2; exit 1; }
   rg -q '^waiting backup-restore-backup: timeout 1800s$' "$receipt" || { printf 'backup acceptance timeout was not recorded\n' >&2; exit 1; }
   rg -q '^step backup-restore-backup: pass$' "$receipt" || { printf 'backup acceptance result was not recorded\n' >&2; exit 1; }
