@@ -670,7 +670,7 @@ backup_restore_roundtrip() {
   local test_work="$1" config_path="$2" backup_path
   backup_path="$test_work/backup-restore.tar.gz"
   local config_copy="$test_work/backup-restore-config.before" marker_path graph_marker marker_value graph_value config_stat marker_stat graph_stat config_mode
-  local path existing covered bytes source_bytes=0 needed available graph_service_user graph_service_uid graph_service_gid graph_service_home graphroot
+  local path existing covered bytes source_bytes=0 needed available graph_service_user graph_service_uid graph_service_gid graphroot
   local -a configured_paths backup_roots=()
   # shellcheck disable=SC1091
   source "$repo_root/lib/config.sh"
@@ -720,26 +720,29 @@ backup_restore_roundtrip() {
   fi
   cp -a -- "$config_path" "$config_copy" || fail 'cannot save acceptance config metadata.'
   marker_value='localai backup restore acceptance marker'
-  printf '%s\n' "$marker_value" >"$marker_path"
-  chmod 0600 -- "$marker_path"
-  marker_stat="$(stat -c '%u:%a' -- "$marker_path")"
   graph_service_user="$LOCALAI_SERVICE_USER"
   graph_service_uid="$(id -u "$graph_service_user")" || fail 'cannot identify graph storage service owner.'
   graph_service_gid="$(id -g "$graph_service_user")" || fail 'cannot identify graph storage service group.'
-  graph_service_home="$(getent passwd "$graph_service_user" | cut -d: -f6)" || fail 'cannot identify graph storage service home.'
+  create_service_marker() {
+    local value="$1" path="$2" description="$3" owner
+    (umask 077; printf '%s\n' "$value" >"$path") || fail "cannot create $description acceptance marker."
+    chmod 0600 -- "$path" || fail "cannot protect $description acceptance marker."
+    owner="$(stat -c '%u:%g' -- "$path")"
+    if [[ "$owner" != "$graph_service_uid:$graph_service_gid" ]]; then
+      chown -- "$graph_service_uid:$graph_service_gid" "$path" || fail "cannot set $description acceptance marker ownership."
+    fi
+    restorecon -F -- "$path" >/dev/null 2>&1 || fail "cannot label $description acceptance marker."
+    matchpathcon -V "$path" >/dev/null 2>&1 || fail "$description acceptance marker label does not match policy."
+    [[ "$(stat -c '%u:%g:%a' -- "$path")" == "$graph_service_uid:$graph_service_gid:600" ]] ||
+      fail "$description acceptance marker owner or mode is incorrect."
+  }
+  create_service_marker "$marker_value" "$marker_path" 'persistent data'
+  marker_stat="$(stat -c '%u:%g:%a' -- "$marker_path")"
   graphroot="$(service_podman info --format '{{.Store.GraphRoot}}')" || fail 'cannot identify configured graph storage root.'
   [[ "$graphroot" == "${graph_marker%/*}" && "$(realpath -e -- "$graphroot")" == "$graphroot" && -d "$graphroot" && ! -L "$graphroot" ]] || fail 'graph storage acceptance marker is outside the configured graph root.'
   graph_value='localai graph storage backup restore acceptance marker'
-  # shellcheck disable=SC2016
-  systemd-run --user --machine="${graph_service_user}@.host" --wait --pipe --collect \
-    --setenv="HOME=$graph_service_home" --setenv="XDG_RUNTIME_DIR=/run/user/$graph_service_uid" \
-    --setenv="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$graph_service_uid/bus" \
-    --setenv=PATH=/usr/bin:/bin -- /usr/bin/bash -c 'umask 077; printf "%s\n" "$1" >"$2"; chmod 0600 -- "$2"' \
-    acceptance-graph-marker "$graph_value" "$graph_marker" >/dev/null || fail 'cannot create graph storage acceptance marker as the service user.'
-  restorecon -F -- "$graph_marker" >/dev/null 2>&1 || fail 'cannot label graph storage acceptance marker.'
-  matchpathcon -V "$graph_marker" >/dev/null 2>&1 || fail 'graph storage acceptance marker label does not match policy.'
-  graph_stat="$(stat -c '%u:%a' -- "$graph_marker")"
-  [[ "$graph_stat" == "$graph_service_uid:600" && "$(stat -c '%g' -- "$graph_marker")" == "$graph_service_gid" ]] || fail 'graph storage acceptance marker owner or mode is incorrect.'
+  create_service_marker "$graph_value" "$graph_marker" 'graph storage'
+  graph_stat="$(stat -c '%u:%g:%a' -- "$graph_marker")"
   printf '# localai backup restore acceptance marker\n' >>"$config_path"
   check_unit active disabled || fail 'backend was not active before backup acceptance.'
   backup_acceptance_step "$backup_path" || fail 'backup acceptance command failed.'
@@ -749,9 +752,9 @@ backup_restore_roundtrip() {
   printf '# damaged backup restore acceptance marker\n' >>"$config_path"
   step backup-restore-restore 1800 "$controller" restore --yes "$backup_path" || fail 'restore acceptance command failed.'
   check_unit active disabled || fail 'restore did not return the backend to its previous active state.'
-  [[ "$(<"$marker_path")" == "$marker_value" && "$(stat -c '%u:%a' -- "$marker_path")" == "$marker_stat" ]] || fail 'persistent data marker was not restored with its ownership and mode.'
-  [[ "$(<"$graph_marker")" == "$graph_value" && "$(stat -c '%u:%a' -- "$graph_marker")" == "$graph_stat" ]] || fail 'Podman graph storage marker was not restored with its ownership and mode.'
-  [[ "$(stat -c '%g' -- "$graph_marker")" == "$graph_service_gid" ]] || fail 'Podman graph storage marker group changed during restore.'
+  [[ "$(<"$marker_path")" == "$marker_value" && "$(stat -c '%u:%g:%a' -- "$marker_path")" == "$marker_stat" ]] || fail 'persistent data marker was not restored with its ownership and mode.'
+  matchpathcon -V "$marker_path" >/dev/null 2>&1 || fail 'persistent data marker SELinux label does not match policy.'
+  [[ "$(<"$graph_marker")" == "$graph_value" && "$(stat -c '%u:%g:%a' -- "$graph_marker")" == "$graph_stat" ]] || fail 'Podman graph storage marker was not restored with its ownership and mode.'
   matchpathcon -V "$graph_marker" >/dev/null 2>&1 || fail 'Podman graph storage marker SELinux label does not match policy.'
   grep -Fqx '# localai backup restore acceptance marker' "$config_path" || fail 'configuration marker was not restored.'
   if grep -Fq '# damaged backup restore acceptance marker' "$config_path"; then

@@ -641,6 +641,8 @@ PY
 ln -s database.db "$tmp_dir/backup-state/database-current"
 printf 'tls fixture\n' >"$tmp_dir/backup-tls/ca.key"
 printf 'preserve this\n' >"$tmp_dir/backup-state/unrelated.txt"
+mkdir -p "$tmp_dir/backup-state/build/localai-oci"
+printf 'regenerable installer asset\n' >"$tmp_dir/backup-state/build/localai-oci/install.sh"
 printf 'external cache fixture\n' >"$tmp_dir/backup-cache/cache.db"
 printf 'LOCALAI_STATE_DIR=%s\nLOCALAI_MODELS_PATH=%s\nLOCALAI_BACKENDS_PATH=%s/backends\nLOCALAI_DOWNLOAD_STAGING_PATH=%s/downloading\nLOCALAI_BACKEND_TEMP_DIR=%s/tmp\nLOCALAI_DATA_PATH=%s/data\nLOCALAI_CONFIG_DIR=%s/config\nLOCALAI_GENERATED_CONTENT_PATH=%s/generated\nLOCALAI_UPLOAD_PATH=%s/uploads\nLOCALAI_CACHE_DIR=%s\nLOCALAI_LOG_DIR=%s/logs\nLOCALAI_TLS_STATE_DIR=%s\nLOCALAI_TLS_CONFIG_DIR=%s/caddy\nLOCALAI_TLS_CACHE_DIR=%s/cache\nLOCALAI_TLS_CERT_DIR=%s/certs\nLOCALAI_TLS_COMPOSE_DIR=%s/compose\nLOCALAI_TLS_ENABLED=false\n' \
   "$tmp_dir/backup-state" "$tmp_dir/backup-state/models" "$tmp_dir/backup-state" "$tmp_dir/backup-state" "$tmp_dir/backup-state" "$tmp_dir/backup-state" "$tmp_dir/backup-state" "$tmp_dir/backup-state" "$tmp_dir/backup-state" "$tmp_dir/backup-cache" "$tmp_dir/backup-state" "$tmp_dir/backup-tls" "$tmp_dir/backup-tls" "$tmp_dir/backup-tls" "$tmp_dir/backup-tls" "$tmp_dir/backup-tls" >"$tmp_dir/backup-config-dir/localai.conf"
@@ -718,6 +720,10 @@ rg -q '^ConditionPathExists=!/var/lib/\.localaictl-backup-restore\.pending$' \
   "$repo_root/localai-podman-compose/localai-tls-forward.service.in"
 archive_listing="$tmp_dir/backup-members"
 /usr/bin/tar -tzf "$backup_archive" >"$archive_listing"
+if rg -q '(^|/)backup-state/build(/|$)' "$archive_listing"; then
+  printf 'backup archive included regenerable installer build assets\n' >&2
+  exit 1
+fi
 # A configured-off public socket can still be active from an earlier setup.
 # Inventory and stop/restart it only when both root-owned LocalAI unit files
 # prove that the socket is managed by this installer.

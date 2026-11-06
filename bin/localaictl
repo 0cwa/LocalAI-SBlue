@@ -1126,6 +1126,9 @@ sys.stdout.buffer.write(tail)
     path="${rootless_graphroot#/}"
     archive_args+=(--exclude="$path" --exclude="$path/*")
   fi
+  path="${LOCALAI_STATE_DIR%/}/build"
+  path="${path#/}"
+  archive_args+=(--exclude="$path" --exclude="$path/*")
   archive_args+=(--directory "$metadata_dir" metadata --directory /)
   [[ -e "$config_file" ]] && archive_args+=("${config_file#/}")
   for path in "${backup_roots[@]}"; do

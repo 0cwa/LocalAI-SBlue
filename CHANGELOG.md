@@ -36,6 +36,9 @@ has been runtime-qualified on secureblue or on a GPU.
   bytes in destination and rollback capacity checks.
 - Accept world-readable sensitive files only under archived directory chains
   that block world traversal; continue rejecting writable sensitive state.
+- Omit the installer's regenerable state `build/` assets from backups and create
+  backup acceptance markers with configured service-account ownership and
+  verified SELinux labels.
 
 ## 0.2.0
 

@@ -204,23 +204,22 @@ EOF
     printf '%s\n' "$TEST_GRAPHROOT"
   }
   systemd-run() {
-    [[ "$1" == --user ]] || return 2
-    while [[ "$#" -gt 0 && "$1" != -- ]]; do shift; done
-    [[ "$1" == -- ]] || return 2
-    shift
-    # shellcheck disable=SC2016
-    [[ "$1" == /usr/bin/bash && "$2" == -c && "$3" == 'umask 077; printf "%s\n" "$1" >"$2"; chmod 0600 -- "$2"' &&
-       "$4" == acceptance-graph-marker && "$6" == "$TEST_GRAPH_MARKER" ]] || return 2
-    "$@"
+    printf 'unexpected transient service for acceptance marker\n' >&2
+    return 2
   }
   restorecon() {
-    [[ "$1" == -F && "$2" == -- && "$3" == "$TEST_GRAPH_MARKER" ]] || return 2
-    printf 'restorecon: graph-marker\n' >>"$TEST_LABEL_CALLS"
+    [[ "$1" == -F && "$2" == -- ]] || return 2
+    case "$3" in
+      "$TEST_MARKER") printf 'restorecon: data-marker\n' >>"$TEST_LABEL_CALLS" ;;
+      "$TEST_GRAPH_MARKER") printf 'restorecon: graph-marker\n' >>"$TEST_LABEL_CALLS" ;;
+      *) return 2 ;;
+    esac
   }
   matchpathcon() {
     [[ "$1" == -V ]] || return 2
     case "$2" in
       "$TEST_CONFIG") printf 'matchpathcon: config\n' >>"$TEST_LABEL_CALLS" ;;
+      "$TEST_MARKER") printf 'matchpathcon: data-marker\n' >>"$TEST_LABEL_CALLS" ;;
       "$TEST_GRAPH_MARKER") printf 'matchpathcon: graph-marker\n' >>"$TEST_LABEL_CALLS" ;;
       *) return 2 ;;
     esac
@@ -235,6 +234,8 @@ EOF
   [[ ! -e "$TEST_MARKER" ]] || { printf 'acceptance fixture marker was not cleaned\n' >&2; exit 1; }
   [[ ! -e "$TEST_GRAPH_MARKER" ]] || { printf 'acceptance graph fixture marker was not cleaned\n' >&2; exit 1; }
   cmp -s "$config_path" "$test_work/config-original" || { printf 'acceptance fixture config was not restored\n' >&2; exit 1; }
+  [[ "$(rg -c '^restorecon: data-marker$' "$TEST_LABEL_CALLS")" == 1 ]] || { printf 'data marker restorecon check was not recorded\n' >&2; exit 1; }
+  [[ "$(rg -c '^matchpathcon: data-marker$' "$TEST_LABEL_CALLS")" == 2 ]] || { printf 'data marker label verification calls were not recorded\n' >&2; exit 1; }
   [[ "$(rg -c '^restorecon: graph-marker$' "$TEST_LABEL_CALLS")" == 1 ]] || { printf 'graph marker restorecon check was not recorded\n' >&2; exit 1; }
   [[ "$(rg -c '^matchpathcon: graph-marker$' "$TEST_LABEL_CALLS")" == 2 ]] || { printf 'graph marker label verification calls were not recorded\n' >&2; exit 1; }
   rg -q '^command backup-restore-backup:' "$receipt" || { printf 'backup acceptance command was not recorded\n' >&2; exit 1; }
