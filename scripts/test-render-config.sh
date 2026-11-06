@@ -230,6 +230,12 @@ fi
 
 # Static template checks protect the boot/readiness contract without invoking
 # systemd, Podman, SELinux, or a host installer in CI.
+restore_marker_guard='ExecStartPre=/usr/bin/test ! -e /var/lib/.localaictl-backup-restore.pending'
+for service_template in \
+  "$repo_root/secureblue-localai-install/localai.service.in" \
+  "$repo_root/localai-podman-compose/localai-tls-compose.service.in"; do
+  rg -q -x -F "$restore_marker_guard" "$service_template"
+done
 rg -q '^Wants=network-online.target$' "$repo_root/localai-podman-compose/localai-tls-compose.service.in"
 rg -q '^After=network-online.target default.target$' "$repo_root/localai-podman-compose/localai-tls-compose.service.in"
 rg -q '^FreeBind=true$' "$repo_root/localai-podman-compose/localai-tls-forward.socket.in"

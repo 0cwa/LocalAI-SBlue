@@ -347,6 +347,17 @@ ensure_tls_user() {
   log "TLS proxy user UID: $tls_uid"
 }
 
+preflight_tls_podman_parents() {
+  local expected_uid=-1
+  if getent passwd "$tls_user" >/dev/null; then
+    expected_uid="$(getent passwd "$tls_user" | cut -d: -f3)" || return 1
+    [[ "$expected_uid" =~ ^[0-9]+$ ]] || return 1
+  fi
+  localai_installer_preflight_service_directory "$tls_state_dir" "TLS state directory" "$expected_uid" || return 1
+  localai_installer_preflight_service_directory "$tls_state_dir/.local" "TLS Podman home directory" "$expected_uid" || return 1
+  localai_installer_preflight_service_directory "$tls_state_dir/.local/share" "TLS Podman share directory" "$expected_uid" || return 1
+}
+
 tls_runtime_dir() {
   printf '/run/user/%s\n' "$tls_uid"
 }
@@ -513,8 +524,14 @@ ensure_subids() {
 install_dirs() {
   log "Creating LocalAI TLS state directories"
   local dir
+  # Podman uses tls_state_dir as HOME and creates its default graphroot below
+  # .local/share. Create and transfer ownership of each parent explicitly;
+  # the helper refuses non-empty root-owned or otherwise unexpected paths.
+  localai_installer_ensure_service_directory "$tls_state_dir" "TLS state directory" "$tls_user" "$tls_user" "$tls_uid" 0750 || die "Unsafe TLS state directory."
+  localai_installer_ensure_service_directory "$tls_state_dir/.local" "TLS Podman home directory" "$tls_user" "$tls_user" "$tls_uid" 0750 || die "Unsafe TLS Podman home directory."
+  localai_installer_ensure_service_directory "$tls_state_dir/.local/share" "TLS Podman share directory" "$tls_user" "$tls_user" "$tls_uid" 0750 || die "Unsafe TLS Podman share directory."
   for dir in \
-    "$tls_state_dir" "$tls_state_dir/data" "$tls_state_dir/config" \
+    "$tls_state_dir/data" "$tls_state_dir/config" \
     "$tls_app_home_dir" "$tls_storage_dir" "$tls_config_dir" \
     "$tls_cache_dir" "$tls_certs_dir" "$tls_compose_dir"; do
     localai_installer_ensure_service_directory "$dir" "TLS managed directory" "$tls_user" "$tls_user" "$tls_uid" 0750 || die "Unsafe TLS managed directory: $dir"
@@ -973,39 +990,92 @@ selinux_port_state_file() {
   localai_installer_selinux_state_file "$1"
 }
 
-tcp_port_type() {
-  local port="$1"
-  semanage port -l | awk -v port="$port" '
+tcp_port_match_from_listing() {
+  local listing="$1" port="$2"
+  printf '%s\n' "$listing" | awk -v port="$port" '
     $2 == "tcp" {
       for (i = 3; i <= NF; i++) {
-        item = $i
-        gsub(",", "", item)
-        split(item, range, "-")
-        if (range[2] == "" && range[1] == port) {
-          print $1
-          exit
-        }
-        if (range[2] != "" && port >= range[1] && port <= range[2]) {
-          print $1
-          exit
+        item_count = split($i, items, ",")
+        for (j = 1; j <= item_count; j++) {
+          item = items[j]
+          count = split(item, bounds, "-")
+          if (count == 1 && bounds[1] == port) {
+            exact = $1
+          } else if (count == 2 && bounds[1] <= port && port <= bounds[2] && range == "") {
+            range = $1
+          }
         }
       }
+    }
+    END {
+      if (exact != "") print "exact|" exact
+      else if (range != "") print "range|" range
     }
   '
 }
 
+tcp_port_local_override() {
+  local port="$1" listing
+  listing="$(semanage port -l -C)" || return 1
+  tcp_port_match_from_listing "$listing" "$port"
+}
+
+tcp_port_base_match() {
+  local port="$1" listing
+  listing="$(semanage port -l)" || return 1
+  tcp_port_match_from_listing "$listing" "$port"
+}
+
+tcp_port_type() {
+  local port="$1" override base_match
+  override="$(tcp_port_local_override "$port")" || return 1
+  base_match="$(tcp_port_base_match "$port")" || return 1
+  if [[ "$override" == exact\|* ]]; then
+    printf '%s\n' "${override#*|}"
+  elif [[ "$base_match" == exact\|* ]]; then
+    printf '%s\n' "${base_match#*|}"
+  elif [[ -n "$override" ]]; then
+    printf '%s\n' "${override#*|}"
+  elif [[ -n "$base_match" ]]; then
+    printf '%s\n' "${base_match#*|}"
+  fi
+  return 0
+}
+
+selinux_port_change_action() {
+  local local_override="$1" base_match="$2"
+  case "$local_override" in
+    exact\|*) printf 'modify|modify|%s\n' "${local_override#*|}" ;;
+    range\|*) return 2 ;;
+    '')
+      if [[ "$base_match" == exact\|* ]]; then
+        # semanage -m replaces an exact base-policy record and creates a local
+        # override; rollback must delete that override to reveal the base type.
+        printf 'add|modify|\n'
+      else
+        printf 'add|add|\n'
+      fi
+      ;;
+    *) return 1 ;;
+  esac
+}
+
 label_one_forward_selinux_port() {
   local role="$1" port="$2" purpose="$3"
-  local current_type action state_file status current_after
+  local current_type action operation state_file status current_after local_override base_match previous_type
   [[ -n "$port" ]] || return 0
 
   state_file="$(selinux_port_state_file "$role")" || die "Invalid SELinux port role."
-  current_type="$(tcp_port_type "$port")"
+  local_override="$(tcp_port_local_override "$port")" || die "Could not inspect local SELinux port overrides."
+  base_match="$(tcp_port_base_match "$port")" || die "Could not inspect base SELinux port definitions."
+  current_type="$(tcp_port_type "$port")" || die "Could not resolve SELinux type for TCP port $port."
 
   if [[ "$current_type" == "$tls_selinux_port_type" ]]; then
     log "SELinux TCP port $port already labeled $tls_selinux_port_type"
     return 0
   fi
+
+  IFS='|' read -r action operation previous_type < <(selinux_port_change_action "$local_override" "$base_match") || die "Refusing to replace an administrator-defined SELinux port range."
 
   cat >&2 <<EOF
 
@@ -1016,19 +1086,14 @@ Security cost: this reserves TCP port $port for the SELinux
 systemd_socket_proxyd_port_t type. Scope: this one TCP port label only.
 EOF
 
-  if [[ -n "$current_type" ]]; then
-    action="modify"
-  else
-    action="add"
-  fi
-  localai_installer_write_selinux_port_state "$role" "$action" "$port" "$current_type" "$tls_selinux_port_type" || die "Could not save root-owned SELinux rollback metadata."
-  if [[ "$action" == modify ]]; then
+  localai_installer_write_selinux_port_state "$role" "$action" "$port" "$previous_type" "$tls_selinux_port_type" || die "Could not save root-owned SELinux rollback metadata."
+  if [[ "$operation" == modify ]]; then
     run0_pipe semanage port -m -t "$tls_selinux_port_type" -p tcp "$port" || status=$?
   else
     run0_pipe semanage port -a -t "$tls_selinux_port_type" -p tcp "$port" || status=$?
   fi
   if [[ "${status:-0}" != 0 ]]; then
-    current_after="$(tcp_port_type "$port")"
+    current_after="$(tcp_port_type "$port")" || die "Could not verify SELinux TCP port $port after a failed label change; preserving rollback metadata."
     if [[ "$current_after" != "$tls_selinux_port_type" ]]; then
       localai_installer_remove_selinux_port_state "$role" || true
     fi
@@ -1038,15 +1103,18 @@ EOF
 
 restore_forward_selinux_port_if_tracked() {
   local role="$1"
-  local state_file state action="" port="" previous_type="" new_type="" current_type
+  local state_file state action="" port="" previous_type="" new_type="" current_type local_override
   state_file="$(selinux_port_state_file "$role")" || die "Invalid SELinux port role."
 
   [[ -e "$state_file" || -L "$state_file" ]] || return 0
   require_cmd semanage
   state="$(localai_installer_read_selinux_port_state "$state_file")" || die "Refusing untrusted SELinux rollback metadata."
   IFS='|' read -r action port previous_type new_type <<< "$state"
-  current_type="$(tcp_port_type "$port")"
-  if [[ "$current_type" == "$new_type" && "$action" == add ]]; then
+  current_type="$(tcp_port_type "$port")" || die "Could not resolve SELinux type for TCP port $port."
+  local_override="$(tcp_port_local_override "$port")" || die "Could not inspect local SELinux port override for TCP port $port."
+  if [[ "$local_override" != "exact|$new_type" ]]; then
+    log "SELinux TCP port $port no longer has the tracked local exact override; leaving the administrator's change intact."
+  elif [[ "$current_type" == "$new_type" && "$action" == add ]]; then
     log "Removing SELinux TCP port label for $port"
     run0_pipe semanage port -d -p tcp "$port" || die "Could not remove tracked SELinux port label $port."
   elif [[ "$current_type" == "$new_type" && "$action" == modify ]]; then
@@ -1102,7 +1170,7 @@ install_forward_bind_selinux_policy() {
 
   require_cmd semanage
   require_cmd semodule
-  current_type="$(tcp_port_type "$tls_public_port")"
+  current_type="$(tcp_port_type "$tls_public_port")" || die "Could not resolve SELinux type for TCP port $tls_public_port."
   [[ -n "$current_type" ]] || die "Could not resolve SELinux type for TCP port $tls_public_port"
 
   if [[ "$current_type" == "$tls_selinux_port_type" ]]; then
@@ -1249,11 +1317,13 @@ elevate_once
 validate_names
 resolve_localai_user
 preflight_first_admin
+preflight_tls_podman_parents
 localai_installer_prepare_config "$canonical_config" "$LOCALAI_INSTALLER_CONFIG_SOURCE" "$LOCALAI_INSTALLER_CONFIG_FORMAT" || die "Could not safely persist the shared LocalAI configuration."
 localai_installer_persist_environment_overrides "$canonical_config" || die "Could not safely persist explicit configuration overrides."
 load_localai_lock
 require_cmd run0
 validate_names
+preflight_tls_podman_parents || die "Unsafe existing TLS Podman parent directories."
 ensure_tls_user
 preflight_user_systemd_parent
 guard_tls_manager_start
@@ -1266,8 +1336,10 @@ ensure_user_manager
 ensure_container_userns
 rebind_localai_if_requested
 pull_image
-label_container_state
 write_caddyfile
+# The new Caddyfile must exist before the tree is relabeled or SELinux gives
+# it the parent directory's default type instead of container_file_t.
+label_container_state
 validate_caddyfile
 write_compose_file
 write_compose_service

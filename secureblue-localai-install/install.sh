@@ -641,13 +641,14 @@ restore_existing_service() {
 }
 
 install_systemd_service() {
-  local tmp_service image_ref bind_host bind_port user_unit_dir admin_gate=''
+  local tmp_service image_ref bind_host bind_port publish_host user_unit_dir admin_gate=''
   local container_name models_path data_path config_dir generated_content_path upload_path cache_dir log_dir
   local gpu_device_args=""
   local app_home_path backends_path download_staging_path backend_temp_dir
   image_ref="$(localai_image_ref)"
   bind_host="${LOCALAI_BIND_HOST:-${SERVICE_BIND_HOST:-127.0.0.1}}"
   bind_port="${LOCALAI_BIND_PORT:-${SERVICE_BIND_PORT:-11455}}"
+  publish_host="$(localai_installer_podman_publish_host "$bind_host")" || die "Cannot render a safe Podman published-port address."
   container_name="${LOCALAI_CONTAINER_NAME:-localai}"
   models_path="$(localai_models_path)"
   app_home_path="$(localai_app_home_path)"
@@ -696,6 +697,7 @@ install_systemd_service() {
     -e "s|@CONTAINER_NAME@|$container_name|g" \
     -e "s|@BIND_HOST@|$bind_host|g" \
     -e "s|@BIND_PORT@|$bind_port|g" \
+    -e "s|@PUBLISH_HOST@|$publish_host|g" \
     -e "s|@ADMIN_GATE@|$admin_gate|g" \
     -e "s|@LOCALAI_AUTH@|${LOCALAI_AUTH:-true}|g" \
     -e "s|@LOCALAI_REGISTRATION_MODE@|${LOCALAI_REGISTRATION_MODE:-approval}|g" \
@@ -769,6 +771,7 @@ state_dir="$LOCALAI_STATE_DIR"
 project_dir="${LOCALAI_PROJECT_DIR:-$state_dir/build/localai-oci}"
 SERVICE_BIND_HOST="$LOCALAI_BIND_HOST"
 SERVICE_BIND_PORT="$LOCALAI_BIND_PORT"
+localai_installer_podman_publish_host "$LOCALAI_BIND_HOST" >/dev/null || die "Refusing to change an existing service with this bind host; use a numeric IPv4 or IPv6 address."
 localai_installer_validate_service_account_name "$service_user" "LOCALAI_SERVICE_USER" || die "Unsafe LocalAI service account name."
 localai_installer_validate_managed_path "$state_dir" "LOCALAI_STATE_DIR" || die "Unsafe LocalAI state path."
 localai_installer_validate_managed_path "$project_dir" "LOCALAI_PROJECT_DIR" || die "Unsafe LocalAI project path."
@@ -796,6 +799,7 @@ state_dir="$LOCALAI_STATE_DIR"
 project_dir="${LOCALAI_PROJECT_DIR:-$state_dir/build/localai-oci}"
 SERVICE_BIND_HOST="$LOCALAI_BIND_HOST"
 SERVICE_BIND_PORT="$LOCALAI_BIND_PORT"
+localai_installer_podman_publish_host "$LOCALAI_BIND_HOST" >/dev/null || die "Refusing to change an existing service with this bind host; use a numeric IPv4 or IPv6 address."
 localai_installer_validate_service_account_name "$service_user" "LOCALAI_SERVICE_USER" || die "Unsafe LocalAI service account name."
 localai_installer_validate_managed_path "$state_dir" "LOCALAI_STATE_DIR" || die "Unsafe LocalAI state path."
 localai_installer_validate_managed_path "$project_dir" "LOCALAI_PROJECT_DIR" || die "Unsafe LocalAI project path."
