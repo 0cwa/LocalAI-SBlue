@@ -627,10 +627,10 @@ chmod 0644 "$tmp_dir/backup-tls/compose/localai-tls-compose.yaml"
 mkdir -p "$tmp_dir/backup-tls/.config/systemd/user"
 printf '# Managed by LocalAI secureblue TLS installer.\nDescription=LocalAI TLS reverse proxy compose stack\n' >"$tmp_dir/backup-tls/.config/systemd/user/localai-tls-compose.service"
 chmod 0644 "$tmp_dir/backup-tls/.config/systemd/user/localai-tls-compose.service"
-chmod 0710 "$tmp_dir/backup-state"
+chmod 0750 "$tmp_dir/backup-state"
 printf 'active\n' >"$LOCALAI_FAKE_STATE_DIR/backend"
 printf 'state fixture\n' >"$tmp_dir/backup-state/database.db"
-chmod 0640 "$tmp_dir/backup-state/database.db"
+chmod 0644 "$tmp_dir/backup-state/database.db"
 python3 - "$tmp_dir/backup-state/database.db" <<'PY'
 import os, sys
 try:
@@ -680,6 +680,26 @@ if ! "$repo_root/bin/localaictl" backup --exclude-models "$backup_archive" 2>"$t
   cat "$tmp_dir/commands" >&2
   exit 1
 fi
+chmod 0655 "$tmp_dir/backup-state/database.db"
+if "$repo_root/bin/localaictl" backup "$tmp_dir/world-executable-database.tar.gz" 2>"$tmp_dir/world-executable-database-warning"; then
+  printf 'backup accepted a world-executable database under a private data root\n' >&2
+  exit 1
+fi
+if ! rg -q 'backup contains public or writable permissions on sensitive state' "$tmp_dir/world-executable-database-warning"; then
+  cat "$tmp_dir/world-executable-database-warning" >&2
+  exit 1
+fi
+chmod 0644 "$tmp_dir/backup-state/database.db"
+chmod 0755 "$tmp_dir/backup-state"
+if "$repo_root/bin/localaictl" backup "$tmp_dir/public-database.tar.gz" 2>"$tmp_dir/public-database-warning"; then
+  printf 'backup accepted a world-readable database under a world-traversable data root\n' >&2
+  exit 1
+fi
+if ! rg -q 'backup contains public or writable permissions on sensitive state' "$tmp_dir/public-database-warning"; then
+  cat "$tmp_dir/public-database-warning" >&2
+  exit 1
+fi
+chmod 0750 "$tmp_dir/backup-state"
 custom_user_archive="$tmp_dir/custom-service-user.tar.gz"
 : >"$LOCALAI_FAKE_LOG"
 if ! LOCALAI_SERVICE_USER=localai.backup-test-1 "$repo_root/bin/localaictl" backup "$custom_user_archive" >/dev/null 2>&1; then
@@ -1790,7 +1810,7 @@ destination_sync_line="$(rg -n '^sync-destinations$' "$tmp_dir/commands" | tail 
 marker_clear_line="$(rg -n '^restore-marker-clear$' "$tmp_dir/commands" | tail -n1 | cut -d: -f1)"
 [[ -n "$snapshot_sync_line" && -n "$marker_create_line" && -n "$destination_sync_line" && -n "$marker_clear_line" ]]
 (( snapshot_sync_line < marker_create_line && destination_sync_line < marker_clear_line ))
-[[ "$(stat -c '%a' "$tmp_dir/backup-state")" == 710 ]]
+[[ "$(stat -c '%a' "$tmp_dir/backup-state")" == 750 ]]
 restore_config_dir="$tmp_dir/restore-config"
 mkdir -m 0700 "$restore_config_dir"
 restore_config_path="$restore_config_dir/localai.conf"
@@ -1835,7 +1855,7 @@ export LOCALAI_CP_BIN="$tmp_dir/cp-config-test"
 LOCALAI_CONFIG_FILE="$restore_config_path" "$repo_root/bin/localaictl" restore --yes "$config_archive" >"$tmp_dir/config-restore-output"
 unset LOCALAI_CP_BIN LOCALAI_TEST_CONFIG_DEST
 [[ "$(<"$tmp_dir/backup-state/database.db")" == 'state fixture' ]]
-[[ "$(stat -c '%a' "$tmp_dir/backup-state/database.db")" == 640 ]]
+[[ "$(stat -c '%a' "$tmp_dir/backup-state/database.db")" == 644 ]]
 python3 - "$tmp_dir/backup-state/database.db" <<'PY'
 import os, sys
 try:

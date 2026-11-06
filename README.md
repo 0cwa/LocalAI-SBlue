@@ -348,6 +348,9 @@ records the configured backend and TLS image references and digests. Use
 `backup --exclude-models` to leave the configured models directory out of the
 archive; restoring such an archive leaves any existing models untouched. The
 archive is created with mode `0600`.
+Sensitive files may retain world-read bits only when every archived directory
+from their configured root blocks world traversal; group/world write and
+execute permissions remain unsafe.
 Backup checks free bytes and inodes on both the private staging filesystem and
 the archive destination, combining needs when they share a filesystem. The
 estimate treats sparse files conservatively and may require space for their

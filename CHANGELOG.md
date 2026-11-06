@@ -34,6 +34,8 @@ has been runtime-qualified on secureblue or on a GPU.
 - Bound archive member, path, pax metadata, and expanded-size processing; reject
   unsafe ownership, ACLs, and archived SELinux labels, and account for xattr/ACL
   bytes in destination and rollback capacity checks.
+- Accept world-readable sensitive files only under archived directory chains
+  that block world traversal; continue rejecting writable sensitive state.
 
 ## 0.2.0
 

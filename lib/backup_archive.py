@@ -187,6 +187,27 @@ def sensitive_member(name: str) -> bool:
     )
 
 
+def sensitive_permissions_safe(
+    name: str, info: tarfile.TarInfo, root: str, members: dict[str, tarfile.TarInfo]
+) -> bool:
+    """Permit world-read bits only when archived parents block world traversal."""
+    if not info.isfile() and not info.islnk():
+        return False
+    if info.mode & 0o033:
+        return False
+    if not info.mode & 0o004:
+        return True
+    parent = posixpath.dirname(name)
+    while parent == root or parent.startswith(root + "/"):
+        parent_info = members.get(parent)
+        if parent_info is None or not parent_info.isdir() or parent_info.mode & 0o007:
+            return False
+        if parent == root:
+            return True
+        parent = posixpath.dirname(parent)
+    return False
+
+
 def unsafe_archive_attributes(info: tarfile.TarInfo) -> bool:
     for key, value in info.pax_headers.items():
         normalized = key.lower()
@@ -798,13 +819,15 @@ def validate_archive(
                     if (not in_owner_policy(info.uid, expected_uid, uid_ranges) or
                             not in_owner_policy(info.gid, expected_gid, gid_ranges)):
                         fail("backup member ownership is outside the configured service account")
-                    if sensitive_member(name) and info.mode & 0o027:
-                        fail("backup contains public or writable permissions on sensitive state")
                 members[name] = info
     except (OSError, tarfile.TarError) as error:
         fail(f"cannot read backup archive ({type(error).__name__})")
 
     for name, info in members.items():
+        root_name = member_root(name, prefixes)
+        if (sensitive_member(name) and
+                (root_name is None or not sensitive_permissions_safe(name, info, root_name, members))):
+            fail("backup contains public or writable permissions on sensitive state")
         parent = posixpath.dirname(name)
         while parent:
             if parent in members and not members[parent].isdir():
@@ -828,7 +851,7 @@ def validate_archive(
             target_info = members[target]
             if (info.uid, info.gid, info.mode) != (target_info.uid, target_info.gid, target_info.mode):
                 fail("backup hard link metadata differs from its target")
-            if sensitive_member(name) and target_info.mode & 0o027:
+            if sensitive_member(name) and not sensitive_permissions_safe(name, target_info, root, members):
                 fail("backup sensitive hard link target has public or writable permissions")
     if "metadata" not in members or not members["metadata"].isfile():
         fail("backup metadata is missing")
