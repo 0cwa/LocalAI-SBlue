@@ -711,12 +711,15 @@ def validate_graphroot_tar(
     if (root is None or not root.isdir() or root.uid != 0 or root.gid != 0 or
             root.mode & 0o700 != 0o700 or root.mode & 0o077 or root.mode & 0o7000):
         fail("rootless archive graphroot root is missing or not a directory")
+    def archived_selinux_labels(member: tarfile.TarInfo) -> list[bytes]:
+        return [value.encode("utf-8", "surrogateescape").rstrip(b"\0")
+                for key, value in member.pax_headers.items()
+                if key.lower().endswith("security.selinux")]
+
     for name, info in members.items():
-        label_values = [value.encode("utf-8", "surrogateescape").rstrip(b"\0")
-                        for key, value in info.pax_headers.items()
-                        if key.lower().endswith("security.selinux")]
-        if len(label_values) > 1:
-            fail("rootless archive contains duplicate SELinux labels")
+        label_values = archived_selinux_labels(info)
+        if len(set(label_values)) > 1:
+            fail("rootless archive contains conflicting SELinux labels")
         relative = name[len(prefix):].lstrip("/")
         live_path = graphroot if not relative else os.path.join(graphroot, *relative.split("/"))
         if not os.path.lexists(live_path):
@@ -731,6 +734,14 @@ def validate_graphroot_tar(
             else:
                 fail("cannot verify rootless archive SELinux labels")
         archived_label = label_values[0] if label_values else b""
+        if info.islnk() and not label_values:
+            target = clean_member_name(info.linkname)
+            target_info = members.get(target)
+            if target_info is not None and target_info.isfile():
+                target_labels = archived_selinux_labels(target_info)
+                if len(set(target_labels)) > 1:
+                    fail("rootless archive contains conflicting SELinux labels")
+                archived_label = target_labels[0] if target_labels else b""
         if archived_label != live_label:
             fail("rootless archive SELinux label differs from its installed baseline")
     for name, info in members.items():

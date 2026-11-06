@@ -999,6 +999,18 @@ def validate(raw, uid_value=uid_map, gid_value=gid_map):
         return helper.validate_graphroot_tar(io.BytesIO(raw), rootless_path, uid_map, gid_map,
                                              uid_value, gid_value, "localai")
 
+def validate_with_selinux(raw, expected_label):
+    rootless_baseline = expected_label.encode()
+    def has_live_baseline(path):
+        return os.fspath(path) != rootless_path
+    with patch.object(pwd, "getpwnam", return_value=SimpleNamespace(pw_uid=1001)), \
+         patch.object(grp, "getgrnam", return_value=SimpleNamespace(gr_gid=1001)), \
+         patch.object(builtins, "open", side_effect=fixture_open), \
+         patch.object(helper.os.path, "lexists", side_effect=has_live_baseline), \
+         patch.object(helper.os, "getxattr", return_value=rootless_baseline):
+        return helper.validate_graphroot_tar(io.BytesIO(raw), rootless_path, uid_map, gid_map,
+                                             uid_map, gid_map, "localai")
+
 def rejects(raw, uid_value=uid_map, gid_value=gid_map):
     with contextlib.redirect_stderr(io.StringIO()):
         try:
@@ -1021,6 +1033,37 @@ image_privileged_modes = make_archive([
 validated_privileged_members = validate(image_privileged_modes)
 if not {"storage/overlay/layer/diff/usr/bin/passwd", "storage/overlay/layer/diff/usr/bin/write"}.issubset(validated_privileged_members):
     raise SystemExit("rootless image special modes were not preserved")
+selinux_label = "system_u:object_r:container_file_t:s0"
+duplicate_labels = make_archive([
+    directory("storage/"),
+    regular("storage/overlay/layer/diff/tool", pax={
+        "SCHILY.xattr.security.selinux": selinux_label,
+        "RHT.security.selinux": selinux_label,
+    }),
+])
+if "storage/overlay/layer/diff/tool" not in validate_with_selinux(duplicate_labels, selinux_label):
+    raise SystemExit("identical rootless SELinux label metadata was not validated")
+labelled_target_name = "storage/overlay/layer/diff/labelled-target"
+labelled_link_name = "storage/overlay/layer/diff/labelled-hardlink"
+labelled_link = helper.tarfile.TarInfo(labelled_link_name)
+labelled_link.type = helper.tarfile.LNKTYPE
+labelled_link.linkname = labelled_target_name
+labelled_link.mode, labelled_link.uid, labelled_link.gid = 0o600, 1, 1
+hardlink_labels = make_archive([
+    directory("storage/"),
+    regular(labelled_target_name, pax={"SCHILY.xattr.security.selinux": selinux_label}),
+    (labelled_link, None),
+])
+if labelled_link_name not in validate_with_selinux(hardlink_labels, selinux_label):
+    raise SystemExit("rootless hardlink did not inherit its target's SELinux label")
+conflicting_labels = make_archive([
+    directory("storage/"),
+    regular("storage/overlay/layer/diff/tool", pax={
+        "SCHILY.xattr.security.selinux": selinux_label,
+        "RHT.security.selinux": "system_u:object_r:other_t:s0",
+    }),
+])
+rejects(conflicting_labels)
 for unsafe_root_mode in (0o000, 0o500, 0o1700, 0o2700):
     rejects(make_archive([directory("storage/", mode=unsafe_root_mode)]))
 rejects(valid, "0:1002:1;1:200000:65536")

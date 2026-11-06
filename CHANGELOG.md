@@ -42,6 +42,8 @@ has been runtime-qualified on secureblue or on a GPU.
 - Preserve setuid/setgid bits in validated rootless image archives where
   namespace root maps to the service account; ordinary persistent paths still
   reject these bits.
+- Validate rootless hardlink SELinux labels against their archived target when
+  tar omits labels on hardlink entries; reject conflicting label metadata.
 
 ## 0.2.0
 
