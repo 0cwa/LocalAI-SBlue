@@ -686,6 +686,7 @@ except OSError:
 PY
 ln -s database.db "$tmp_dir/backup-state/database-current"
 printf 'tls fixture\n' >"$tmp_dir/backup-tls/ca.key"
+chmod 0600 "$tmp_dir/backup-tls/ca.key"
 printf 'preserve this\n' >"$tmp_dir/backup-state/unrelated.txt"
 mkdir -p "$tmp_dir/backup-state/build/localai-oci"
 printf 'regenerable installer asset\n' >"$tmp_dir/backup-state/build/localai-oci/install.sh"
