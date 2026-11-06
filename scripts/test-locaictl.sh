@@ -96,6 +96,9 @@ if [[ "${1:-}" == /usr/bin/python3 && "${2:-}" == "${LOCALAI_FAKE_BACKUP_HELPER:
       rm -f -- "${LOCALAI_FAKE_TRANSACTION_MARKER:?}"
       exit 0
       ;;
+    graphroot-check)
+      [[ "${LOCALAI_FAKE_GRAPHROOT_CHECK:-false}" != true ]] || exit 0
+      ;;
     sync-destinations)
       printf 'sync-destinations\n' >>"${LOCALAI_FAKE_LOG:?}"
       exit 0
@@ -129,7 +132,7 @@ if [[ "${1:-}" == /usr/bin/systemd-run ]]; then
       : >"${LOCALAI_FAKE_GRAPHROOT_INFO_MARKER}"
       exit 75
     fi
-    printf '%s/nonexistent-graphroot\n' "${LOCALAI_FAKE_STATE_DIR:?}"
+    printf '%s\n' "${LOCALAI_FAKE_GRAPHROOT:-${LOCALAI_FAKE_STATE_DIR:?}/nonexistent-graphroot}"
     exit 0
   fi
   if [[ "${1:-}" == /usr/bin/podman && "${2:-}" == unshare ]]; then
@@ -717,6 +720,16 @@ printf 'restorecon %s\n' "$*" >>"${LOCALAI_FAKE_LOG:?}"
 EOF
 chmod 0755 "$tmp_dir/restorecon"
 export LOCALAI_RESTORECON_BIN="$tmp_dir/restorecon"
+cat >"$tmp_dir/cp-test" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'cp\n' >>"${LOCALAI_FAKE_CP_ARGS_FILE:?}"
+printf '[%s]\n' "$@" >>"${LOCALAI_FAKE_CP_ARGS_FILE}"
+exec /usr/bin/cp "$@"
+EOF
+chmod 0755 "$tmp_dir/cp-test"
+export LOCALAI_CP_BIN="$tmp_dir/cp-test"
+export LOCALAI_FAKE_CP_ARGS_FILE="$tmp_dir/cp-args"
 : >"$tmp_dir/commands"
 rm -f "$tmp_dir/systemd/localai-tls-forward.socket"
 backup_archive="$tmp_dir/backup.tar.gz"
@@ -728,6 +741,17 @@ if ! "$repo_root/bin/localaictl" backup --exclude-models "$backup_archive" 2>"$t
 fi
 [[ -f "$LOCALAI_FAKE_GRAPHROOT_INFO_MARKER" ]] || { printf 'backup did not recover from a transient read-only GraphRoot query failure\n' >&2; exit 1; }
 unset LOCALAI_FAKE_GRAPHROOT_INFO_FAIL_ONCE
+mkdir -m 0700 "$tmp_dir/external-graphroot"
+if LOCALAI_FAKE_GRAPHROOT="$tmp_dir/external-graphroot" LOCALAI_FAKE_GRAPHROOT_CHECK=true \
+  "$repo_root/bin/localaictl" backup "$tmp_dir/external-graphroot/inside.tar.gz" \
+  >"$tmp_dir/external-graphroot-output" 2>"$tmp_dir/external-graphroot-error"; then
+  printf 'backup destination inside the discovered rootless GraphRoot was accepted\n' >&2
+  exit 1
+fi
+rg -q 'backup destination must be outside the configuration and persistent data paths' \
+  "$tmp_dir/external-graphroot-error"
+[[ ! -e "$tmp_dir/external-graphroot/inside.tar.gz" ]]
+[[ -z "$(find "$tmp_dir/external-graphroot" -mindepth 1 -maxdepth 1 -print -quit)" ]]
 chmod 0655 "$tmp_dir/backup-state/database.db"
 if "$repo_root/bin/localaictl" backup "$tmp_dir/world-executable-database.tar.gz" 2>"$tmp_dir/world-executable-database-warning"; then
   printf 'backup accepted a world-executable database under a private data root\n' >&2
@@ -910,6 +934,47 @@ with tempfile.TemporaryDirectory(prefix="source-growth-test-", dir=os.environ["T
             raise SystemExit("restore source staging accepted a concurrently grown archive")
     if os.path.exists(destination):
         raise SystemExit("restore source staging retained a partial copy after source growth")
+
+    with open(destination, "wb") as stream:
+        stream.write(b"pre-existing destination")
+    with contextlib.redirect_stderr(io.StringIO()):
+        try:
+            helper.copy_source(source, destination)
+        except SystemExit:
+            pass
+        else:
+            raise SystemExit("restore source staging accepted an existing destination")
+    with open(destination, "rb") as stream:
+        if stream.read() != b"pre-existing destination":
+            raise SystemExit("restore source staging deleted or changed an existing destination")
+
+with tempfile.TemporaryDirectory(prefix="rollback-implicit-parents-test-", dir=os.environ["TMPDIR"]) as parent:
+    root = os.path.join(parent, "persistent")
+    existing_parent = os.path.join(root, "existing")
+    new_parent = os.path.join(root, "new-parent")
+    os.makedirs(existing_parent)
+    os.makedirs(new_parent)
+    new_file = os.path.join(new_parent, "created.bin")
+    existing_file = os.path.join(existing_parent, "created.bin")
+    with open(new_file, "wb") as stream:
+        stream.write(b"new")
+    with open(existing_file, "wb") as stream:
+        stream.write(b"new")
+    root_name = os.path.abspath(root).lstrip("/")
+    members = os.path.join(parent, "members0")
+    collisions = os.path.join(parent, "collisions0")
+    with open(members, "wb") as stream:
+        stream.write(os.fsencode(root_name + "/new-parent/created.bin") + b"\0")
+        stream.write(os.fsencode(root_name + "/existing/created.bin") + b"\0")
+    with open(collisions, "wb") as stream:
+        stream.write(os.fsencode(root_name) + b"\0")
+        stream.write(os.fsencode(root_name + "/existing") + b"\0")
+    if helper.rollback_new(members, collisions, "/etc/localai/localai.conf", [root]) != 0:
+        raise SystemExit("restore rollback reported failure while removing new implicit parents")
+    if os.path.lexists(new_parent) or os.path.lexists(new_file):
+        raise SystemExit("restore rollback retained a newly created implicit parent")
+    if not os.path.isdir(root) or not os.path.isdir(existing_parent) or os.path.lexists(existing_file):
+        raise SystemExit("restore rollback removed an existing parent or retained its new file")
 
 with tempfile.TemporaryDirectory(prefix="label-metadata-test-", dir=os.environ["TMPDIR"]) as parent:
     staged = os.path.join(parent, "staged")
@@ -1144,7 +1209,13 @@ conflicting_labels = make_archive([
         "RHT.security.selinux": "system_u:object_r:other_t:s0",
     }),
 ])
-rejects(conflicting_labels)
+with contextlib.redirect_stderr(io.StringIO()):
+    try:
+        validate_with_selinux(conflicting_labels, selinux_label)
+    except SystemExit:
+        pass
+    else:
+        raise SystemExit("rootless archive accepted conflicting SELinux labels")
 for unsafe_root_mode in (0o000, 0o500, 0o1700, 0o2700):
     rejects(make_archive([directory("storage/", mode=unsafe_root_mode)]))
 rejects(valid, "0:1002:1;1:200000:65536")
@@ -1328,6 +1399,35 @@ with tempfile.TemporaryDirectory(prefix="graphroot-home-mode-", dir=os.environ["
                 pass
             else:
                 raise SystemExit("graphroot accepted special root mode bits")
+
+    def rejects_missing_graphroot_boundary(graphroot, service_home, roots):
+        real_dirname = helper.os.path.dirname
+        calls = 0
+        def bounded_dirname(path):
+            nonlocal calls
+            calls += 1
+            if calls > 128:
+                raise AssertionError("missing graphroot boundary caused an ancestry loop")
+            return real_dirname(path)
+        error = io.StringIO()
+        with patch.object(helper.os.path, "dirname", side_effect=bounded_dirname), \
+             contextlib.redirect_stderr(error):
+            try:
+                helper.validate_graphroot_path(graphroot, service_home, uid, gid, roots)
+            except SystemExit:
+                pass
+            else:
+                raise SystemExit("graphroot with a missing boundary was accepted")
+        if "configured rootless graphroot ancestry cannot be verified" not in error.getvalue():
+            raise SystemExit("missing graphroot boundary refusal lacked its fixed category")
+
+    rejects_missing_graphroot_boundary(
+        os.path.join(parent, "missing-external-root"),
+        os.path.join(parent, "service-home"),
+        [os.path.join(parent, "missing-external-root")],
+    )
+    missing_home = os.path.join(parent, "missing-service-home")
+    rejects_missing_graphroot_boundary(missing_home, missing_home, [missing_home])
 
 with tempfile.TemporaryDirectory(prefix="graphroot-rename-", dir=os.environ["TMPDIR"]) as parent:
     with patch.object(builtins, "open", return_value=io.StringIO("pos:\t0\nflags:\t0100000\n")), \
@@ -1650,23 +1750,98 @@ if "$repo_root/bin/localaictl" backup "$tmp_dir/backup-state/inside.tar.gz" >/de
   printf 'backup destination inside state was accepted\n' >&2
   exit 1
 fi
-malicious_archive="$tmp_dir/malicious.tar.gz"
-python3 - "$malicious_archive" "$tmp_dir/backup-state" <<'PY'
-import io, sys, tarfile
-with tarfile.open(sys.argv[1], 'w:gz') as archive:
-    info = tarfile.TarInfo('metadata')
-    info.size = 3
-    archive.addfile(info, io.BytesIO(b'v=1'))
-    info = tarfile.TarInfo(sys.argv[2].lstrip('/') + '/escape')
-    info.type = tarfile.SYMTYPE
-    info.linkname = '../../../../etc/passwd'
-    archive.addfile(info)
+cat >"$tmp_dir/make-archive-variant.py" <<'PY'
+import io
+import os
+import stat
+import sys
+import tarfile
+
+source_path, destination_path, case, state_root, tls_root = sys.argv[1:]
+state_name, tls_name = state_root.lstrip("/"), tls_root.lstrip("/")
+uid, gid = os.stat(state_root).st_uid, os.stat(state_root).st_gid
+additions = []
+changed = False
+
+def add_directory(name):
+    member = tarfile.TarInfo(name + "/")
+    member.type, member.mode = tarfile.DIRTYPE, 0o755
+    member.uid, member.gid = uid, gid
+    additions.append((member, None))
+
+def add_file(name, payload):
+    member = tarfile.TarInfo(name)
+    member.mode, member.uid, member.gid = 0o644, uid, gid
+    member.size = len(payload)
+    additions.append((member, payload))
+
+if case == "tls-dropin":
+    directory = tls_name + "/.config/systemd/user/localai-tls-compose.service.d"
+    add_directory(directory)
+    add_file(directory + "/override.conf", b"[Service]\nExecStart=/usr/bin/touch /root/restore-unit-compromise\n")
+elif case == "user-wants":
+    directory = tls_name + "/.config/systemd/user/default.target.wants"
+    add_directory(directory)
+    add_file(directory + "/evil.service", b"[Service]\nExecStart=/usr/bin/touch /root/restore-unit-compromise\n")
+elif case == "system-unit":
+    add_file(state_name + "/.config/systemd/system/evil.service",
+             b"[Service]\nExecStart=/usr/bin/touch /root/restore-unit-compromise\n")
+elif case not in {"escape-link", "cross-root-link", "setuid", "capability", "tls-exec"}:
+    raise SystemExit(f"unknown archive variant: {case}")
+
+with tarfile.open(source_path, "r:gz") as source:
+    with tarfile.open(destination_path, "w:gz", format=tarfile.PAX_FORMAT) as target:
+        for member in source:
+            payload_stream = source.extractfile(member) if member.isfile() else None
+            payload = payload_stream.read() if payload_stream is not None else None
+            name = member.name.rstrip("/")
+            if case in {"escape-link", "cross-root-link"} and name == state_name + "/database-current":
+                if not member.issym():
+                    raise SystemExit("source archive lacks its database symlink fixture")
+                member.linkname = ("../" * (len(state_name.split("/")) + 1) + "etc/passwd"
+                                   if case == "escape-link" else "/" + tls_name + "/ca.key")
+                changed = True
+            elif case in {"setuid", "capability"} and name == state_name + "/database.db":
+                if case == "setuid":
+                    member.mode |= stat.S_ISUID
+                else:
+                    member.pax_headers["SCHILY.xattr.security.capability"] = "cap_setuid=ep"
+                changed = True
+            elif case == "tls-exec" and name == tls_name + "/.config/systemd/user/localai-tls-compose.service":
+                payload = b"[Service]\nExecStart=/usr/bin/touch /root/restore-unit-compromise\n"
+                member.size = len(payload)
+                changed = True
+            target.addfile(member, io.BytesIO(payload) if payload is not None else None)
+        for member, payload in additions:
+            target.addfile(member, io.BytesIO(payload) if payload is not None else None)
+if case in {"escape-link", "cross-root-link", "setuid", "capability", "tls-exec"} and not changed:
+    raise SystemExit(f"source archive lacks the target member for {case}")
 PY
+dry_run_command_size="$(stat -c %s "$tmp_dir/commands")"
+if "$repo_root/bin/localaictl" --dry-run backup "$tmp_dir/dry-run-backup.tar.gz" \
+  >"$tmp_dir/dry-run-backup-output" 2>"$tmp_dir/dry-run-backup-error"; then
+  printf 'backup accepted --dry-run while still creating a real archive\n' >&2
+  exit 1
+fi
+rg -q 'backup does not support --dry-run' "$tmp_dir/dry-run-backup-error"
+if "$repo_root/bin/localaictl" --dry-run restore --yes "$backup_archive" \
+  >"$tmp_dir/dry-run-restore-output" 2>"$tmp_dir/dry-run-restore-error"; then
+  printf 'restore accepted --dry-run while still mutating persistent state\n' >&2
+  exit 1
+fi
+rg -q 'restore does not support --dry-run' "$tmp_dir/dry-run-restore-error"
+[[ ! -e "$tmp_dir/dry-run-backup.tar.gz" ]]
+[[ "$(stat -c %s "$tmp_dir/commands")" == "$dry_run_command_size" ]]
+malicious_archive="$tmp_dir/malicious.tar.gz"
+python3 "$tmp_dir/make-archive-variant.py" "$backup_archive" "$malicious_archive" escape-link \
+  "$tmp_dir/backup-state" "$tmp_dir/backup-tls"
 stop_count_before="$(rg -c ' stop localai.service$' "$tmp_dir/commands" || true)"
-if "$repo_root/bin/localaictl" restore --yes "$malicious_archive" >/dev/null 2>&1; then
+if "$repo_root/bin/localaictl" restore --yes "$malicious_archive" \
+  >/dev/null 2>"$tmp_dir/malicious-restore-error"; then
   printf 'restore accepted a traversal symbolic link\n' >&2
   exit 1
 fi
+rg -F -q 'backup contains a symbolic link escaping its archived tree' "$tmp_dir/malicious-restore-error"
 stop_count_after="$(rg -c ' stop localai.service$' "$tmp_dir/commands" || true)"
 [[ "$stop_count_before" == "$stop_count_after" ]]
 omitted_units_archive="$tmp_dir/omitted-units.tar.gz"
@@ -1759,87 +1934,48 @@ if "$repo_root/bin/localaictl" restore --yes "$unsafe_config_archive" >/dev/null
   exit 1
 fi
 cross_root_archive="$tmp_dir/cross-root-link.tar.gz"
-python3 - "$cross_root_archive" "$tmp_dir/backup-state" "$tmp_dir/backup-tls" <<'PY'
-import io, sys, tarfile
-archive_path, state, tls = sys.argv[1:]
-with tarfile.open(archive_path, 'w:gz') as archive:
-    metadata = tarfile.TarInfo('metadata')
-    metadata.size = 3
-    archive.addfile(metadata, io.BytesIO(b'v=1'))
-    root = tarfile.TarInfo(state.lstrip('/'))
-    root.type = tarfile.DIRTYPE
-    archive.addfile(root)
-    link = tarfile.TarInfo(state.lstrip('/') + '/cross-root')
-    link.type = tarfile.SYMTYPE
-    link.linkname = tls + '/ca.key'
-    archive.addfile(link)
-PY
-if "$repo_root/bin/localaictl" restore --yes "$cross_root_archive" >/dev/null 2>&1; then
+python3 "$tmp_dir/make-archive-variant.py" "$backup_archive" "$cross_root_archive" cross-root-link \
+  "$tmp_dir/backup-state" "$tmp_dir/backup-tls"
+if "$repo_root/bin/localaictl" restore --yes "$cross_root_archive" \
+  >/dev/null 2>"$tmp_dir/cross-root-restore-error"; then
   printf 'restore accepted a symbolic link crossing configured persistent roots\n' >&2
   exit 1
 fi
+rg -F -q 'backup contains a symbolic link crossing configured persistent paths' \
+  "$tmp_dir/cross-root-restore-error"
 stop_count_after="$(rg -c ' stop localai.service$' "$tmp_dir/commands" || true)"
 [[ "$stop_count_before" == "$stop_count_after" ]]
 for unsafe_kind in setuid capability; do
   unsafe_archive="$tmp_dir/unsafe-$unsafe_kind.tar.gz"
-  python3 - "$unsafe_archive" "$tmp_dir/backup-state" "$unsafe_kind" <<'PY'
-import io, sys, tarfile
-archive_path, state, unsafe_kind = sys.argv[1:]
-with tarfile.open(archive_path, 'w:gz', format=tarfile.PAX_FORMAT) as archive:
-    metadata = tarfile.TarInfo('metadata')
-    metadata.size = 3
-    archive.addfile(metadata, io.BytesIO(b'v=1'))
-    root = tarfile.TarInfo(state.lstrip('/'))
-    root.type = tarfile.DIRTYPE
-    root.mode = 0o755
-    archive.addfile(root)
-    member = tarfile.TarInfo(state.lstrip('/') + '/privileged')
-    member.size = 1
-    if unsafe_kind == 'setuid':
-        member.mode = 0o4755
-    else:
-        member.mode = 0o755
-        member.pax_headers['SCHILY.xattr.security.capability'] = 'cap_setuid=ep'
-    archive.addfile(member, io.BytesIO(b'x'))
-PY
-  if "$repo_root/bin/localaictl" restore --yes "$unsafe_archive" >/dev/null 2>&1; then
+  python3 "$tmp_dir/make-archive-variant.py" "$backup_archive" "$unsafe_archive" "$unsafe_kind" \
+    "$tmp_dir/backup-state" "$tmp_dir/backup-tls"
+  if "$repo_root/bin/localaictl" restore --yes "$unsafe_archive" \
+    >/dev/null 2>"$tmp_dir/unsafe-$unsafe_kind-restore-error"; then
     printf 'restore accepted a %s executable entry\n' "$unsafe_kind" >&2
     exit 1
   fi
+  if [[ "$unsafe_kind" == setuid ]]; then
+    expected_error='backup contains setuid or setgid permission bits'
+  else
+    expected_error='backup contains a file capability xattr'
+  fi
+  rg -F -q "$expected_error" "$tmp_dir/unsafe-$unsafe_kind-restore-error"
 done
 for unit_case in tls-exec tls-dropin user-wants system-unit; do
   unit_archive="$tmp_dir/unsafe-unit-$unit_case.tar.gz"
-  python3 - "$unit_archive" "$tmp_dir/backup-tls" "$unit_case" <<'PY'
-import io, sys, tarfile
-archive_path, tls_root, unit_case = sys.argv[1:]
-root_name = tls_root.lstrip('/')
-if unit_case == 'tls-exec':
-    member_name = root_name + '/.config/systemd/user/localai-tls-compose.service'
-    payload = b'[Service]\nExecStart=/usr/bin/touch /root/restore-unit-compromise\n'
-elif unit_case == 'tls-dropin':
-    member_name = root_name + '/.config/systemd/user/localai-tls-compose.service.d/override.conf'
-    payload = b'[Service]\nExecStart=/usr/bin/touch /root/restore-unit-compromise\n'
-elif unit_case == 'user-wants':
-    member_name = root_name + '/.config/systemd/user/default.target.wants/evil.service'
-    payload = b'[Service]\nExecStart=/usr/bin/touch /root/restore-unit-compromise\n'
-else:
-    member_name = root_name + '/.config/systemd/system/evil.service'
-    payload = b'[Service]\nExecStart=/usr/bin/touch /root/restore-unit-compromise\n'
-with tarfile.open(archive_path, 'w:gz') as archive:
-    metadata = tarfile.TarInfo('metadata')
-    metadata.size = 3
-    archive.addfile(metadata, io.BytesIO(b'v=1'))
-    root = tarfile.TarInfo(root_name)
-    root.type = tarfile.DIRTYPE
-    archive.addfile(root)
-    member = tarfile.TarInfo(member_name)
-    member.size = len(payload)
-    archive.addfile(member, io.BytesIO(payload))
-PY
-  if "$repo_root/bin/localaictl" restore --yes "$unit_archive" >/dev/null 2>&1; then
+  python3 "$tmp_dir/make-archive-variant.py" "$backup_archive" "$unit_archive" "$unit_case" \
+    "$tmp_dir/backup-state" "$tmp_dir/backup-tls"
+  if "$repo_root/bin/localaictl" restore --yes "$unit_archive" \
+    >/dev/null 2>"$tmp_dir/unsafe-unit-$unit_case-restore-error"; then
     printf 'restore accepted changed or unsupported systemd unit content (%s)\n' "$unit_case" >&2
     exit 1
   fi
+  case "$unit_case" in
+    tls-exec) expected_error='backup user unit file differs from the installed tree' ;;
+    tls-dropin|user-wants) expected_error='backup has a user unit absent from the installed tree' ;;
+    system-unit) expected_error='backup contains system manager unit configuration' ;;
+  esac
+  rg -F -q "$expected_error" "$tmp_dir/unsafe-unit-$unit_case-restore-error"
   stop_count_after="$(rg -c ' stop localai.service$' "$tmp_dir/commands" || true)"
   [[ "$stop_count_before" == "$stop_count_after" ]]
 done
@@ -1942,6 +2078,9 @@ printf 'damaged state\n' >"$tmp_dir/backup-state/database.db"
 printf 'damaged external cache\n' >"$tmp_dir/backup-cache/cache.db"
 chmod 0755 "$tmp_dir/backup-state"
 "$repo_root/bin/localaictl" restore --yes "$backup_archive" >"$tmp_dir/restore-output"
+rg -Fqx '[--attributes-only]' "$tmp_dir/cp-args"
+rg -Fqx '[-T]' "$tmp_dir/cp-args"
+[[ ! -e "$tmp_dir/backup-state/backup-state" ]]
 snapshot_sync_line="$(rg -n '^sync-staging-snapshot$' "$tmp_dir/commands" | head -n1 | cut -d: -f1)"
 marker_create_line="$(rg -n '^restore-marker-create$' "$tmp_dir/commands" | head -n1 | cut -d: -f1)"
 destination_sync_line="$(rg -n '^sync-destinations$' "$tmp_dir/commands" | tail -n1 | cut -d: -f1)"

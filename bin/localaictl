@@ -914,6 +914,7 @@ backup_stop_services() {
 }
 
 backup() {
+  [[ "$dry_run" != 1 ]] || die "backup does not support --dry-run"
   local exclude_models=0 destination path lock_file destination_parent tmp status
   while [[ "$#" -gt 0 ]]; do
     case "$1" in
@@ -1083,6 +1084,10 @@ backup_locked() {
   chmod 0700 "$metadata_dir"
   query_rootless_context "$metadata_dir/rootless-context.json"
   include_rootless_graphroot
+  for path in "$config_file" "${backup_roots[@]}"; do
+    [[ "$archive_file" != "$path" && "$archive_file" != "$path"/* ]] ||
+      die "backup destination must be outside the configuration and persistent data paths"
+  done
   backup_space_args=("$archive_file" "$metadata_dir" "$rootless_graphroot")
   [[ "$exclude_models" == 0 ]] || backup_space_args+=(--exclude-models "$LOCALAI_MODELS_PATH")
   run_elevated /usr/bin/python3 "$backup_archive_helper" backup-space-check \
@@ -1173,6 +1178,7 @@ backup_exit_cleanup() {
 }
 
 restore_archive() {
+  [[ "$dry_run" != 1 ]] || die "restore does not support --dry-run"
   local source="$1" lock_file status
   [[ -f "$source" && ! -L "$source" ]] || die "restore source must be a regular, non-linked archive file"
   source="$(realpath -e -- "$source")"
@@ -1333,7 +1339,7 @@ restore_locked() {
   for target in "${backup_roots[@]}"; do
     if [[ -d "$stage/${target#/}" && ! -L "$stage/${target#/}" ]]; then
       run_elevated "$cp_bin" -a -- "$stage/${target#/}/." "$target/" || die "restore failed; rollback will run before services restart"
-      run_elevated "$cp_bin" -a --attributes-only -- "$stage/${target#/}" "$target" || die "restore failed while applying persistent root metadata; rollback will run before services restart"
+      run_elevated "$cp_bin" -a --attributes-only -T -- "$stage/${target#/}" "$target" || die "restore failed while applying persistent root metadata; rollback will run before services restart"
     fi
   done
   if [[ -e "$stage/${config_file#/}" ]]; then

@@ -420,18 +420,18 @@ def validate_graphroot_path(
     chain.append("/")
     home_chain = set()
     if under_home:
-        current = graphroot if graphroot_exists else os.path.dirname(graphroot)
-        while current != service_home:
-            home_chain.add(current)
-            current = os.path.dirname(current)
-        home_chain.add(service_home)
+        try:
+            home_boundary = chain.index(service_home)
+        except ValueError:
+            fail("configured rootless graphroot ancestry cannot be verified")
+        home_chain = set(chain[:home_boundary + 1])
     private_chain = set()
     if not under_home and external_root is not None:
-        current = graphroot if graphroot_exists else os.path.dirname(graphroot)
-        while current != external_root:
-            private_chain.add(current)
-            current = os.path.dirname(current)
-        private_chain.add(external_root)
+        try:
+            external_boundary = chain.index(external_root)
+        except ValueError:
+            fail("configured rootless graphroot ancestry cannot be verified")
+        private_chain = set(chain[:external_boundary + 1])
     for path in reversed(chain):
         try:
             info = os.lstat(path)
@@ -930,12 +930,14 @@ def copy_source(source: str, destination: str) -> None:
     except OSError:
         fail("restore source must be a regular non-linked file")
     destination_fd = -1
+    destination_created = False
     try:
         initial = os.fstat(source_fd)
         if not stat.S_ISREG(initial.st_mode) or initial.st_size < 0 or initial.st_size > MAX_ARCHIVE_EXPANDED_BYTES:
             fail("restore source must be a supported regular file")
         destination_fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL |
                                  getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0), 0o600)
+        destination_created = True
         remaining = initial.st_size
         while remaining:
             chunk = os.read(source_fd, min(1024 * 1024, remaining))
@@ -962,16 +964,18 @@ def copy_source(source: str, destination: str) -> None:
         os.fchmod(destination_fd, 0o600)
         os.fsync(destination_fd)
     except SystemExit:
-        try:
-            os.unlink(destination)
-        except FileNotFoundError:
-            pass
+        if destination_created:
+            try:
+                os.unlink(destination)
+            except FileNotFoundError:
+                pass
         raise
     except OSError:
-        try:
-            os.unlink(destination)
-        except FileNotFoundError:
-            pass
+        if destination_created:
+            try:
+                os.unlink(destination)
+            except FileNotFoundError:
+                pass
         fail("could not stage restore source safely")
     finally:
         os.close(source_fd)
@@ -1747,7 +1751,8 @@ def write_names(names: list[str], mode: str, config: str, roots: list[str]) -> N
 def rollback_new(member_file: str, collision_file: str, config: str, roots: list[str]) -> int:
     members = open(member_file, "rb").read().split(b"\0")
     collisions = set(open(collision_file, "rb").read().split(b"\0"))
-    roots = [p.lstrip("/").rstrip("/") for p in roots]
+    absolute_roots = [os.path.abspath(p) for p in roots]
+    roots = [p.lstrip("/").rstrip("/") for p in absolute_roots]
     config_name = config.lstrip("/")
     status = 0
     for encoded in reversed(members):
@@ -1773,9 +1778,9 @@ def rollback_new(member_file: str, collision_file: str, config: str, roots: list
         if not encoded or encoded == b"metadata" or encoded in collisions:
             continue
         parent = os.path.dirname(os.path.join("/", os.fsdecode(encoded)))
-        while any(parent == root or parent.startswith(root + "/") for root in roots):
+        while any(parent == root or parent.startswith(root + "/") for root in absolute_roots):
             parent_name = parent.lstrip("/")
-            if parent_name in collisions:
+            if os.fsencode(parent_name) in collisions:
                 break
             parents.add(parent)
             parent = os.path.dirname(parent)

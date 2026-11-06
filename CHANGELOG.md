@@ -9,8 +9,10 @@ has been runtime-qualified on secureblue or on a GPU.
 - Probe all configured writable LocalAI paths inside the existing container and document which paths hold persistent data or scratch files.
 
 - Add protected `localaictl backup` and explicitly confirmed overlay restore,
-  covering configured persistent paths and preserving ownership, modes, xattrs,
-  ACLs, and SELinux labels.
+  covering configured persistent paths and preserving validated ownership,
+  modes, and supported non-SELinux xattrs. Unverified ACL and archived SELinux
+  metadata are rejected; destination SELinux labels are applied and verified
+  by policy, with rootless GraphRoot validated separately.
 - Include user service unit state in archives while requiring a byte-for-byte
   match with already installed unit entries before restore; restore does not
   install or reload unit definitions and refuses missing or changed entries.
