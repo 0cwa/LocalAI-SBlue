@@ -81,6 +81,84 @@ def environment_matches(environment: str, database: str, port: str) -> bool:
     return True
 
 
+def restore_config(config: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    try:
+        with open(config, encoding="utf-8") as source:
+            for line in source:
+                line = line.rstrip("\n")
+                if not line or line.startswith("#"):
+                    continue
+                key, separator, value = line.partition("=")
+                if not separator or key in values or not key.replace("_", "").isalnum():
+                    raise ValueError("invalid configuration")
+                values[key] = value
+    except (OSError, UnicodeError, ValueError):
+        raise ValueError("invalid configuration") from None
+    if "LOCALAI_BIND_HOST" not in values:
+        values["LOCALAI_BIND_HOST"] = values.get("SERVICE_BIND_HOST", "127.0.0.1")
+    values.setdefault("LOCALAI_BIND_PORT", values.get("SERVICE_BIND_PORT", "11455"))
+    values.setdefault("LOCALAI_AUTH", "true")
+    values.setdefault("LOCALAI_DATA_PATH", "/var/lib/localai/data")
+    host = values["LOCALAI_BIND_HOST"]
+    port = values["LOCALAI_BIND_PORT"]
+    if not port.isdecimal() or not 1 <= int(port) <= 65535:
+        raise ValueError("invalid configuration")
+    if host not in {"127.0.0.1", "::1"} and values["LOCALAI_AUTH"] != "true":
+        raise ValueError("unsafe public binding")
+    return values
+
+
+def restore_unit_matches(
+    config: str, unit: str, expected_path: str = "/etc/localai/backend-unit.expected", expected_uid: int = 0
+) -> bool:
+    try:
+        values = restore_config(config)
+        expected_file = pathlib.Path(expected_path)
+        metadata = expected_file.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != expected_uid or metadata.st_mode & 0o022:
+            return False
+        unit_text = pathlib.Path(unit).read_text(encoding="utf-8")
+        expected_text = expected_file.read_text(encoding="utf-8")
+        if unit_text != expected_text:
+            return False
+        database = values["LOCALAI_DATA_PATH"] + "/database.db"
+        required = (
+            f"Environment=LOCALAI_AUTH={values['LOCALAI_AUTH']}",
+            f"Environment=LOCALAI_AUTH_DATABASE_URL={database}",
+            f"Environment=LOCALAI_ADDRESS={values['LOCALAI_BIND_HOST']}:{values['LOCALAI_BIND_PORT']}",
+            f"Environment=LOCALAI_DATA_PATH={values['LOCALAI_DATA_PATH']}",
+        )
+        lines = unit_text.splitlines()
+        if any(lines.count(line) != 1 for line in required):
+            return False
+        if values["LOCALAI_BIND_HOST"] not in {"127.0.0.1", "::1"}:
+            guard = f"ExecStartPre=/usr/bin/python3 /etc/localai/bootstrap-guard.py {database}"
+            if values["LOCALAI_AUTH"] != "true" or lines.count(guard) != 1:
+                return False
+        return True
+    except (OSError, UnicodeError, ValueError):
+        return False
+
+
+def restore_environment_matches(environment: str, config: str) -> bool:
+    try:
+        values = restore_config(config)
+        expected = (
+            f"LOCALAI_AUTH={values['LOCALAI_AUTH']}",
+            f"LOCALAI_AUTH_DATABASE_URL={values['LOCALAI_DATA_PATH']}/database.db",
+            f"LOCALAI_ADDRESS={values['LOCALAI_BIND_HOST']}:{values['LOCALAI_BIND_PORT']}",
+        )
+        actual = shlex.split(environment)
+        for item in expected:
+            name = item.split("=", 1)[0] + "="
+            if [value for value in actual if value.startswith(name)] != [item]:
+                return False
+        return True
+    except (OSError, UnicodeError, ValueError):
+        return False
+
+
 def dropins_safe(value: str) -> bool:
     try:
         paths = shlex.split(value)
@@ -133,6 +211,10 @@ def main() -> int:
         return 0 if unit_matches(*sys.argv[2:]) else 1
     if len(sys.argv) == 4 and sys.argv[1] == "--unit-environment":
         return 0 if environment_matches(sys.stdin.read(), sys.argv[2], sys.argv[3]) else 1
+    if len(sys.argv) == 4 and sys.argv[1] == "--unit-restore-safe":
+        return 0 if restore_unit_matches(*sys.argv[2:]) else 1
+    if len(sys.argv) == 3 and sys.argv[1] == "--unit-environment-restore-safe":
+        return 0 if restore_environment_matches(sys.stdin.read(), sys.argv[2]) else 1
     if len(sys.argv) == 2 and sys.argv[1] == "--dropins-safe":
         return 0 if dropins_safe(sys.stdin.read()) else 1
     if len(sys.argv) not in (2, 4):

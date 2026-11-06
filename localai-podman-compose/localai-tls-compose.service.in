@@ -6,6 +6,7 @@ After=network-online.target default.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+ExecStartPre=/usr/bin/test ! -e /var/lib/.localaictl-backup-restore.pending
 WorkingDirectory=@TLS_STATE_DIR@
 Environment=HOME=@TLS_STATE_DIR@
 Environment=XDG_RUNTIME_DIR=/run/user/@TLS_UID@

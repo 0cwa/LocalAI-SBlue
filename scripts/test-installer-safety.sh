@@ -548,6 +548,38 @@ source_production_function() {
   source <(/usr/bin/sed -n "/^${function_name}() {$/,/^}/p" "$source_file")
 }
 
+printf 'Private rootless Podman storage ancestry checks\n'
+(
+  source_production_function "$repo_root/secureblue-localai-install/install.sh" ensure_private_rootless_storage_ancestry
+  state_dir="$scratch/rootless-storage-home"
+  service_user="$(id -un)"
+  service_uid="$(id -u)"
+  mkdir -m 0750 -- "$state_dir"
+  mkdir -m 0755 -- "$state_dir/.local"
+  mkdir -m 0755 -- "$state_dir/.local/share"
+  mkdir -m 0755 -- "$state_dir/.local/share/containers"
+  printf 'preserved\n' >"$state_dir/.local/share/containers/marker"
+  # Test the production helper's directory policy and mode arguments without
+  # asking the system installer to manage a path under the test checkout.
+  # shellcheck disable=SC2329
+  localai_installer_check_directory_chain() {
+    [[ "$1" == "$state_dir" || "$1" == "$state_dir/"* ]]
+  }
+  # shellcheck disable=SC2329
+  localai_installer_ensure_service_directory() {
+    mkdir -p -- "$1"
+    chown "$3:$4" -- "$1"
+    chmod "$6" -- "$1"
+  }
+  # shellcheck disable=SC2329
+  die() { fail "rootless storage ancestry: $*"; }
+  ensure_private_rootless_storage_ancestry
+  for path in "$state_dir/.local" "$state_dir/.local/share" "$state_dir/.local/share/containers"; do
+    [[ "$(stat -c '%a:%u' -- "$path")" == "700:$(id -u)" ]] || fail "rootless storage ancestor was not private and service-owned"
+  done
+  [[ "$(<"$state_dir/.local/share/containers/marker")" == preserved ]] || fail "rootless storage hardening removed existing data"
+)
+
 (
   source_production_function "$repo_root/localai-podman-compose/install.sh" retire_forward_units
   # These mocks are used by the extracted production function.

@@ -26,14 +26,55 @@ curl_bin="${LOCALAI_CURL_BIN:-/usr/bin/curl}"
 id_bin="${LOCALAI_ID_BIN:-/usr/bin/id}"
 date_bin="${LOCALAI_DATE_BIN:-/usr/bin/date}"
 sha256_bin="${LOCALAI_SHA256_BIN:-/usr/bin/sha256sum}"
+tar_bin="${LOCALAI_TAR_BIN:-/usr/bin/tar}"
+matchpathcon_bin="${LOCALAI_MATCHPATHCON_BIN:-/usr/sbin/matchpathcon}"
+restorecon_bin="${LOCALAI_RESTORECON_BIN:-/usr/sbin/restorecon}"
+cp_bin="${LOCALAI_CP_BIN:-/usr/bin/cp}"
 config_file="${LOCALAI_CONFIG_FILE:-/etc/localai/localai.conf}"
 legacy_config_file="${LOCALAI_LEGACY_CONFIG_FILE:-$repo_root/localai/localai.lock}"
 audit_dir="${LOCALAI_AUDIT_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/localai/audit}"
 dry_run=0
 status_elevated=0
+RESTORE_STACK_POLICY_SET=0
+RESTORE_ROOTLESS_SELINUX_RANGE_CHANGE_ALLOWED=0
+RESTORE_TLS_ENABLED=false
+RESTORE_TLS_PUBLIC_SOCKET=false
+RESTORE_TLS_PUBLIC_HOST=''
+RESTORE_TLS_PUBLIC_PORT=''
+RESTORE_TLS_INTERNAL_HOST=''
+RESTORE_TLS_INTERNAL_PORT=''
+RESTORE_TLS_STATE_DIR=''
+RESTORE_TLS_COMPOSE_DIR=''
+RESTORE_TLS_COMPOSE_FILE_NAME=''
+RESTORE_TLS_COMPOSE_PROJECT_NAME=''
+RESTORE_TLS_USER=''
+RESTORE_SERVICE_USER=''
+RESTORE_TLS_SERVICE_NAME=''
+RESTORE_TLS_FORWARD_SOCKET_NAME=''
+RESTORE_TLS_FORWARD_SERVICE_NAME=''
+RESTORE_MARKER_PATH=/var/lib/.localaictl-backup-restore.pending
 
-die() { printf 'localaictl: %s\n' "$*" >&2; exit 1; }
+die() {
+  printf 'localaictl: %s\n' "$*" >&2
+  if [[ "${LOCALAI_ACCEPTANCE_DIAGNOSTIC:-}" == 1 ]]; then
+    printf 'localaictl: diagnostic-controller-site:%s\n' "${BASH_LINENO[0]:-0}" >&2
+  fi
+  exit 1
+}
 log() { printf '%s\n' "$*"; }
+backup_archive_helper_for() {
+  local adjacent="$1/backup_archive.py" repository="$2/lib/backup_archive.py"
+  if [[ -e "$adjacent" || -L "$adjacent" ]]; then
+    [[ -f "$adjacent" && ! -L "$adjacent" ]] || return 1
+    printf '%s\n' "$adjacent"
+  elif [[ -e "$repository" || -L "$repository" ]]; then
+    [[ -f "$repository" && ! -L "$repository" ]] || return 1
+    printf '%s\n' "$repository"
+  else
+    return 1
+  fi
+}
+backup_archive_helper="$(backup_archive_helper_for "$script_dir" "$repo_root")" || die "shared backup archive helper is missing."
 
 if [[ -z "${LOCALAI_CONFIG_FILE:-}" && ! -e "$config_file" ]]; then
   # A repository checkout may use its editable config while developing. An
@@ -66,14 +107,190 @@ tls_enabled() {
 }
 
 service_uid() { "$id_bin" -u "$1"; }
+service_gid() { "$id_bin" -g "$1"; }
+
+rootless_context_file=''
+rootless_graphroot=''
+rootless_uid_map=''
+rootless_gid_map=''
+rootless_service_home=''
+ROOTLESS_GRAPHROOT_MEMBER=rootless-graphroot.tar
+
+# These Podman commands only inspect the service store. A short retry handles
+# transient user-manager bus resets without repeating any state-changing action.
+run_rootless_readonly() {
+  local home="$1" uid="$2" attempt output
+  shift 2
+  for attempt in 1 2 3; do
+    if output="$(run_elevated /usr/bin/systemd-run --user --machine="${LOCALAI_SERVICE_USER}@.host" --wait --pipe --collect --quiet \
+      --setenv="HOME=$home" --setenv="XDG_RUNTIME_DIR=/run/user/$uid" \
+      --setenv="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" --setenv=PATH=/usr/bin:/bin \
+      -- "$@" 2>/dev/null)"; then
+      printf '%s' "$output"
+      return 0
+    fi
+    (( attempt < 3 )) || return 1
+    sleep 1
+  done
+}
+
+query_rootless_context() {
+  local context_file="$1" check_quiescent="${2:-1}" uid gid home info maps running map_pattern='^[0-9:;]+$'
+  local -a map_lines=()
+  uid="$(service_uid "$LOCALAI_SERVICE_USER")" || die "cannot verify the LocalAI service account"
+  gid="$(service_gid "$LOCALAI_SERVICE_USER")" || die "cannot verify the LocalAI service group"
+  home="$(run_elevated /usr/bin/getent passwd "$LOCALAI_SERVICE_USER" | /usr/bin/cut -d: -f6)" || die "cannot verify the LocalAI service home"
+  rootless_service_home="$home"
+  [[ "$home" == /* && "$home" != / && "$home" != *$'\n'* && "$home" != *$'\r'* && "$(realpath -m -- "$home")" == "$home" ]] || die "LocalAI service home is not canonical"
+  info="$(run_rootless_readonly "$home" "$uid" /usr/bin/podman info --format '{{.Store.GraphRoot}}')" || die "cannot verify the LocalAI rootless container store"
+  rootless_graphroot="$info"
+  [[ "$rootless_graphroot" == /* && "$rootless_graphroot" != / && "$rootless_graphroot" != *$'\n'* && "$rootless_graphroot" != *$'\r'* && "$(realpath -m -- "$rootless_graphroot")" == "$rootless_graphroot" ]] || die "LocalAI rootless graphroot is not canonical"
+  maps="$(run_rootless_readonly "$home" "$uid" /usr/bin/podman unshare /usr/bin/python3 -c 'from pathlib import Path; print(";".join(":".join(row.split()) for row in Path("/proc/self/uid_map").read_text().splitlines())); print(";".join(":".join(row.split()) for row in Path("/proc/self/gid_map").read_text().splitlines()))')" || die "cannot verify the LocalAI user namespace mappings"
+  mapfile -t map_lines <<<"$maps"
+  [[ "${#map_lines[@]}" == 2 ]] || die "LocalAI user namespace mappings are invalid"
+  rootless_uid_map="${map_lines[0]}"
+  rootless_gid_map="${map_lines[1]}"
+  [[ "$rootless_uid_map" =~ $map_pattern && "$rootless_gid_map" =~ $map_pattern ]] || die "LocalAI user namespace mappings are invalid"
+  if [[ "$check_quiescent" == 1 ]]; then
+    running="$(run_rootless_readonly "$home" "$uid" /usr/bin/podman ps --format '{{.ID}}')" || die "cannot verify LocalAI container state"
+    [[ -z "$running" ]] || die "rootless graphroot is in use by a running container"
+  fi
+  [[ ! -e "$rootless_graphroot" || -d "$rootless_graphroot" ]] || die "LocalAI rootless graphroot is not a directory"
+  rootless_context_file="$context_file"
+  run_elevated /usr/bin/python3 - "$context_file" "$rootless_graphroot" "$rootless_uid_map" \
+    "$rootless_gid_map" "$home" "$uid" "$gid" "$LOCALAI_SERVICE_USER" <<'PY'
+import json
+import os
+import sys
+
+path, graphroot, uid_map, gid_map, home, uid, gid, user = sys.argv[1:]
+if os.path.lexists(path):
+    raise SystemExit(1)
+with open(path, "x", encoding="ascii") as stream:
+    json.dump({"graphroot": graphroot, "uid_map": uid_map, "gid_map": gid_map,
+               "service_home": home, "service_uid": int(uid), "service_gid": int(gid),
+               "service_user": user}, stream, separators=(",", ":"))
+    stream.write("\n")
+os.chmod(path, 0o600)
+PY
+}
+
+run_backup_helper() {
+  local mode="$1"
+  local -a helper_options=()
+  shift
+  if [[ "${RESTORE_ROOTLESS_SELINUX_RANGE_CHANGE_ALLOWED:-0}" == 1 ]]; then
+    case "$mode" in
+      validate|validate-created|members0|collisions0|destinations|skip-links0|unit-trees0|rootless-present)
+        helper_options=(--allow-rootless-selinux-range-change) ;;
+    esac
+  fi
+  if [[ -n "${rootless_context_file:-}" ]]; then
+    run_elevated /usr/bin/python3 "$backup_archive_helper" "$mode" "$@" "${helper_options[@]}" --rootless-context "$rootless_context_file"
+  else
+    run_elevated /usr/bin/python3 "$backup_archive_helper" "$mode" "$@" "${helper_options[@]}"
+  fi
+}
 
 is_effectively_root() { [[ "$EUID" == 0 ]]; }
+
+backup_stage_base() {
+  local base="${LOCALAI_RESTORE_STAGE_BASE:-/var/lib/.localaictl-backup-staging}" current
+  [[ "$base" == /* && "$base" != /run && "$base" != /run/* && "$base" != /tmp && "$base" != /tmp/* && "$base" != /var/tmp && "$base" != /var/tmp/* ]] || die "restore staging must use an absolute disk-backed directory outside temporary filesystems"
+  [[ "$(realpath -m -- "$base")" == "$base" ]] || die "restore staging path must not contain symbolic links or traversal components"
+  current="$base"
+  while [[ "$current" != / ]]; do
+    [[ ! -L "$current" ]] || die "restore staging path must not contain symbolic links"
+    current="${current%/*}"
+    [[ -n "$current" ]] || current=/
+  done
+  if [[ ! -e "$base" && ! -L "$base" ]]; then
+    [[ -d "${base%/*}" ]] || die "restore staging parent directory must already exist"
+    mkdir -m 0700 -- "$base"
+  fi
+  [[ ! -L "$base" && "$(realpath -e -- "$base")" == "$base" ]] || die "restore staging directory must not use symbolic links"
+  [[ -d "$base" && "$(stat -c %a -- "$base")" == 700 ]] || die "restore staging directory must have mode 0700"
+  if is_effectively_root; then
+    [[ "$(stat -c %u -- "$base")" == 0 ]] || die "restore staging directory must be root-owned"
+  else
+    [[ "$(stat -c %u -- "$base")" == 0 ]] || die "restore staging must be root-owned"
+  fi
+  printf '%s\n' "$base"
+}
+
+backup_configured_paths=(
+  "$LOCALAI_STATE_DIR" "$LOCALAI_MODELS_PATH" "$LOCALAI_BACKENDS_PATH"
+  "$LOCALAI_DOWNLOAD_STAGING_PATH" "$LOCALAI_BACKEND_TEMP_DIR" "$LOCALAI_DATA_PATH"
+  "$LOCALAI_CONFIG_DIR" "$LOCALAI_GENERATED_CONTENT_PATH" "$LOCALAI_UPLOAD_PATH"
+  "$LOCALAI_CACHE_DIR" "$LOCALAI_LOG_DIR" "$LOCALAI_TLS_STATE_DIR"
+  "$LOCALAI_TLS_CONFIG_DIR" "$LOCALAI_TLS_CACHE_DIR" "$LOCALAI_TLS_CERT_DIR"
+  "$LOCALAI_TLS_COMPOSE_DIR"
+)
+backup_roots=()
+
+prepare_backup_roots() {
+  local path normalized current existing covered
+  local -a candidates=()
+  backup_roots=()
+  for path in "${backup_configured_paths[@]}"; do
+    normalized="$(realpath -m -- "$path")"
+    [[ "$normalized" == "$path" && "$path" != / ]] || die "configured persistent paths must be normalized absolute paths without symbolic links"
+    current="$path"
+    while [[ "$current" != / ]]; do
+      [[ ! -L "$current" ]] || die "configured persistent paths must not use symbolic links"
+      current="${current%/*}"
+      [[ -n "$current" ]] || current=/
+    done
+    candidates+=("$path")
+  done
+  while IFS= read -r path; do
+    covered=0
+    for existing in "${backup_roots[@]}"; do
+      if [[ "$path" == "$existing" || "$path" == "$existing"/* ]]; then covered=1; break; fi
+    done
+    [[ "$covered" == 1 ]] || backup_roots+=("$path")
+  done < <(printf '%s\0' "${candidates[@]}" | /usr/bin/python3 -c 'import sys; p=sys.stdin.buffer.read().split(b"\0"); p=[x for x in p if x]; [sys.stdout.buffer.write(x+b"\0") for x in sorted(p,key=lambda x:(len(x),x))]' | while IFS= read -r -d '' path; do printf '%s\n' "$path"; done)
+  for path in "${backup_roots[@]}"; do
+    [[ "$config_file" != "$path" && "$config_file" != "$path"/* && "$path" != "$config_file"/* ]] || die "configuration file must not overlap a persistent data path"
+  done
+}
+
+include_rootless_graphroot() {
+  local existing unit_dir covered=0
+  local -a retained=()
+  [[ -e "$rootless_graphroot" || -L "$rootless_graphroot" ]] || return 0
+  for existing in "$LOCALAI_STATE_DIR" "$LOCALAI_TLS_STATE_DIR"; do
+    unit_dir="$existing/.config/systemd/user"
+    [[ "$rootless_graphroot" != "$unit_dir" && "$rootless_graphroot" != "$unit_dir"/* &&
+       "$unit_dir" != "$rootless_graphroot"/* ]] || die "rootless graphroot overlaps a host user service unit tree"
+  done
+  for existing in "${backup_roots[@]}"; do
+    if [[ "$rootless_graphroot" == "$existing" || "$rootless_graphroot" == "$existing"/* ]]; then
+      covered=1
+    fi
+  done
+  for existing in "${backup_roots[@]}"; do
+    [[ "$covered" == 1 || "$existing" != "$rootless_graphroot"/* ]] || continue
+    retained+=("$existing")
+  done
+  [[ "$covered" == 1 ]] || retained+=("$rootless_graphroot")
+  backup_roots=("${retained[@]}")
+  for existing in "${backup_roots[@]}"; do
+    [[ "$config_file" != "$existing" && "$config_file" != "$existing"/* && "$existing" != "$config_file"/* ]] ||
+      die "configuration file must not overlap the rootless graphroot"
+  done
+  run_elevated /usr/bin/python3 "$backup_archive_helper" graphroot-check \
+    "$rootless_graphroot" "$rootless_service_home" "$(service_uid "$LOCALAI_SERVICE_USER")" "$(service_gid "$LOCALAI_SERVICE_USER")" \
+    "${backup_roots[@]}" || die "LocalAI rootless graphroot path is unsafe"
+}
 
 # Called through the controller's indirectly selected systemctl helpers.
 # shellcheck disable=SC2329
 run_elevated() {
   if is_effectively_root; then
     "$@"
+  elif [[ "${LOCALAI_ACCEPTANCE_DIAGNOSTIC:-}" == 1 ]]; then
+    "$run0_bin" -i /usr/bin/env LOCALAI_ACCEPTANCE_DIAGNOSTIC=1 "$@"
   else
     "$run0_bin" -i "$@"
   fi
@@ -85,6 +302,15 @@ run_elevated_pipe() {
   else
     "$run0_bin" -i --pipe "$@"
   fi
+}
+
+run_rootless_podman() {
+  local uid
+  uid="$(service_uid "$LOCALAI_SERVICE_USER")" || return 1
+  run_elevated /usr/bin/systemd-run --user --machine="${LOCALAI_SERVICE_USER}@.host" --wait --pipe --collect --quiet \
+    --setenv="HOME=$rootless_service_home" --setenv="XDG_RUNTIME_DIR=/run/user/$uid" \
+    --setenv="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" --setenv=PATH=/usr/bin:/bin \
+    -- /usr/bin/podman unshare "$@"
 }
 
 # The function is called indirectly by a helper or test.
@@ -134,6 +360,146 @@ backend_state() { component_state backend_systemctl localai.service; }
 tls_state() { component_state tls_systemctl "$LOCALAI_TLS_SERVICE_NAME"; }
 socket_state() { component_state root_systemctl "$LOCALAI_TLS_FORWARD_SOCKET_NAME"; }
 
+tls_unit_managed() {
+  local path="$LOCALAI_TLS_STATE_DIR/.config/systemd/user/$LOCALAI_TLS_SERVICE_NAME" expected_uid owner
+  [[ -e "$path" || -L "$path" ]] || return 1
+  [[ -f "$path" && ! -L "$path" ]] || die "cannot verify ownership of the configured TLS unit"
+  expected_uid="$(service_uid "$LOCALAI_TLS_USER")" || die "cannot verify the TLS service account"
+  owner="$(run_elevated /usr/bin/stat -c %u -- "$path")" || die "cannot verify ownership of the configured TLS unit"
+  [[ "$owner" == "$expected_uid" ]] || die "configured TLS unit is not owned by the TLS service account"
+  run_elevated /usr/bin/grep -qx '# Managed by LocalAI secureblue TLS installer.' "$path" || die "configured TLS unit lacks the LocalAI ownership marker"
+}
+
+backend_unit_managed() {
+  local path="$LOCALAI_STATE_DIR/.config/systemd/user/localai.service" expected_uid owner mode
+  [[ -e "$path" || -L "$path" ]] || return 1
+  [[ -f "$path" && ! -L "$path" ]] || die "cannot verify ownership of the configured backend unit"
+  expected_uid="$(service_uid "$LOCALAI_SERVICE_USER")" || die "cannot verify the backend service account"
+  owner="$(run_elevated /usr/bin/stat -c %u -- "$path")" || die "cannot verify ownership of the configured backend unit"
+  [[ "$owner" == "$expected_uid" ]] || die "configured backend unit is not owned by the backend service account"
+  run_elevated /usr/bin/grep -qx '# Managed by LocalAI secureblue installer.' "$path" ||
+    run_elevated /usr/bin/grep -qx 'Description=LocalAI OpenAI-compatible API and web UI container' "$path" ||
+    die "configured backend unit lacks the LocalAI ownership marker"
+  mode="$(run_elevated /usr/bin/stat -c %a -- "$path")"
+  [[ "$mode" =~ ^[0-7]+$ ]] || die "cannot verify permissions of the configured backend unit"
+  (( (8#$mode & 8#22) == 0 )) || die "configured backend unit is group/world writable"
+}
+
+verify_restore_backend_unit() {
+  local restored_config="$1" unit="$LOCALAI_STATE_DIR/.config/systemd/user/localai.service" dropins environment
+  backend_unit_managed || return 1
+  run_elevated /usr/bin/python3 /etc/localai/bootstrap-guard.py --unit-restore-safe \
+    "$restored_config" "$unit" || return 1
+  dropins="$(backend_systemctl show localai.service --property=DropInPaths --value 2>/dev/null)" || return 1
+  printf '%s\n' "$dropins" | run_elevated_pipe /usr/bin/python3 /etc/localai/bootstrap-guard.py --dropins-safe || return 1
+  environment="$(backend_systemctl show localai.service --property=Environment --value 2>/dev/null)" || return 1
+  printf '%s\n' "$environment" | run_elevated_pipe /usr/bin/python3 /etc/localai/bootstrap-guard.py --unit-environment-restore-safe "$restored_config"
+}
+
+load_restore_stack_policy() {
+  local restored_config="$1" values
+  # The archive's configuration determines which prior listeners may be
+  # restarted. Ignore caller LOCALAI_* overrides so they cannot re-enable one.
+  # shellcheck disable=SC2016
+  values="$(/usr/bin/env -i PATH=/usr/bin:/bin \
+    LOCALAI_CONFIG_FILE="$restored_config" LOCALAI_CONFIG_LIB="$config_lib" \
+    LOCALAI_LEGACY_CONFIG_FILE="$legacy_config_file" /usr/bin/bash -c '
+      set -euo pipefail
+      source "$LOCALAI_CONFIG_LIB"
+      localai_config_load_compat "$LOCALAI_CONFIG_FILE" "$LOCALAI_LEGACY_CONFIG_FILE" >/dev/null
+      restore_public_host="${LOCALAI_TLS_PUBLIC_HOST:--}"
+      printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+        "$LOCALAI_TLS_ENABLED" "$LOCALAI_TLS_PUBLIC_SOCKET" "$restore_public_host" \
+        "$LOCALAI_TLS_PUBLIC_PORT" "$LOCALAI_TLS_INTERNAL_HOST" "$LOCALAI_TLS_INTERNAL_PORT" \
+        "$LOCALAI_TLS_STATE_DIR" "$LOCALAI_TLS_COMPOSE_DIR" "$LOCALAI_TLS_COMPOSE_FILE_NAME" \
+        "$LOCALAI_TLS_COMPOSE_PROJECT_NAME" "$LOCALAI_TLS_USER" "$LOCALAI_SERVICE_USER" \
+        "$LOCALAI_TLS_SERVICE_NAME" "$LOCALAI_TLS_FORWARD_SOCKET_NAME" "$LOCALAI_TLS_FORWARD_SERVICE_NAME"
+    ' 2>/dev/null)" || return 1
+  IFS=$'\t' read -r RESTORE_TLS_ENABLED RESTORE_TLS_PUBLIC_SOCKET RESTORE_TLS_PUBLIC_HOST \
+    RESTORE_TLS_PUBLIC_PORT RESTORE_TLS_INTERNAL_HOST RESTORE_TLS_INTERNAL_PORT \
+    RESTORE_TLS_STATE_DIR RESTORE_TLS_COMPOSE_DIR RESTORE_TLS_COMPOSE_FILE_NAME \
+    RESTORE_TLS_COMPOSE_PROJECT_NAME RESTORE_TLS_USER RESTORE_SERVICE_USER \
+    RESTORE_TLS_SERVICE_NAME RESTORE_TLS_FORWARD_SOCKET_NAME RESTORE_TLS_FORWARD_SERVICE_NAME <<<"$values"
+  [[ "$RESTORE_TLS_ENABLED" == true || "$RESTORE_TLS_ENABLED" == false ]] || return 1
+  [[ "$RESTORE_TLS_PUBLIC_SOCKET" == true || "$RESTORE_TLS_PUBLIC_SOCKET" == false ]] || return 1
+  if [[ "$RESTORE_TLS_PUBLIC_HOST" == - ]]; then RESTORE_TLS_PUBLIC_HOST=''; fi
+  RESTORE_STACK_POLICY_SET=1
+}
+
+verify_restore_tls_unit_settings() {
+  [[ "$RESTORE_TLS_ENABLED" == true ]] || return 0
+  [[ "$RESTORE_SERVICE_USER" == "$LOCALAI_SERVICE_USER" &&
+     "$RESTORE_TLS_USER" == "$LOCALAI_TLS_USER" &&
+     "$RESTORE_TLS_STATE_DIR" == "$LOCALAI_TLS_STATE_DIR" &&
+     "$RESTORE_TLS_COMPOSE_DIR" == "$LOCALAI_TLS_COMPOSE_DIR" &&
+     "$RESTORE_TLS_COMPOSE_FILE_NAME" == "$LOCALAI_TLS_COMPOSE_FILE_NAME" &&
+     "$RESTORE_TLS_COMPOSE_PROJECT_NAME" == "$LOCALAI_TLS_COMPOSE_PROJECT_NAME" &&
+     "$RESTORE_TLS_SERVICE_NAME" == "$LOCALAI_TLS_SERVICE_NAME" &&
+     "$RESTORE_TLS_FORWARD_SOCKET_NAME" == "$LOCALAI_TLS_FORWARD_SOCKET_NAME" &&
+     "$RESTORE_TLS_FORWARD_SERVICE_NAME" == "$LOCALAI_TLS_FORWARD_SERVICE_NAME" ]] || return 1
+  tls_unit_managed || return 1
+  local tls_unit="$LOCALAI_TLS_STATE_DIR/.config/systemd/user/$LOCALAI_TLS_SERVICE_NAME"
+  local tls_uid compose_file="${RESTORE_TLS_COMPOSE_DIR%/}/$RESTORE_TLS_COMPOSE_FILE_NAME"
+  tls_uid="$(service_uid "$RESTORE_TLS_USER")" || return 1
+  run_elevated /usr/bin/grep -Fqx "WorkingDirectory=$RESTORE_TLS_STATE_DIR" "$tls_unit" || return 1
+  run_elevated /usr/bin/grep -Fqx "Environment=HOME=$RESTORE_TLS_STATE_DIR" "$tls_unit" || return 1
+  run_elevated /usr/bin/grep -Fqx "Environment=XDG_RUNTIME_DIR=/run/user/$tls_uid" "$tls_unit" || return 1
+  run_elevated /usr/bin/grep -Fqx "ExecStart=/usr/bin/podman compose -p $RESTORE_TLS_COMPOSE_PROJECT_NAME -f $compose_file up -d" "$tls_unit" || return 1
+  run_elevated /usr/bin/grep -Fqx "ExecStop=/usr/bin/podman compose -p $RESTORE_TLS_COMPOSE_PROJECT_NAME -f $compose_file down" "$tls_unit" || return 1
+  if [[ "$RESTORE_TLS_PUBLIC_SOCKET" == true ]]; then
+    socket_units_managed || return 1
+    local socket_unit="$system_unit_dir/$LOCALAI_TLS_FORWARD_SOCKET_NAME"
+    local service_unit="$system_unit_dir/$LOCALAI_TLS_FORWARD_SERVICE_NAME"
+    run_elevated /usr/bin/grep -Fqx "User=$RESTORE_SERVICE_USER" "$socket_unit" || return 1
+    run_elevated /usr/bin/grep -Fqx "ListenStream=$RESTORE_TLS_PUBLIC_HOST:$RESTORE_TLS_PUBLIC_PORT" "$socket_unit" || return 1
+    run_elevated /usr/bin/grep -Fqx "Requires=$LOCALAI_TLS_FORWARD_SOCKET_NAME" "$service_unit" || return 1
+    run_elevated /usr/bin/grep -Fqx "ExecStart=/usr/bin/systemd-socket-proxyd $RESTORE_TLS_INTERNAL_HOST:$RESTORE_TLS_INTERNAL_PORT" "$service_unit" ||
+      run_elevated /usr/bin/grep -Fqx "ExecStart=/usr/lib/systemd/systemd-socket-proxyd $RESTORE_TLS_INTERNAL_HOST:$RESTORE_TLS_INTERNAL_PORT" "$service_unit" || return 1
+  fi
+}
+
+socket_units_managed() {
+  local socket="$system_unit_dir/$LOCALAI_TLS_FORWARD_SOCKET_NAME" service="$system_unit_dir/$LOCALAI_TLS_FORWARD_SERVICE_NAME" path owner
+  if [[ ! -e "$socket" && ! -L "$socket" && ! -e "$service" && ! -L "$service" ]]; then return 1; fi
+  for path in "$socket" "$service"; do
+    [[ -f "$path" && ! -L "$path" ]] || die "cannot verify the configured TLS socket units"
+    owner="$(run_elevated /usr/bin/stat -c %u -- "$path")" || die "cannot verify ownership of the configured TLS socket units"
+    [[ "$owner" == 0 ]] || die "configured TLS socket unit is not root-owned"
+    run_elevated /usr/bin/grep -qx '# Managed by LocalAI secureblue TLS installer.' "$path" || die "configured TLS socket unit lacks the LocalAI ownership marker"
+  done
+}
+
+effective_execstartpre_has_restore_guard() {
+  local manager="$1" unit="$2" commands
+  commands="$($manager show --property=ExecStartPre --value "$unit" 2>/dev/null)" || return 1
+  printf '%s\n' "$commands" | /usr/bin/grep -Fq -- \
+    "{ path=/usr/bin/test ; argv[]=/usr/bin/test ! -e $RESTORE_MARKER_PATH ; ignore_errors=no ;"
+}
+
+effective_condition_has_restore_guard() {
+  local manager="$1" unit="$2" conditions
+  conditions="$($manager show --property=Conditions --value "$unit" 2>/dev/null)" || return 1
+  printf '%s\n' "$conditions" | /usr/bin/grep -Fq -- \
+    "{ type=ConditionPathExists ; trigger=false ; negate=true ; parameter=$RESTORE_MARKER_PATH ;"
+}
+
+verify_effective_restore_guards() {
+  effective_execstartpre_has_restore_guard backend_systemctl localai.service || return 1
+  local tls_unit="$LOCALAI_TLS_STATE_DIR/.config/systemd/user/$LOCALAI_TLS_SERVICE_NAME"
+  if [[ -e "$tls_unit" || -L "$tls_unit" ]]; then
+    tls_unit_managed || return 1
+    effective_execstartpre_has_restore_guard tls_systemctl "$LOCALAI_TLS_SERVICE_NAME" || return 1
+  fi
+  local socket_unit="$system_unit_dir/$LOCALAI_TLS_FORWARD_SOCKET_NAME"
+  local service_unit="$system_unit_dir/$LOCALAI_TLS_FORWARD_SERVICE_NAME"
+  if [[ -e "$socket_unit" || -L "$socket_unit" || -e "$service_unit" || -L "$service_unit" ]]; then
+    socket_units_managed || return 1
+    effective_condition_has_restore_guard root_systemctl "$LOCALAI_TLS_FORWARD_SOCKET_NAME" || return 1
+    effective_condition_has_restore_guard root_systemctl "$LOCALAI_TLS_FORWARD_SERVICE_NAME" || return 1
+  fi
+  return 0
+}
+
 config_hash() {
   if [[ -f "$config_file" ]]; then
     "$sha256_bin" "$config_file" | awk '{print $1}'
@@ -165,19 +531,24 @@ run_or_dry() {
 
 start_stack() {
   local result=success actions="backend-start"
+  if [[ "$dry_run" != 1 ]]; then
+    run_elevated /usr/bin/python3 "$backup_archive_helper" restore-marker-check || die "a previous backup restore is incomplete; managed services remain blocked pending recovery"
+  fi
   if [[ "$dry_run" != 1 ]] && { [[ "$LOCALAI_AUTH" != true ]] || ! run_elevated /usr/bin/python3 /etc/localai/bootstrap-guard.py "$LOCALAI_DATA_PATH/database.db" >/dev/null 2>&1; }; then
     bootstrap_admin
     return $?
   fi
   if ! run_or_dry backend_systemctl start localai.service; then
     log "start: backend failed; inspect with 'localaictl logs backend'"
-    result=failure
+    audit start failure "$actions"
+    return 1
   fi
   if tls_enabled; then
     actions+=",tls-start"
     if ! run_or_dry tls_systemctl start "$LOCALAI_TLS_SERVICE_NAME"; then
       log "start: TLS Compose service failed; inspect with 'localaictl logs tls'"
-      result=failure
+      audit start failure "$actions"
+      return 1
     fi
     if [[ "$LOCALAI_TLS_PUBLIC_SOCKET" == true ]]; then
       actions+=",socket-start"
@@ -465,12 +836,639 @@ doctor() {
   return 1
 }
 
+backup_unit_list=()
+backup_units() {
+  backup_unit_list=(backend)
+  if tls_enabled; then
+    tls_unit_managed || die "configured TLS service unit is not verifiably managed by LocalAI"
+    backup_unit_list+=(tls)
+    if [[ "$LOCALAI_TLS_PUBLIC_SOCKET" == true ]]; then
+      socket_units_managed || die "configured TLS socket units are not verifiably managed by LocalAI"
+      backup_unit_list+=(socket)
+    elif socket_units_managed; then
+      # A previously installed managed socket may remain active after config
+      # disables it; inventory it so backup/restore preserves its real state.
+      backup_unit_list+=(socket)
+    fi
+  else
+    tls_unit_managed && backup_unit_list+=(tls)
+    socket_units_managed && backup_unit_list+=(socket)
+  fi
+  return 0
+}
+
+backup_unit_state() {
+  case "$1" in
+    backend) backend_state ;;
+    tls) tls_state ;;
+    socket) socket_state ;;
+    *) return 2 ;;
+  esac
+}
+
+backup_unit_action() {
+  local unit="$1" action="$2"
+  case "$unit" in
+    backend) backend_systemctl "$action" localai.service ;;
+    tls) tls_systemctl "$action" "$LOCALAI_TLS_SERVICE_NAME" ;;
+    socket) root_systemctl "$action" "$LOCALAI_TLS_FORWARD_SOCKET_NAME" "$LOCALAI_TLS_FORWARD_SERVICE_NAME" ;;
+    *) return 2 ;;
+  esac
+}
+
+restore_backup_service_state() {
+  local unit
+  for unit in backend tls socket; do
+    if [[ " ${backup_was_active[*]:-} " == *" $unit "* ]]; then
+      if [[ "${RESTORE_STACK_POLICY_SET:-0}" == 1 ]]; then
+        case "$unit" in
+          tls) [[ "$RESTORE_TLS_ENABLED" == true ]] || continue ;;
+          socket) [[ "$RESTORE_TLS_ENABLED" == true && "$RESTORE_TLS_PUBLIC_SOCKET" == true ]] || continue ;;
+        esac
+      fi
+      backup_unit_action "$unit" start || { printf 'localaictl: warning: could not restore the previous %s service state\n' "$unit" >&2; return 1; }
+    fi
+  done
+  return 0
+}
+
+backup_stop_services() {
+  local unit state
+  backup_units
+  backup_was_active=()
+  for unit in "${backup_unit_list[@]}"; do
+    state="$(backup_unit_state "$unit")"
+    case "$state" in
+      active) backup_was_active+=("$unit") ;;
+      inactive|failed) ;;
+      *) die "cannot determine a stable $unit service state; refusing backup or restore" ;;
+    esac
+  done
+  for unit in socket tls backend; do
+    if [[ " ${backup_was_active[*]:-} " == *" $unit "* ]]; then
+      backup_unit_action "$unit" stop || die "could not stop $unit service for backup"
+      state="$(backup_unit_state "$unit")"
+      [[ "$state" == inactive || "$state" == failed ]] || die "could not verify that $unit service stopped"
+    fi
+  done
+}
+
+backup() {
+  [[ "$dry_run" != 1 ]] || die "backup does not support --dry-run"
+  local exclude_models=0 destination path lock_file destination_parent tmp status
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      --exclude-models) [[ "$exclude_models" == 0 ]] || die "backup accepts --exclude-models once"; exclude_models=1; shift ;;
+      --*) die "unknown backup option: $1" ;;
+      *) break ;;
+    esac
+  done
+  [[ "$#" == 1 ]] || die "backup requires one destination path"
+  destination="$1"
+  [[ "$destination" == /* ]] || destination="$PWD/$destination"
+  [[ ! -e "$destination" && ! -L "$destination" ]] || die "backup destination already exists"
+  [[ -d "${destination%/*}" ]] || die "backup destination directory does not exist"
+  destination_parent="${destination%/*}"
+  [[ "$(realpath -m -- "$destination_parent")" == "$destination_parent" ]] || die "backup destination parent must not contain symbolic links or traversal components"
+  destination="$(realpath -m -- "$destination")"
+  prepare_backup_roots
+  for path in "$config_file" "${backup_roots[@]}"; do
+    [[ "$destination" != "$path" && "$destination" != "$path"/* ]] || die "backup destination must be outside the configuration and persistent data paths"
+  done
+  lock_file=/run/lock/localai-backup.lock
+  tmp="$(mktemp "${destination%/*}/.localaictl-backup.XXXXXX")"
+  chmod 0600 "$tmp"
+  local -a args=(--archive-file "$tmp")
+  [[ "$exclude_models" == 0 ]] || args=(--exclude-models "${args[@]}")
+  if run_elevated_pipe /usr/bin/flock -n -E 75 "$lock_file" "$script_dir/localaictl" __backup "${args[@]}" >"$tmp"; then
+    :
+  else
+    status=$?
+    rm -f -- "$tmp"
+    [[ "$status" != 75 ]] || die "backup or restore is already running"
+    return "$status"
+  fi
+  if ! ln -- "$tmp" "$destination"; then
+    rm -f -- "$tmp"
+    die "could not create backup without overwriting another file"
+  fi
+  rm -f -- "$tmp"
+  log "Backup created: $destination"
+}
+
+rootless_tar_failure_category() {
+  local error="$1"
+  case "$error" in
+    *"Cannot open: Permission denied"*) printf 'source-open-permission' ;;
+    *"Cannot read: Permission denied"*) printf 'source-read-permission' ;;
+    *"Cannot get extended attributes: Permission denied"*) printf 'xattr-read-permission' ;;
+    *"Cannot set extended attributes: Permission denied"*) printf 'xattr-write-permission' ;;
+    *"Cannot get ACL"*"Permission denied"*) printf 'acl-read-permission' ;;
+    *"Cannot set ACL"*"Permission denied"*) printf 'acl-write-permission' ;;
+    *"Cannot stat: Permission denied"*) printf 'source-stat-permission' ;;
+    *"Cannot change ownership"*"Permission denied"*) printf 'ownership-permission' ;;
+    *"Permission denied"*) printf 'permission' ;;
+    *"No space left on device"*|*"quota exceeded"*) printf 'capacity' ;;
+    *"File changed as we read it"*|*"file changed as we read it"*|*"file changed while"*) printf 'source-changed' ;;
+    *"unrecognized option"*|*"invalid option"*) printf 'unsupported-option' ;;
+    *"No such file or directory"*|*"Cannot stat"*) printf 'source-path' ;;
+    *"Operation not permitted"*) printf 'operation-not-permitted' ;;
+    *"Failed to connect"*|*"Failed to open bus"*) printf 'service-manager' ;;
+    *"xattr"*|*"extended attribute"*) printf 'xattr' ;;
+    "") printf 'empty-error' ;;
+    *) printf 'other' ;;
+  esac
+}
+
+rootless_tar_member_metadata_category() {
+  local graphroot="$1" error="$2" expected_marker="$3" category
+  category="$(printf '%s\n%s\n%s\n' "$graphroot" "$expected_marker" "$error" | /usr/bin/python3 -c '
+import os
+import pwd
+import re
+import stat
+import sys
+
+graphroot = sys.stdin.readline().rstrip("\n")
+expected_marker = sys.stdin.readline().rstrip("\n")
+error = sys.stdin.read()
+try:
+    root = os.path.normpath(graphroot)
+    root_parent = os.path.dirname(root)
+    candidate = None
+    for line in error.splitlines():
+        match = re.search(r"tar: (.+): Cannot open: Permission denied", line)
+        if match:
+            candidate = match.group(1)
+            break
+    if candidate is None:
+        print("member-unidentified")
+        raise SystemExit(0)
+    path = os.path.normpath(candidate if os.path.isabs(candidate) else os.path.join(root_parent, candidate))
+    if os.path.commonpath((root, path)) != root:
+        print("member-outside-graphroot")
+        raise SystemExit(0)
+    relative = os.path.relpath(path, root)
+    components = relative.split(os.sep)
+    current = root
+    for component in components[:-1]:
+        current = os.path.join(current, component)
+        ancestor = os.lstat(current)
+        if not stat.S_ISDIR(ancestor.st_mode) or stat.S_ISLNK(ancestor.st_mode):
+            print("member-path-unsafe")
+            raise SystemExit(0)
+    info = os.lstat(path)
+    kind = "directory" if stat.S_ISDIR(info.st_mode) else "regular" if stat.S_ISREG(info.st_mode) else "symlink" if stat.S_ISLNK(info.st_mode) else "special"
+    path_class = "other-root-subtree" if os.sep in relative else "other-root-entry"
+    service_uid = int(os.environ.get("LOCALAI_DIAGNOSTIC_SERVICE_UID", "-1"))
+    service_name = pwd.getpwuid(service_uid).pw_name
+    if info.st_uid == service_uid:
+        owner = "service"
+    elif info.st_uid == 0:
+        owner = "host-root"
+    else:
+        mapped = False
+        with open("/etc/subuid", encoding="ascii") as mappings:
+            for row in mappings:
+                fields = row.rstrip("\n").split(":")
+                if len(fields) != 3 or not fields[1].isdigit() or not fields[2].isdigit():
+                    continue
+                if fields[0] not in (service_name, str(service_uid)):
+                    continue
+                start, length = int(fields[1]), int(fields[2])
+                if start <= info.st_uid < start + length:
+                    mapped = True
+                    break
+        owner = "subuid" if mapped else "other"
+    mode = stat.S_IMODE(info.st_mode)
+    if path == os.path.normpath(expected_marker):
+        print(f"member-acceptance-marker-owner-{owner}-mode-{mode:04o}-persistence-fixture")
+    else:
+        print(f"member-{kind}-owner-{owner}-mode-{mode:04o}-path-{path_class}")
+except (OSError, ValueError, OverflowError, KeyError):
+    print("member-metadata-unavailable")
+')" || category=member-metadata-unavailable
+  if [[ "$category" =~ ^member-acceptance-marker-owner-(service|subuid|host-root|other)-mode-[0-7][0-7][0-7][0-7]-persistence-fixture$ ||
+        "$category" =~ ^member-(regular|directory|symlink|special)-owner-(service|subuid|host-root|other)-mode-[0-7][0-7][0-7][0-7]-path-(overlay-layer|image-metadata|container-metadata|layer-metadata|overlay-locks|volume-data|libpod-metadata|temporary-data|mount-metadata|container-state|storage-lock|storage-database|network-metadata|hidden-root-entry|root-lock-entry|root-database-entry|root-metadata-entry|other-root-entry|other-root-subtree)$ ||
+        "$category" =~ ^member-(unidentified|outside-graphroot|metadata-unavailable|path-unsafe)$ ]]; then
+    printf '%s' "$category"
+  else
+    printf 'member-metadata-unavailable'
+  fi
+}
+
+backup_locked() {
+  local exclude_models=0 archive_file metadata_dir stage_base archive_args=() path rootless_nested='' rootless_tar_error='' rootless_tar_category rootless_tar_member_category
+  local -a backup_space_args=()
+  if [[ "${1:-}" == --exclude-models ]]; then exclude_models=1; shift; fi
+  [[ "${1:-}" == --archive-file && "$#" == 2 ]] || die "internal backup requires an archive stream target"
+  archive_file="$2"
+  prepare_backup_roots
+  run_elevated /usr/bin/python3 "$backup_archive_helper" restore-marker-check || die "a previous backup restore is incomplete; managed services remain blocked pending recovery"
+  if [[ -e "$config_file" ]] && is_effectively_root; then
+    [[ -f "$config_file" && ! -L "$config_file" && "$(stat -c %u -- "$config_file")" == 0 ]] || die "configuration file must be a root-owned regular file to back up"
+    (( (8#$(stat -c %a -- "$config_file") & 8#22) == 0 )) || die "configuration file must not be group/world writable to back up"
+  fi
+  printf 'WARNING: this backup contains the TLS CA private key and LocalAI authentication database. Store it securely.\n' >&2
+  backup_was_active=()
+  backup_tmp=""
+  backup_metadata_dir=""
+  trap 'backup_exit_cleanup' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  backup_stop_services
+  stage_base="$(backup_stage_base)"
+  metadata_dir="$(mktemp -d "$stage_base/localai-backup.XXXXXX")"
+  backup_metadata_dir="$metadata_dir"
+  chmod 0700 "$metadata_dir"
+  query_rootless_context "$metadata_dir/rootless-context.json"
+  include_rootless_graphroot
+  for path in "$config_file" "${backup_roots[@]}"; do
+    [[ "$archive_file" != "$path" && "$archive_file" != "$path"/* ]] ||
+      die "backup destination must be outside the configuration and persistent data paths"
+  done
+  backup_space_args=("$archive_file" "$metadata_dir" "$rootless_graphroot")
+  [[ "$exclude_models" == 0 ]] || backup_space_args+=(--exclude-models "$LOCALAI_MODELS_PATH")
+  run_elevated /usr/bin/python3 "$backup_archive_helper" backup-space-check \
+    "${backup_space_args[@]}" "${backup_roots[@]}" || die "insufficient disk space for backup staging and archive output"
+  if [[ -d "$rootless_graphroot" ]]; then
+    if [[ "$exclude_models" == 1 && ( "$LOCALAI_MODELS_PATH" == "$rootless_graphroot" || "$LOCALAI_MODELS_PATH" == "$rootless_graphroot"/* || "$rootless_graphroot" == "$LOCALAI_MODELS_PATH"/* ) ]]; then
+      die "model exclusion cannot safely omit a path inside the rootless graphroot"
+    fi
+    rootless_nested="$metadata_dir/$ROOTLESS_GRAPHROOT_MEMBER"
+    [[ ! -e "$rootless_nested" && ! -L "$rootless_nested" ]] || die "rootless graphroot staging file already exists"
+    if [[ "${LOCALAI_ACCEPTANCE_DIAGNOSTIC:-}" == 1 ]]; then
+      if rootless_tar_error="$(set -o pipefail; run_rootless_podman "$tar_bin" --create --file - --xattrs --acls --selinux --numeric-owner \
+        --sparse --directory "${rootless_graphroot%/*}" "${rootless_graphroot##*/}" 2>&1 >"$rootless_nested" | /usr/bin/python3 -c '
+import sys
+
+limit = 8192
+tail = bytearray()
+while True:
+    chunk = sys.stdin.buffer.read(4096)
+    if not chunk:
+        break
+    tail.extend(chunk)
+    if len(tail) > limit:
+        del tail[:-limit]
+sys.stdout.buffer.write(tail)
+' )"; then
+        :
+      else
+        rootless_tar_category="$(rootless_tar_failure_category "$rootless_tar_error")"
+        printf 'localaictl: diagnostic-rootless-tar-failure: %s\n' "$rootless_tar_category" >&2
+        if [[ "$rootless_tar_category" == source-open-permission ]]; then
+          rootless_tar_member_category="$(LOCALAI_DIAGNOSTIC_SERVICE_UID="$(service_uid "$LOCALAI_SERVICE_USER")" rootless_tar_member_metadata_category "$rootless_graphroot" "$rootless_tar_error" "$LOCALAI_STATE_DIR/.local/share/containers/storage/.localaictl-backup-restore-marker")"
+          printf 'localaictl: diagnostic-rootless-tar-member: %s\n' "$rootless_tar_member_category" >&2
+          unset rootless_tar_member_category
+        fi
+        unset rootless_tar_error
+        die "rootless graphroot archive creation failed"
+      fi
+      unset rootless_tar_error
+    else
+      run_rootless_podman "$tar_bin" --create --file - --xattrs --acls --selinux --numeric-owner \
+        --sparse --directory "${rootless_graphroot%/*}" "${rootless_graphroot##*/}" 2>/dev/null >"$rootless_nested" || die "rootless graphroot archive creation failed"
+    fi
+    chmod 0600 "$rootless_nested"
+  fi
+  {
+    printf 'format=2\nbackend_image=%s\nbackend_digest=%s\ntls_image=%s\ntls_digest=%s\n' \
+      "$LOCALAI_IMAGE_REF" "$LOCALAI_IMAGE_DIGEST" "$LOCALAI_TLS_IMAGE_REF" "$LOCALAI_TLS_IMAGE_DIGEST"
+    if [[ -n "$rootless_nested" ]]; then
+      printf 'graphroot=%s\nuid_map=%s\ngid_map=%s\n' "$rootless_graphroot" "$rootless_uid_map" "$rootless_gid_map"
+    fi
+  } >"$metadata_dir/metadata"
+  chmod 0600 "$metadata_dir/metadata"
+  archive_args=(--create --gzip --file - --xattrs --xattrs-exclude=security.selinux --acls --no-selinux --numeric-owner)
+  if [[ "$exclude_models" == 1 ]]; then
+    path="${LOCALAI_MODELS_PATH#/}"
+    archive_args+=(--exclude="$path" --exclude="$path/*")
+  fi
+  if [[ -n "$rootless_nested" ]]; then
+    path="${rootless_graphroot#/}"
+    archive_args+=(--exclude="$path" --exclude="$path/*")
+  fi
+  path="${LOCALAI_STATE_DIR%/}/build"
+  path="${path#/}"
+  archive_args+=(--exclude="$path" --exclude="$path/*")
+  archive_args+=(--directory "$metadata_dir" metadata --directory /)
+  [[ -e "$config_file" ]] && archive_args+=("${config_file#/}")
+  for path in "${backup_roots[@]}"; do
+    [[ -n "$rootless_nested" && "$path" == "$rootless_graphroot" ]] && continue
+    [[ -e "$path" ]] && archive_args+=("${path#/}")
+  done
+  [[ -z "$rootless_nested" ]] || archive_args+=(--directory "$metadata_dir" "$ROOTLESS_GRAPHROOT_MEMBER")
+  run_elevated_pipe "$tar_bin" "${archive_args[@]}" || die "backup archive creation failed"
+  run_backup_helper validate-created "$archive_file" "$config_file" "${backup_roots[@]}" || die "backup contains unsupported or unsafe filesystem entries"
+  run_backup_helper trusted-compose "$archive_file" "$config_file" '' "$LOCALAI_TLS_COMPOSE_DIR" || die "backup TLS Compose tree differs from the installed tree"
+  rm -rf -- "$metadata_dir"
+  backup_metadata_dir=""
+  restore_backup_service_state || die "backup completed but one or more previously active services could not be restarted"
+  trap - EXIT HUP INT TERM
+}
+
+# Called indirectly by the backup EXIT trap.
+# shellcheck disable=SC2329
+backup_exit_cleanup() {
+  [[ -z "${backup_tmp:-}" ]] || rm -f -- "$backup_tmp"
+  [[ -z "${backup_metadata_dir:-}" ]] || rm -rf -- "$backup_metadata_dir"
+  restore_backup_service_state || :
+}
+
+restore_archive() {
+  [[ "$dry_run" != 1 ]] || die "restore does not support --dry-run"
+  local source="$1" lock_file status
+  [[ -f "$source" && ! -L "$source" ]] || die "restore source must be a regular, non-linked archive file"
+  source="$(realpath -e -- "$source")"
+  lock_file=/run/lock/localai-backup.lock
+  local -a args=("$source")
+  [[ "${restore_confirmed:-0}" == 0 ]] || args=(--yes "$source")
+  if run_elevated_pipe /usr/bin/flock -n -E 75 "$lock_file" "$script_dir/localaictl" __restore "${args[@]}"; then
+    :
+  else
+    status=$?
+    [[ "$status" != 75 ]] || die "backup or restore is already running"
+    return "$status"
+  fi
+}
+
+restore_locked() {
+  local source="$1" stage source_copy members collisions snapshot skip_links target answer item had_target=0 stage_base needs_confirmation=0 restored_config_path
+  local rootless_present=0 rootless_archive rootless_old_path='' rootless_source_inode='' rootless_initial_inode=''
+  local marker_graphroot='' marker_rollback=''
+  local rootless_graphroot_had_old=0 rootless_graphroot_mutated=0
+  local restore_mutation_started=0 restore_completed=0
+  local restore_marker_created=0
+  local helper="$backup_archive_helper"
+  [[ -f "$source" && ! -L "$source" ]] || die "restore source must be a regular, non-linked archive file"
+  run_elevated /usr/bin/python3 "$helper" restore-marker-check || die "a previous backup restore is incomplete; managed services remain blocked pending recovery"
+  prepare_backup_roots
+  source="$(realpath -e -- "$source")"
+  stage_base="$(backup_stage_base)"
+  stage="$(mktemp -d "$stage_base/localai-restore.XXXXXX")"
+  rootless_context_file=''
+  backup_was_active=()
+  RESTORE_ROLLBACK_FAILED=0
+  RESTORE_SERVICES_STOPPED=0
+  trap 'restore_exit_cleanup' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  chmod 0700 "$stage"
+  query_rootless_context "$stage/rootless-context-before.json" 0
+  include_rootless_graphroot
+  members="$stage/members0"
+  collisions="$stage/collisions0"
+  snapshot="$stage/rollback.tar"
+  skip_links="$stage/skip-links0"
+  source_copy="$stage/input.tar.gz"
+  run_elevated /usr/bin/python3 "$helper" stage-check "$stage" || die "restore staging must be on a disk-backed filesystem"
+  run_backup_helper space-check "$source" "$stage" || die "insufficient disk space for a safe restore stage"
+  run_elevated /usr/bin/python3 "$helper" copy-source "$source" "$config_file" "${backup_roots[@]}" "$source_copy" || die "could not safely copy restore archive"
+  source="$source_copy"
+  # Podman assigns fresh private MCS categories when it starts the restored
+  # container. Check the stable SELinux identity and sensitivity at both
+  # validation points, and let Podman reapply those dynamic categories.
+  RESTORE_ROOTLESS_SELINUX_RANGE_CHANGE_ALLOWED=1
+  run_backup_helper validate "$source" "$config_file" "${backup_roots[@]}" || die "backup contains unsupported or unsafe filesystem entries"
+  run_elevated "$tar_bin" --extract --gzip --file "$source" --directory "$stage" --xattrs --acls --no-selinux --numeric-owner --same-owner || die "could not extract backup into private staging"
+  run_backup_helper destinations "$source" "$config_file" "${backup_roots[@]}" "$stage" || die "restore paths are unsafe"
+  run_backup_helper skip-links0 "$source" "$config_file" "${backup_roots[@]}" "$stage" >"$skip_links"
+  run_backup_helper members0 "$source" "$config_file" "${backup_roots[@]}" >"$members"
+  run_backup_helper collisions0 "$source" "$config_file" "${backup_roots[@]}" >"$collisions"
+  rootless_present="$(run_backup_helper rootless-present "$source" "$config_file" "${backup_roots[@]}")" || die "backup rootless graphroot status could not be verified"
+  [[ "$rootless_present" == 0 || "$rootless_present" == 1 ]] || die "backup rootless graphroot status is invalid"
+  rootless_archive="$stage/$ROOTLESS_GRAPHROOT_MEMBER"
+  if [[ "$rootless_present" == 1 ]]; then
+    [[ -f "$rootless_archive" && ! -L "$rootless_archive" ]] || die "backup rootless graphroot archive was not staged safely"
+    [[ -d "$rootless_graphroot" ]] && [[ -n "$(run_elevated find -P "$rootless_graphroot" -mindepth 1 -maxdepth 1 -print -quit)" ]] && needs_confirmation=1
+    rootless_initial_inode="$(run_elevated /usr/bin/stat -c '%d:%i' -- "$rootless_graphroot")" || die "cannot identify the rootless graphroot before restore"
+  fi
+  run_backup_helper unit-trees0 "$source" "$config_file" "${backup_roots[@]}" "$stage" "$LOCALAI_STATE_DIR" "$LOCALAI_TLS_STATE_DIR" >"$stage/unit-trees0" || die "backup contains unsafe or changed systemd unit configuration"
+  run_backup_helper trusted-compose "$source" "$config_file" "$stage" "$LOCALAI_TLS_COMPOSE_DIR" || die "backup TLS Compose tree differs from the installed tree"
+  if grep -zFxq "${LOCALAI_STATE_DIR#/}/.config/systemd/user/localai.service" "$members"; then
+    verify_restore_backend_unit "$stage/${config_file#/}" || die "restored config does not match the trusted installed backend unit and manager settings"
+  fi
+  restored_config_path="$config_file"
+  [[ ! -e "$stage/${config_file#/}" ]] || restored_config_path="$stage/${config_file#/}"
+  load_restore_stack_policy "$restored_config_path" || die "restored configuration cannot be read safely for service-state reconciliation"
+  verify_restore_tls_unit_settings || die "restored TLS configuration does not match the installed service units"
+  verify_effective_restore_guards || die "installed or effective service units lack the durable restore marker guard"
+  for target in "${backup_roots[@]}"; do
+    if [[ -d "$target" ]] && [[ -n "$(run_elevated find "$target" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then needs_confirmation=1; fi
+  done
+  [[ ! -e "$config_file" ]] || needs_confirmation=1
+  if [[ "$needs_confirmation" == 1 && "${restore_confirmed:-0}" != 1 ]]; then
+    [[ -t 0 ]] || die "restore requires --yes in non-interactive use"
+    if [[ "$rootless_present" == 1 ]]; then
+      printf 'This overlays LocalAI configuration and state and replaces the complete rootless Podman graphroot, including the TLS CA key and authentication database. Continue? [y/N] ' >&2
+    else
+      printf 'This overlays LocalAI configuration and state, including the TLS CA key and authentication database. Continue? [y/N] ' >&2
+    fi
+    read -r answer
+    [[ "$answer" == y || "$answer" == Y ]] || die "restore cancelled"
+    restore_confirmed=1
+  fi
+  RESTORE_SERVICES_STOPPED=1
+  backup_stop_services
+  query_rootless_context "$stage/rootless-context-stopped.json" 1
+  include_rootless_graphroot
+  if [[ "$rootless_present" == 1 ]]; then
+    [[ -f "$rootless_archive" && ! -L "$rootless_archive" ]] || die "backup rootless graphroot archive changed during restore"
+    rootless_source_inode="$(run_elevated /usr/bin/stat -c '%d:%i' -- "$rootless_graphroot")" || die "cannot identify the stopped rootless graphroot"
+    [[ "$rootless_source_inode" == "$rootless_initial_inode" ]] || die "rootless graphroot changed while services stopped"
+  fi
+  run_backup_helper validate "$source" "$config_file" "${backup_roots[@]}" || die "backup contents or LocalAI storage settings changed while services stopped"
+  run_backup_helper destinations "$source" "$config_file" "${backup_roots[@]}" "$stage" || die "restore paths changed while services stopped"
+  run_backup_helper skip-links0 "$source" "$config_file" "${backup_roots[@]}" "$stage" >"$skip_links"
+  run_backup_helper collisions0 "$source" "$config_file" "${backup_roots[@]}" >"$collisions"
+  needs_confirmation=0
+  for target in "${backup_roots[@]}"; do
+    if [[ -d "$target" ]] && [[ -n "$(run_elevated find "$target" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then needs_confirmation=1; fi
+  done
+  [[ ! -e "$config_file" ]] || needs_confirmation=1
+  if [[ "$needs_confirmation" == 1 && "${restore_confirmed:-0}" != 1 ]]; then
+    die "restore targets changed before restore; rerun with --yes after reviewing the overwrite"
+  fi
+  [[ ! -s "$collisions" ]] || had_target=1
+  run_backup_helper space-check "$source" "$stage" --staged "$collisions" --destinations "$config_file" "${backup_roots[@]}" || die "insufficient disk space for the restore and rollback snapshot"
+  if [[ "$had_target" == 1 ]]; then
+    run_elevated "$tar_bin" --create --file "$snapshot" --xattrs --acls --selinux --numeric-owner --no-recursion --directory / --null --files-from="$collisions" || die "could not prepare rollback snapshot"
+  fi
+  local -a links_to_keep=()
+  mapfile -d '' -t links_to_keep <"$skip_links"
+  for item in "${links_to_keep[@]}"; do run_elevated /usr/bin/rm -f -- "$stage/$item"; done
+  mapfile -d '' -t links_to_keep <"$stage/unit-trees0"
+  for item in "${links_to_keep[@]}"; do
+    run_elevated /usr/bin/rm -rf -- "${stage:?}/$item"
+  done
+  run_elevated /usr/bin/python3 "$helper" sync-staging-snapshot "$snapshot" "$stage" || die "could not durably persist rollback snapshot and staging data"
+  if [[ "$rootless_present" == 1 ]]; then
+    [[ -d "$rootless_graphroot" && ! -L "$rootless_graphroot" ]] || die "rootless graphroot disappeared before restore"
+    rootless_old_path="$rootless_graphroot.localaictl-rollback.$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+    rootless_graphroot_had_old=1
+    rootless_graphroot_mutated=1
+    marker_graphroot="$rootless_graphroot"
+    marker_rollback="$rootless_old_path"
+  fi
+  run_elevated /usr/bin/python3 "$helper" restore-marker-create \
+    "$marker_graphroot" "$marker_rollback" "$rootless_source_inode" || die "could not create the durable restore safety marker"
+  restore_marker_created=1
+  restore_mutation_started=1
+  if [[ "$rootless_present" == 1 ]]; then
+    local rootless_source_device rootless_source_ino
+    IFS=: read -r rootless_source_device rootless_source_ino <<<"$rootless_source_inode"
+    run_elevated /usr/bin/python3 "$helper" graphroot-rename-expected \
+      "$rootless_graphroot" "$rootless_old_path" "$rootless_source_device" "$rootless_source_ino" || die "could not reserve the rootless graphroot rollback path"
+    local service_uid_value service_gid_value
+    service_uid_value="$(service_uid "$LOCALAI_SERVICE_USER")"
+    service_gid_value="$(service_gid "$LOCALAI_SERVICE_USER")"
+    run_elevated /usr/bin/python3 "$helper" graphroot-create "$rootless_graphroot" "$service_uid_value" "$service_gid_value" || die "could not create the rootless graphroot restore destination"
+    run_rootless_podman "$tar_bin" --extract --file - --directory "${rootless_graphroot%/*}" \
+      --xattrs --acls --selinux --numeric-owner --same-owner --same-permissions \
+      <"$rootless_archive" 2>/dev/null || die "rootless graphroot extraction failed; rollback will run before services restart"
+    run_elevated "$restorecon_bin" -F -- "$rootless_graphroot" || die "could not normalize the rootless graphroot label; rollback will run before services restart"
+    run_elevated "$matchpathcon_bin" -V "$rootless_graphroot" || die "rootless graphroot SELinux label verification failed; rollback will run before services restart"
+  fi
+  for target in "${backup_roots[@]}"; do
+    if [[ -d "$stage/${target#/}" ]]; then mkdir -p -- "$target"; fi
+  done
+  if [[ -e "$stage/${config_file#/}" ]]; then mkdir -p -- "${config_file%/*}"; fi
+  for target in "${backup_roots[@]}"; do
+    if [[ -d "$stage/${target#/}" && ! -L "$stage/${target#/}" ]]; then
+      run_elevated "$cp_bin" -a -- "$stage/${target#/}/." "$target/" || die "restore failed; rollback will run before services restart"
+      run_elevated "$cp_bin" -a --attributes-only -T -- "$stage/${target#/}" "$target" || die "restore failed while applying persistent root metadata; rollback will run before services restart"
+    fi
+  done
+  if [[ -e "$stage/${config_file#/}" ]]; then
+    run_elevated "$cp_bin" -a -- "$stage/${config_file#/}" "$config_file" || die "restore failed; rollback will run before services restart"
+  fi
+  if [[ -e "$stage/${config_file#/}" ]]; then
+    run_elevated "$restorecon_bin" -F -- "$config_file" || die "could not normalize restored configuration SELinux label; rollback will run before services restart"
+    run_elevated "$matchpathcon_bin" -V "$config_file" || die "configuration SELinux label verification failed; rollback will run before services restart"
+  fi
+  for target in "${backup_roots[@]}"; do
+    [[ -e "$target" ]] || continue
+    if [[ "$rootless_present" != 1 || "$target" != "$rootless_graphroot" ]]; then
+      run_elevated "$restorecon_bin" -F -R -- "$target" || die "could not normalize persistent SELinux labels; rollback will run before services restart"
+    fi
+    run_elevated "$matchpathcon_bin" -V "$target" || die "SELinux label verification failed; rollback will run before services restart"
+  done
+  if [[ "$rootless_present" == 1 ]]; then
+    run_backup_helper sync-destinations "$source" "$config_file" "${backup_roots[@]}" || die "could not durably flush restored data; rollback will run before services restart"
+  else
+    run_backup_helper sync-destinations "$source" "$config_file" "${backup_roots[@]}" || die "could not durably flush restored data; rollback will run before services restart"
+  fi
+  restore_completed=1
+  if [[ "$rootless_graphroot_had_old" == 1 ]]; then
+    local old_inode old_device old_ino
+    old_inode="$(run_elevated /usr/bin/stat -c '%d:%i' -- "$rootless_old_path" 2>/dev/null || :)"
+    IFS=: read -r old_device old_ino <<<"$rootless_source_inode"
+    if [[ "$old_inode" != "$rootless_source_inode" ]] ||
+       ! run_elevated /usr/bin/python3 "$helper" graphroot-remove "$rootless_old_path" "$old_device" "$old_ino"; then
+      log "warning: restored graphroot is active; old graphroot cleanup remains at the private rollback path"
+    else
+      rootless_old_path=''
+      rootless_graphroot_had_old=0
+    fi
+  fi
+  run_elevated /usr/bin/rm -rf -- "$stage"
+  if ! run_elevated /usr/bin/python3 "$helper" restore-marker-clear; then
+    RESTORE_ROLLBACK_FAILED=1
+    die "restore completed but the durable safety marker could not be cleared; managed services remain stopped"
+  fi
+  restore_marker_created=0
+  restore_backup_service_state || die "restore completed but one or more previously active services could not be restarted"
+  trap - EXIT HUP INT TERM
+  log "Backup restored. State was overlaid, unrelated files were preserved, and configured root labels were verified."
+}
+
+# Called indirectly by the restore EXIT trap.
+# shellcheck disable=SC2329
+restore_rollback() {
+  local members="$1" collisions="$2" snapshot="$3" had_target="$4"
+  local rootless_graphroot="$5" rootless_old_path="$6" rootless_had_old="$7" rootless_mutated="$8"
+  local status=0
+  if [[ "$rootless_mutated" == 1 && "$rootless_had_old" == 1 ]]; then
+    local old_inode current_inode
+    old_inode="$(run_elevated /usr/bin/stat -c '%d:%i' -- "$rootless_old_path" 2>/dev/null || :)"
+    current_inode="$(run_elevated /usr/bin/stat -c '%d:%i' -- "$rootless_graphroot" 2>/dev/null || :)"
+    if [[ "$current_inode" == "$rootless_source_inode" && "$old_inode" != "$rootless_source_inode" ]]; then
+      : # The no-replace rename did not move the original tree.
+    elif [[ "$old_inode" == "$rootless_source_inode" ]]; then
+      if [[ -e "$rootless_graphroot" || -L "$rootless_graphroot" ]]; then
+        local current_device current_ino
+        IFS=: read -r current_device current_ino <<<"$current_inode"
+        if [[ -L "$rootless_graphroot" || ! -d "$rootless_graphroot" ]] ||
+           ! run_elevated /usr/bin/python3 "$backup_archive_helper" graphroot-check \
+             "$rootless_graphroot" "$rootless_service_home" "$(service_uid "$LOCALAI_SERVICE_USER")" "$(service_gid "$LOCALAI_SERVICE_USER")" "${backup_roots[@]}" ||
+           ! run_elevated /usr/bin/python3 "$backup_archive_helper" graphroot-remove "$rootless_graphroot" "$current_device" "$current_ino"; then
+          log "warning: could not safely remove the partially restored rootless graphroot"
+          status=1
+        fi
+      fi
+      if (( status == 0 )); then
+        local source_device source_ino
+        IFS=: read -r source_device source_ino <<<"$rootless_source_inode"
+        run_elevated /usr/bin/python3 "$backup_archive_helper" graphroot-rename-expected \
+          "$rootless_old_path" "$rootless_graphroot" "$source_device" "$source_ino" || {
+          log "warning: could not restore the previous rootless graphroot"
+          status=1
+        }
+      fi
+    else
+      log "warning: rootless graphroot rollback identity could not be verified"
+      status=1
+    fi
+  fi
+  run_elevated /usr/bin/python3 "$backup_archive_helper" rollback-new "$source" "$config_file" "${backup_roots[@]}" "$members" "$collisions" || { log "warning: could not remove all newly restored paths"; status=1; }
+  if [[ "$had_target" == 1 ]]; then
+    run_elevated "$tar_bin" --extract --file "$snapshot" --directory / --xattrs --acls --selinux --numeric-owner --same-owner || { log "warning: could not restore the rollback snapshot"; status=1; }
+  fi
+  return "$status"
+}
+
+# Called indirectly by the restore EXIT trap.
+# shellcheck disable=SC2329
+restore_exit_cleanup() {
+  local exit_status=$?
+  trap - EXIT HUP INT TERM
+  trap '' HUP INT TERM
+  if [[ "${restore_mutation_started:-0}" == 1 && "${restore_completed:-0}" != 1 ]]; then
+    restore_rollback "$members" "$collisions" "$snapshot" "$had_target" \
+      "$rootless_graphroot" "$rootless_old_path" "$rootless_graphroot_had_old" "$rootless_graphroot_mutated" || RESTORE_ROLLBACK_FAILED=1
+    RESTORE_STACK_POLICY_SET=0
+    if [[ "$RESTORE_ROLLBACK_FAILED" == 0 ]]; then
+      run_backup_helper sync-destinations "$source" "$config_file" "${backup_roots[@]}" || RESTORE_ROLLBACK_FAILED=1
+    fi
+    if [[ "$RESTORE_ROLLBACK_FAILED" == 0 && "${restore_marker_created:-0}" == 1 ]]; then
+      run_elevated /usr/bin/python3 "$backup_archive_helper" restore-marker-clear || RESTORE_ROLLBACK_FAILED=1
+    fi
+  fi
+  [[ -z "${stage:-}" ]] || run_elevated /usr/bin/rm -rf -- "$stage"
+  if [[ "${RESTORE_ROLLBACK_FAILED:-0}" == 1 ]]; then
+    printf 'localaictl: warning: rollback was incomplete; previously active services remain stopped for manual recovery\n' >&2
+    [[ "$exit_status" != 0 ]] || exit 1
+    exit "$exit_status"
+  fi
+  if [[ "${RESTORE_SERVICES_STOPPED:-0}" == 1 ]]; then
+    restore_backup_service_state || exit 1
+  fi
+  exit "$exit_status"
+}
+
 usage() {
   cat <<'EOF'
-Usage: localaictl --version | [--dry-run] <bootstrap-admin|start|stop|restart|status [--json] [--elevated]|logs [backend|tls|all]|doctor>
+Usage: localaictl --version | [--dry-run] <bootstrap-admin|start|stop|restart|status [--json] [--elevated]|logs [backend|tls|all]|doctor|backup [--exclude-models] <dest>|restore [--yes] <src>>
 
 The command controls only the known LocalAI backend, TLS Compose service, and
 TLS forward socket. It does not accept arbitrary systemd or Podman commands.
+
+Backup stops active services temporarily and starts them again afterwards.
+Use `backup --exclude-models` to omit the configured models directory. Restore
+requires an empty target or `--yes` to confirm replacing configuration/state.
 
 doctor uses normal TLS verification. For the local Caddy CA, set
 LOCALAI_DOCTOR_CACERT=/path/to/root.crt. Use LOCALAI_DOCTOR_TOKEN only for a
@@ -499,6 +1497,19 @@ while [[ "$#" -gt 0 ]]; do
       fi
       exit $?
       ;;
+    __backup)
+      shift
+      backup_locked "$@"
+      exit $?
+      ;;
+    __restore)
+      shift
+      restore_confirmed=0
+      if [[ "${1:-}" == --yes ]]; then restore_confirmed=1; shift; fi
+      [[ "$#" == 1 ]] || die "internal restore requires one source archive"
+      restore_locked "$1"
+      exit $?
+      ;;
     bootstrap-admin)
       shift
       [[ "$#" == 0 ]] || die "bootstrap-admin accepts no arguments"
@@ -509,6 +1520,19 @@ while [[ "$#" -gt 0 ]]; do
       shift
       [[ "$#" == 0 ]] || die "start accepts no arguments"
       start_stack
+      exit $?
+      ;;
+    backup)
+      shift
+      backup "$@"
+      exit $?
+      ;;
+    restore)
+      shift
+      restore_confirmed=0
+      if [[ "${1:-}" == --yes ]]; then restore_confirmed=1; shift; fi
+      [[ "$#" == 1 ]] || die "restore accepts [--yes] and one source archive"
+      restore_archive "$1"
       exit $?
       ;;
     stop)

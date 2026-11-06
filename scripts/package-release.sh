@@ -43,6 +43,7 @@ manifest=(
   bin/localaictl
   config/localai.conf.example
   lib/config.sh
+  lib/backup_archive.py
   lib/acceptance.sh
   lib/bootstrap_guard.py
   lib/installer_safety.sh
@@ -92,9 +93,11 @@ manifest=(
   scripts/test-config.sh
   scripts/test-bootstrap-guard.sh
   scripts/test-locaictl.sh
+  scripts/test-backup-space.py
   scripts/test-installed-copy.sh
   scripts/test-render-config.sh
   scripts/test-tray-adapter.py
+  scripts/test-tray-install.sh
   scripts/test-uninstall-config.sh
   scripts/test-installer-safety.sh
   scripts/test-runtime-paths.sh
