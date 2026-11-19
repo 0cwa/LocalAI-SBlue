@@ -29,8 +29,11 @@ cd LocalAI-SBlue
 
    The installer saves the shared installed configuration at
    `/etc/localai/localai.conf`. Keep `LOCALAI_BIND_HOST=127.0.0.1` unless you
-   have a specific reason to expose the backend directly. Do not put passwords,
-   API keys, or private keys in this file.
+   have a specific reason to expose the backend directly. The private Podman
+   network publishes this address on the host, so use a numeric IPv4 or IPv6
+   address; hostnames such as `localhost` or DNS names are rejected before
+   elevation or stopping an existing service during install or upgrade. Do not
+   put passwords, API keys, or private keys in this file.
 3. Install the backend from the host:
 
    ```sh
@@ -160,6 +163,13 @@ connect. Set `LOCALAI_TLS_HOSTNAMES` and, when the public socket is enabled,
 cd localai-podman-compose
 ./install.sh
 ```
+
+The TLS installer prepares `/var/lib/localai-tls/.local` and
+`/var/lib/localai-tls/.local/share` for the TLS account's rootless Podman
+storage. If either path already exists as a nonempty root-owned directory,
+installation stops for manual review. Back up and inspect existing contents
+before correcting ownership; the installer does not recursively change
+ownership of existing data.
 
 To bind the backend's direct HTTP listener to loopback while serving clients
 through the proxy:
