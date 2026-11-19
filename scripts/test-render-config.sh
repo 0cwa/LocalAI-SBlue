@@ -118,7 +118,7 @@ else
   [[ "${#readable_check_paths[@]}" == 0 ]]
 fi
 
-mock_tls_unreadable_path="$static_cert_dir/legacy-leaf.key"
+mock_tls_unreadable_path="$(/usr/bin/realpath -e -- "$static_cert_dir/legacy-leaf.key")"
 if localai_tls_preflight_static_paths \
   "$static_cert_dir/fullchain.crt" "$static_cert_dir/legacy-leaf.key"; then
   printf 'expected TLS service unreadability to fail preflight\n' >&2
@@ -228,10 +228,53 @@ fi
 [[ "$LOCALAI_TLS_PUBLIC_HOST:$LOCALAI_TLS_PUBLIC_PORT" == localai.example.test:443 ]]
 [[ "$LOCALAI_TLS_INTERNAL_HOST:$LOCALAI_TLS_INTERNAL_PORT" == 127.0.0.1:8443 ]]
 
+# The installer streams exactly the staged bytes to Caddy before replacing
+# the live file, even when --no-pull uses an already cached image.
+# shellcheck disable=SC1090,SC2034,SC2329
+(
+  installer="$repo_root/localai-podman-compose/install.sh"
+  for function in caddy_site_addresses caddy_default_sni tls_chain_enabled tls_compose_mount_dirs write_caddyfile validate_caddyfile; do
+    source <(sed -n "/^$function() {\$/,/^}/p" "$installer")
+  done
+  tls_state_dir="$tmp_dir/caddy-validation"
+  tls_storage_dir="$tls_state_dir/storage" tls_config_dir="$tls_state_dir/config"
+  tls_cache_dir="$tls_state_dir/cache" tls_certs_dir="$tls_state_dir/certs" tls_app_home_dir="$tls_state_dir/home"
+  tls_fullchain_path='' tls_leaf_key_path='' tls_leaf_name=localai tls_chain_mode=off
+  tls_hostnames=localai.example.test tls_public_host=localai.example.test
+  tls_internal_host=127.0.0.1 tls_internal_port=8443 tls_backend_host=127.0.0.1 tls_backend_port=11455
+  tls_image_ref=docker.io/library/caddy:2-alpine tls_uid="$(id -u)" tls_user=fixture
+  source "$repo_root/lib/installer_safety.sh"
+  run_pull=0 image_status_fixture=0 validation_status=1
+  mkdir -p "$tls_config_dir"
+  printf '%s\n' '# Managed by LocalAI secureblue TLS installer.' 'existing config' >"$tls_config_dir/Caddyfile"
+  cp "$tls_config_dir/Caddyfile" "$tmp_dir/previous-Caddyfile"
+  localai_installer_mktemp_var() { printf -v "$1" '%s' "$tmp_dir/staged-Caddyfile"; }
+  run_as_tls() {
+    [[ "$*" == "/usr/bin/podman image exists $tls_image_ref" ]] || return 90
+    return "$image_status_fixture"
+  }
+  run_tls_unit() {
+    [[ "$*" == *'--pull=never --interactive'*' caddy validate --config - --adapter caddyfile' ]] || return 90
+    cat >"$tmp_dir/validated-Caddyfile"
+    return "$validation_status"
+  }
+  run0_pipe() { [[ "$1" == /usr/bin/install ]] && cp -- "${@: -2}"; }
+  log() { :; }
+  die() { printf '%s\n' "$*" >&2; exit 1; }
+  if (write_caddyfile) 2>"$tmp_dir/caddy-validation-error"; then exit 1; fi
+  rg -q 'leaving the existing Caddyfile in place' "$tmp_dir/caddy-validation-error"
+  cmp "$tmp_dir/previous-Caddyfile" "$tls_config_dir/Caddyfile"
+  cmp "$tmp_dir/staged-Caddyfile" "$tmp_dir/validated-Caddyfile"
+  image_status_fixture=125
+  if (write_caddyfile) 2>"$tmp_dir/caddy-validation-error"; then exit 1; fi
+  cmp "$tmp_dir/previous-Caddyfile" "$tls_config_dir/Caddyfile"
+  image_status_fixture=0 validation_status=0
+  write_caddyfile
+  cmp "$tmp_dir/validated-Caddyfile" "$tls_config_dir/Caddyfile"
+)
+
 # Static template checks protect the boot/readiness contract without invoking
 # systemd, Podman, SELinux, or a host installer in CI.
-rg -q '^Wants=network-online.target$' "$repo_root/localai-podman-compose/localai-tls-compose.service.in"
-rg -q '^After=network-online.target default.target$' "$repo_root/localai-podman-compose/localai-tls-compose.service.in"
 rg -q '^FreeBind=true$' "$repo_root/localai-podman-compose/localai-tls-forward.socket.in"
 rg -q '^Restart=on-failure$' "$repo_root/localai-podman-compose/localai-tls-forward.service.in"
 rg -q '^StartLimitBurst=5$' "$repo_root/localai-podman-compose/localai-tls-forward.service.in"
@@ -302,13 +345,14 @@ assert document["services"]["localai-tls"]["environment"]["HOME"] == sys.argv[8]
 PY
 fi
 
-# Render the same service unit template used by the installer and ensure
-# shutdown targets only the services defined in that compose file.
+# Render the installed unit and check socket activation and scoped shutdown.
 compose_file="$tmp_dir/localai-tls-compose.yaml"
 rendered_unit="$tmp_dir/localai-tls-compose.service"
 localai_tls_render_compose_service_template \
   "$repo_root/localai-podman-compose/localai-tls-compose.service.in" \
   955 "$state_dir" "$compose_file" localai-tls-test >"$rendered_unit"
+rg -q '^Wants=network-online.target podman.socket$' "$rendered_unit"
+rg -q '^After=network-online.target default.target podman.socket$' "$rendered_unit"
 rg -q -x -F "ExecStop=/usr/bin/podman compose -p localai-tls-test -f $compose_file down" "$rendered_unit"
 if rg -q -- '--remove-orphans' "$rendered_unit"; then
   printf 'Unexpected match in negative assertion\n' >&2

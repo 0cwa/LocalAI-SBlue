@@ -1,7 +1,7 @@
 [Unit]
 Description=LocalAI TLS reverse proxy compose stack
-Wants=network-online.target
-After=network-online.target default.target
+Wants=network-online.target podman.socket
+After=network-online.target default.target podman.socket
 
 [Service]
 Type=oneshot

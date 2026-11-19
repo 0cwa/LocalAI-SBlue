@@ -148,6 +148,7 @@ expect_reject system-state-root localai_installer_validate_managed_path /var/lib
 expect_reject non-localai-var-lib localai_installer_validate_managed_path /var/lib/containers/storage data
 expect_reject forbidden-var-lib-sibling localai_installer_validate_managed_path /var/lib/postgresql data
 expect_reject etc-descendant localai_installer_validate_managed_path /etc/ssl/private data
+expect_reject canonical-config-as-service-state localai_installer_validate_managed_path /etc/localai data
 expect_reject usr-descendant localai_installer_validate_managed_path /usr/lib/systemd data
 expect_reject proc-descendant localai_installer_validate_managed_path /proc/sys data
 expect_reject dev-descendant localai_installer_validate_managed_path /dev/dri data
@@ -216,11 +217,13 @@ assert_call_order "$repo_root/secureblue-localai-install/install.sh" \
 assert_call_order "$repo_root/secureblue-localai-install/install.sh" \
   stop_existing_managed_service remove_preflighted_existing_container ensure_container_userns
 assert_call_order "$repo_root/localai-podman-compose/install.sh" \
-  preflight_localai_backend_state ensure_user_manager ensure_container_userns
+  confirm_localai_rebind preflight_localai_backend_state ensure_user_manager
+assert_call_order "$repo_root/localai-podman-compose/install.sh" \
+  select_compose_file write_caddyfile write_compose_file
 assert_call_order "$repo_root/localai-podman-compose/install.sh" \
   pull_image label_container_state write_caddyfile
 assert_call_order "$repo_root/localai-podman-compose/install.sh" \
-  label_container_state write_caddyfile validate_caddyfile
+  label_container_state write_caddyfile rebind_localai_if_requested
 assert_call_order "$repo_root/secureblue-localai-install/uninstall.sh" \
   preflight_backend_state stop_service remove_container
 assert_call_order "$repo_root/secureblue-localai-install/uninstall.sh" \
@@ -257,6 +260,52 @@ expected_stop_argv=(
 for index in "${!expected_stop_argv[@]}"; do
   [[ "${actual_stop_argv[$index]}" == "${expected_stop_argv[$index]}" ]] || fail "generated ExecStop argv does not match the managed label filters"
 done
+
+printf 'TLS upgrade preserves a running backend and the legacy Compose definition\n'
+# The installer functions read fixture variables and call these stubs indirectly.
+# shellcheck disable=SC1090,SC2034,SC2329
+(
+  installer="$repo_root/localai-podman-compose/install.sh"
+  # shellcheck disable=SC1090
+  source <(sed -n '/^confirm_localai_rebind() {$/,/^}/p' "$installer")
+  # shellcheck disable=SC1090
+  source <(sed -n '/^rebind_localai_if_requested() {$/,/^}/p' "$installer")
+  tls_backend_port=11455 tls_public_host=localai.example.test tls_public_port=443
+  rebind_localai_loopback=1 tls_backend_host=127.0.0.1 LOCALAI_BIND_HOST=127.0.0.2
+  confirm() { return 1; }
+  confirm_localai_rebind 2>/dev/null
+  [[ "$rebind_localai_loopback" == 0 && "$tls_backend_host" == "$LOCALAI_BIND_HOST" ]]
+  rebind_localai_if_requested
+)
+# The installer functions read fixture variables and call these stubs indirectly.
+# shellcheck disable=SC1090,SC2034,SC2329
+(
+  source "$repo_root/lib/tls_compose_render.sh"
+  source <(sed -n '/^select_compose_file() {$/,/^}/p' "$repo_root/localai-podman-compose/install.sh")
+  yaml_quote() { localai_tls_compose_yaml_quote "$1"; }
+  log() { :; }
+  die() { printf '%s\n' "$*" >&2; exit 1; }
+  tls_state_dir="$scratch/upgrade-tls"
+  tls_compose_dir="$tls_state_dir/compose"
+  tls_compose_file_name=localai-tls-compose.yaml
+  tls_service_name=localai-tls-compose.service
+  tls_container_name=localai-tls tls_project_name=localai-tls tls_uid="$(id -u)"
+  unit="$tls_state_dir/.config/systemd/user/$tls_service_name"
+  legacy="$tls_compose_dir/$tls_compose_file_name"
+  mkdir -p "${unit%/*}" "$tls_compose_dir"
+  printf "services:\n  localai-tls:\n    container_name: 'localai-tls'\n" >"$legacy"
+  if (select_compose_file) 2>/dev/null; then fail "unreferenced definition was accepted"; fi
+  printf 'Description=LocalAI TLS reverse proxy compose stack\nExecStart=/usr/bin/podman compose -p localai-tls -f %s up -d\n' "$legacy" >"$unit"
+  select_compose_file
+  [[ "$tls_compose_file_name" == localai-tls-compose.managed.yaml ]]
+  [[ ! -e "$tls_compose_dir/$tls_compose_file_name" && -f "$legacy" ]]
+  printf 'unrelated\n' >"$tls_compose_dir/$tls_compose_file_name"
+  tls_compose_file_name=localai-tls-compose.yaml
+  if (select_compose_file) 2>/dev/null; then fail "an unrelated migration target was accepted"; fi
+  printf '%s\n' '# Managed by LocalAI secureblue TLS installer.' >"$tls_compose_dir/localai-tls-compose.managed.yaml"
+  select_compose_file
+  [[ "$tls_compose_file_name" == localai-tls-compose.managed.yaml ]]
+)
 
 printf 'SELinux rollback metadata parser checks\n'
 cat >"$metadata" <<'EOF'

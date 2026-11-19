@@ -86,10 +86,14 @@ LOCALAI_TLS_COMPOSE_FILE_NAME=../localai.yaml
 EOF
 expect_failure "$tmp_dir/bad-compose-name.conf"
 
+printf 'LOCALAI_TLS_LEAF_NAME=../leaf\n' >"$tmp_dir/bad-leaf-name.conf"
+expect_failure "$tmp_dir/bad-leaf-name.conf"
+
 cat >"$tmp_dir/good.conf" <<'EOF'
 LOCALAI_BIND_HOST=127.0.0.3
 LOCALAI_BIND_PORT=11456
 LOCALAI_TLS_ENABLED=false
+LOCALAI_TLS_LEAF_NAME=existing-leaf
 EOF
 cat >"$tmp_dir/second.conf" <<'EOF'
 LOCALAI_BIND_HOST=127.0.0.4
@@ -122,6 +126,7 @@ localai_config_load "$repo_root/config/localai.conf.example"
 [[ "$LOCALAI_AUTH" == true ]]
 [[ "$LOCALAI_REGISTRATION_MODE" == approval ]]
 [[ "$LOCALAI_TLS_CONFIG_DIR" == /var/lib/localai-tls/caddy ]]
+[[ "$LOCALAI_TLS_LEAF_NAME" == localai ]]
 
 localai_config_load "$tmp_dir/good.conf"
 # The subshell change is isolated deliberately.
@@ -131,6 +136,7 @@ localai_config_load "$tmp_dir/good.conf"
 # shellcheck disable=SC2153
 [[ "$LOCALAI_BIND_PORT" == 11456 ]]
 [[ "$LOCALAI_TLS_ENABLED" == false ]]
+[[ "$LOCALAI_TLS_LEAF_NAME" == existing-leaf ]]
 localai_config_load "$tmp_dir/second.conf"
 # The subshell change is isolated deliberately.
 # shellcheck disable=SC2031

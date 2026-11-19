@@ -33,6 +33,8 @@ LOCALAI_TLS_STATE_DIR=/var/lib/localai-tls
 LOCALAI_TLS_CONFIG_DIR=
 LOCALAI_TLS_CACHE_DIR=
 LOCALAI_TLS_CERT_DIR=
+# Set this to the existing key filename stem when migrating static TLS.
+# LOCALAI_TLS_LEAF_NAME=localai
 LOCALAI_TLS_COMPOSE_DIR=
 LOCALAI_TLS_COMPOSE_FILE_NAME=localai-tls-compose.yaml
 LOCALAI_TLS_COMPOSE_PROJECT_NAME=localai-tls

@@ -55,7 +55,6 @@ tls_backend_host="${LOCALAI_TLS_BACKEND_HOST:-}"
 tls_backend_port="${LOCALAI_TLS_BACKEND_PORT:-}"
 tls_image_ref="${LOCALAI_TLS_IMAGE_REF:-docker.io/library/caddy:2-alpine}"
 tls_container_name="${LOCALAI_TLS_CONTAINER_NAME:-localai-tls}"
-tls_leaf_name="${LOCALAI_TLS_LEAF_NAME:-localai}"
 tls_chain_mode="${LOCALAI_TLS_CHAIN_MODE:-auto}" # auto|always|off
 tls_fullchain_path="${LOCALAI_TLS_FULLCHAIN_PATH:-}"
 tls_leaf_key_path="${LOCALAI_TLS_LEAF_KEY_PATH:-}"
@@ -91,7 +90,7 @@ The installer changes host state in these areas:
 
 Options:
   -y, --yes                 Do not prompt for optional actions.
-  --no-pull                  Install config files but do not pull image.
+  --no-pull                  Use the cached Caddy image for validation and startup.
   --no-service               Generate files but do not install the compose unit.
   --no-start                 Install config but do not enable/start it.
   --no-public-socket         Do not install system socket proxy to :443.
@@ -109,6 +108,7 @@ Environment:
                               Default: localai-tls-compose.yaml
   LOCALAI_TLS_CHAIN_MODE       auto|always|off (default: auto)
   LOCALAI_TLS_FULLCHAIN_PATH   Fullchain cert path (default: $LOCALAI_TLS_CERT_DIR/fullchain.crt)
+  LOCALAI_TLS_LEAF_NAME        Key filename stem (default: localai)
   LOCALAI_TLS_LEAF_KEY_PATH    Leaf private key path (default: $LOCALAI_TLS_CERT_DIR/$LOCALAI_TLS_LEAF_NAME.key)
   LOCALAI_TLS_SERVICE_NAME     Default: localai-tls-compose.service
   LOCALAI_TLS_COMPOSE_PROJECT_NAME
@@ -182,7 +182,6 @@ validate_names() {
   validate_abs_path "$tls_compose_dir" "LOCALAI_TLS_COMPOSE_DIR"
   validate_abs_path "$tls_app_home_dir" "TLS application home"
   validate_abs_path "$tls_storage_dir" "Caddy storage directory"
-  [[ "$tls_leaf_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "LOCALAI_TLS_LEAF_NAME must be a filename stem."
   [[ "$tls_chain_mode" == auto || "$tls_chain_mode" == always || "$tls_chain_mode" == off ]] || die "LOCALAI_TLS_CHAIN_MODE must be auto, always, or off."
   local cert_path hostname
   for cert_path in "$tls_fullchain_path" "$tls_leaf_key_path"; do
@@ -246,7 +245,7 @@ elevate_once() {
     LOCALAI_TLS_COMPOSE_DIR LOCALAI_TLS_COMPOSE_FILE_NAME LOCALAI_TLS_COMPOSE_PROJECT_NAME \
     LOCALAI_TLS_LEGACY_SERVICE_NAME \
     LOCALAI_TLS_CHAIN_MODE LOCALAI_TLS_FULLCHAIN_PATH LOCALAI_TLS_LEAF_KEY_PATH \
-    LOCALAI_TLS_LEAF_NAME LOCALAI_TLS_BACKEND_HOST LOCALAI_TLS_BACKEND_PORT \
+    LOCALAI_TLS_BACKEND_HOST LOCALAI_TLS_BACKEND_PORT \
     LOCALAI_TLS_SELINUX_PORT_TYPE LOCALAI_TLS_LEGACY_SELINUX_MODULE \
     LOCALAI_TLS_BIND_SELINUX_MODULE LOCALAI_TLS_SUBID_MIN LOCALAI_TLS_SUBID_COUNT; do
     if value="$(printenv "$key" 2>/dev/null)"; then config_env+=("$key=$value"); fi
@@ -286,6 +285,7 @@ load_localai_lock() {
   localai_state_dir="$LOCALAI_STATE_DIR"
   tls_user="$LOCALAI_TLS_USER"
   tls_state_dir="$LOCALAI_TLS_STATE_DIR"
+  tls_leaf_name="$LOCALAI_TLS_LEAF_NAME"
   tls_app_home_dir="$tls_state_dir/app-home"
   tls_storage_dir="$tls_state_dir/caddy"
   tls_config_dir="${LOCALAI_TLS_CONFIG_DIR:-$tls_state_dir/caddy}"
@@ -702,7 +702,6 @@ localai_tls_preflight_static_paths() {
 write_caddyfile() {
   local tmp_caddyfile site_addresses default_sni chain_full chain_key
   local tls_directive preflight_status
-  tls_static_chain_active=0
   site_addresses="$(caddy_site_addresses)"
   default_sni="$(caddy_default_sni)"
   [[ -n "$site_addresses" ]] || die "No TLS site names were generated."
@@ -741,7 +740,6 @@ write_caddyfile() {
         *) die "Static TLS files failed preflight; refusing to install the Caddyfile." ;;
       esac
     fi
-    tls_static_chain_active=1
     tls_directive="    tls ${chain_full} ${chain_key}"
     log "Using static chain mode for Caddyfile (tls ${chain_full} ...)"
   else
@@ -778,32 +776,39 @@ write_caddyfile() {
     printf '}\n'
   } >>"$tmp_caddyfile"
 
-  log "Installing Caddyfile at $tls_config_dir/Caddyfile"
   localai_installer_check_managed_file "$tls_config_dir/Caddyfile" "Caddyfile" "$tls_uid" \
     '# Managed by LocalAI secureblue TLS installer.' "    storage file_system $tls_storage_dir" || die "Refusing to replace an unrelated Caddyfile."
+  validate_caddyfile "$tmp_caddyfile" || die "Caddyfile validation failed; leaving the existing Caddyfile in place."
+  log "Installing Caddyfile at $tls_config_dir/Caddyfile"
   run0_pipe /usr/bin/install -o "$tls_user" -g "$tls_user" -m 0644 "$tmp_caddyfile" "$tls_config_dir/Caddyfile"
 }
 
 validate_caddyfile() {
-  if [[ "$run_pull" != "1" && "$tls_static_chain_active" != "1" ]]; then
-    log "Skipping Caddyfile validation because --no-pull was requested and no static chain is configured."
-    return 0
+  local candidate="$1" image_status=0 mount_dir
+  if [[ "$run_pull" == 0 ]]; then
+    run_as_tls /usr/bin/podman image exists "$tls_image_ref" || image_status=$?
+    if [[ "$image_status" == 1 ]]; then
+      log "Staging Caddyfile without validation because the Caddy image is not cached. Start is a separate operation."
+      return 0
+    fi
+    if [[ "$image_status" != 0 ]]; then
+      log "Caddy image is unavailable for validation. Install the image or rerun without --no-pull."
+      return 1
+    fi
   fi
 
   log "Validating Caddyfile in Caddy container"
-  local -a volume_args=() pull_args=()
-  [[ "$run_pull" == "1" ]] || pull_args+=(--pull=never)
-  local mount_dir
+  local -a volume_args=()
   while IFS= read -r mount_dir; do
     [[ -n "$mount_dir" ]] && volume_args+=(--volume "$mount_dir:$mount_dir")
   done < <(tls_compose_mount_dirs)
-  run_tls_unit /usr/bin/podman run --rm "${pull_args[@]}" \
+  /usr/bin/cat -- "$candidate" | run_tls_unit /usr/bin/podman run --rm --pull=never --interactive \
     --userns=keep-id \
     --security-opt=no-new-privileges \
     --network=none \
     "${volume_args[@]}" \
     "$tls_image_ref" \
-    caddy validate --config "$tls_config_dir/Caddyfile"
+    caddy validate --config - --adapter caddyfile
 }
 
 require_compose() {
@@ -830,6 +835,29 @@ tls_compose_mount_dirs() {
     "$tls_app_home_dir"
 }
 
+select_compose_file() {
+  local path="$tls_compose_dir/$tls_compose_file_name"
+  local unit="$tls_state_dir/.config/systemd/user/$tls_service_name"
+  local marker='# Managed by LocalAI secureblue TLS installer.'
+  if localai_installer_check_managed_file "$path" "TLS compose definition" "$tls_uid" "$marker" 2>/dev/null; then
+    return 0
+  fi
+
+  # Legacy generated definitions lacked the marker. Only migrate one the
+  # installed LocalAI unit already references, and leave its contents in place.
+  localai_installer_check_managed_file "$path" "legacy TLS compose definition" "$tls_uid" "$marker" \
+    "    container_name: $(yaml_quote "$tls_container_name")" || die "Refusing to replace an unrelated Compose definition."
+  localai_installer_check_managed_file "$unit" "TLS user unit" "$tls_uid" "$marker" \
+    'Description=LocalAI TLS reverse proxy compose stack' || die "Cannot confirm ownership of the legacy Compose definition."
+  if ! /usr/bin/grep -Fxq -- "ExecStart=/usr/bin/podman compose -p $tls_project_name -f $path up -d" "$unit"; then
+    die "The installed TLS unit does not reference the legacy Compose definition at $path. Choose a new LOCALAI_TLS_COMPOSE_FILE_NAME."
+  fi
+  tls_compose_file_name="${tls_compose_file_name%.*}.managed.yaml"
+  localai_installer_check_managed_file "$tls_compose_dir/$tls_compose_file_name" \
+    "new TLS compose definition" "$tls_uid" "$marker" || die "Refusing to overwrite the migration destination."
+  log "Keeping the legacy Compose definition at $path and installing $tls_compose_file_name alongside it"
+}
+
 write_compose_file() {
   local tmp_compose
   localai_installer_mktemp_var tmp_compose localai-tls-compose.XXXXXX.yaml || die "Could not create a private Compose file temporary."
@@ -844,7 +872,7 @@ write_compose_file() {
 
   log "Installing compose definition at $tls_compose_dir/$tls_compose_file_name"
   localai_installer_check_managed_file "$tls_compose_dir/$tls_compose_file_name" "TLS compose definition" "$tls_uid" \
-    '# Managed by LocalAI secureblue TLS installer.' "container_name: $(yaml_quote "$tls_container_name")" || die "Refusing to replace an unrelated Compose definition."
+    '# Managed by LocalAI secureblue TLS installer.' || die "Refusing to replace an unrelated Compose definition."
   run0_pipe /usr/bin/install -o "$tls_user" -g "$tls_user" -m 0644 "$tmp_compose" "$tls_compose_dir/$tls_compose_file_name"
 }
 
@@ -1154,7 +1182,7 @@ retire_legacy_direct_tls_service() {
   run0_pipe /usr/bin/rm -f "$legacy_unit"
 }
 
-rebind_localai_if_requested() {
+confirm_localai_rebind() {
   [[ "$rebind_localai_loopback" == "1" ]] || return 0
 
   cat >&2 <<EOF
@@ -1163,8 +1191,14 @@ This will regenerate the LocalAI service so its plain HTTP backend binds only
 to 127.0.0.1:$tls_backend_port. HTTPS remains exposed on
 $tls_public_host:$tls_public_port.
 EOF
-  confirm "Rebind LocalAI's HTTP backend to loopback now?" || return 0
+  if ! confirm "Rebind LocalAI's HTTP backend to loopback now?"; then
+    rebind_localai_loopback=0
+    tls_backend_host="${LOCALAI_TLS_BACKEND_HOST:-$LOCALAI_BIND_HOST}"
+  fi
+}
 
+rebind_localai_if_requested() {
+  [[ "$rebind_localai_loopback" == 1 ]] || return 0
   log "Regenerating LocalAI service with loopback backend bind"
   LOCALAI_BIND_HOST=127.0.0.1 \
     LOCALAI_BIND_PORT="$tls_backend_port" \
@@ -1253,28 +1287,29 @@ localai_installer_prepare_config "$canonical_config" "$LOCALAI_INSTALLER_CONFIG_
 localai_installer_persist_environment_overrides "$canonical_config" || die "Could not safely persist explicit configuration overrides."
 load_localai_lock
 require_cmd run0
+confirm_localai_rebind
 validate_names
 ensure_tls_user
 preflight_user_systemd_parent
 guard_tls_manager_start
 ensure_subids
 install_dirs
+select_compose_file
 install_container_policy
 existing_localai_service_unit=0
 preflight_localai_backend_state
 ensure_user_manager
 ensure_container_userns
-rebind_localai_if_requested
 pull_image
 label_container_state
 write_caddyfile
-validate_caddyfile
 write_compose_file
 write_compose_service
 retire_forward_units /etc/systemd/system
 write_forward_units
 label_forward_selinux_ports
 install_forward_bind_selinux_policy
+rebind_localai_if_requested
 persist_tls_lifecycle_config
 retire_legacy_direct_tls_service
 preserve_linked_service_states
