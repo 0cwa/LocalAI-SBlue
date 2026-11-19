@@ -52,4 +52,4 @@ fi
 printf 'Installed LocalAI tray launcher.\n'
 printf 'Application entry: %s\n' "$desktop_path"
 printf 'Binary: %s\n' "$bin_path"
-printf 'Launch it from the application launcher, or run: %s --start\n' "$bin_path"
+printf 'Launch it from the application launcher, or run: %s\n' "$bin_path"

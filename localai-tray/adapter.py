@@ -55,7 +55,7 @@ def command_args(action: str) -> list[str]:
     allowed = {"start", "stop", "restart", "status", "doctor"}
     if action not in allowed:
         raise ValueError(f"unsupported LocalAI action: {action}")
-    return ["status", "--json"] if action == "status" else [action]
+    return ["status", "--json", "--health"] if action == "status" else [action]
 
 
 def parse_status(payload: str) -> dict[str, object]:
@@ -73,6 +73,12 @@ def parse_status(payload: str) -> dict[str, object]:
         raise ValueError("invalid LocalAI TLS state")
     result["tls_enabled"] = value["tls_enabled"]
     result["endpoint"] = endpoint(value)
+    for key in ("backend_health", "endpoint_health"):
+        if key in value:
+            state = value[key]
+            if not isinstance(state, str) or state not in {"ready", "untrusted", "not_ready", "unreachable"}:
+                raise ValueError("invalid LocalAI readiness state")
+            result[key] = state
     return result
 
 
@@ -82,6 +88,19 @@ def stack_healthy(status: dict[str, object]) -> bool:
     if status.get("tls_enabled") is not True:
         return True
     return status.get("tls_compose") == "active" and status.get("https_socket") in {"active", "disabled"}
+
+
+def stack_reachable(status: dict[str, object]) -> bool:
+    return status.get("endpoint_health") in {"ready", "untrusted"} or stack_healthy(status)
+
+
+def display_health(value: object) -> str:
+    return {
+        "ready": "ready",
+        "not_ready": "not ready",
+        "unreachable": "unreachable",
+        "untrusted": "certificate untrusted",
+    }.get(str(value), "unknown")
 
 
 def display_state(value: object) -> str:
@@ -151,7 +170,7 @@ def parse_start_requested(argv: list[str]) -> bool:
 
 
 def should_start_after_status(start_requested: bool, status: dict[str, object] | None) -> bool:
-    return start_requested and status is not None and not stack_healthy(status)
+    return start_requested and status is not None and not stack_reachable(status)
 
 
 def menu_entries(actions: dict[str, object]) -> tuple[object | None, ...]:

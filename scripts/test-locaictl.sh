@@ -64,6 +64,11 @@ while [[ "$#" -gt 0 ]]; do
     *) break ;;
   esac
 done
+if [[ "${1:-}" == /usr/bin/bash && "${2:-}" == -c && "${4:-}" == localaictl-lifecycle ]]; then
+  script="$3"
+  shift 5
+  exec /usr/bin/bash -c "$script" localaictl-lifecycle "${LOCALAI_FAKE_CONTROL_PYTHON:?}" "$@"
+fi
 if [[ "${1:-}" == /usr/bin/flock ]]; then
   shift
   while [[ "$#" -gt 0 ]]; do
@@ -188,10 +193,24 @@ fi
 exec "$@"
 EOF
 chmod 0755 "$tmp_dir/run0"
+cat >"$tmp_dir/control-python" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$1" == /etc/localai/bootstrap-guard.py ]]; then exit 0; fi
+[[ "$1" == "$LOCALAI_FAKE_BACKUP_HELPER" && "$2" == restore-marker-check && ! -e "$LOCALAI_FAKE_TRANSACTION_MARKER" ]]
+EOF
+chmod 0755 "$tmp_dir/control-python"
+export LOCALAI_FAKE_CONTROL_PYTHON="$tmp_dir/control-python"
+
 
 cat >"$tmp_dir/systemctl" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+# Normalize the option terminator in fixture commands before matching unit names.
+args=()
+for arg; do
+  [[ "$arg" == -- ]] || args+=("$arg")
+done
+set -- "${args[@]}"
 printf 'systemctl' >>"${LOCALAI_FAKE_LOG:?}"
 printf ' %s' "$@" >>"${LOCALAI_FAKE_LOG:?}"
 printf '\n' >>"${LOCALAI_FAKE_LOG:?}"
@@ -275,6 +294,9 @@ cat >"$tmp_dir/curl" <<'EOF'
 set -euo pipefail
 printf '%s\n' "$@" >"${LOCALAI_CURL_ARGS_FILE:?}"
 cat >"${LOCALAI_CURL_STDIN_FILE:?}"
+if [[ "${*: -1}" == https://* && "${LOCALAI_FAKE_TLS_UNTRUSTED:-false}" == true && " $* " != *" --cacert "* ]]; then
+  exit 60
+fi
 printf '200\n'
 EOF
 chmod 0755 "$tmp_dir/curl"
@@ -461,7 +483,7 @@ if [[ -s "$tmp_dir/commands" ]]; then
   printf 'Unexpected match in negative assertion\n' >&2
   exit 1
 fi
-rg -q 'backend_systemctl' "$tmp_dir/dry-run"
+rg -q 'localaictl-lifecycle' "$tmp_dir/dry-run"
 
 "$repo_root/bin/localaictl" status --json >"$tmp_dir/status"
 [[ "$(<"$tmp_dir/status")" == '{"backend":"active","tls_compose":"active","https_socket":"active","tls_enabled":true,"endpoint":"https://localhost"}' ]]
@@ -560,8 +582,10 @@ export LOCALAI_CONFIG_FILE="$tmp_dir/legacy-config"
 rg -q '"tls_enabled":true' "$tmp_dir/legacy-tls-status"
 rg -q '"endpoint":"https://localhost"' "$tmp_dir/legacy-tls-status"
 
+: >"$tmp_dir/commands"
 "$repo_root/bin/localaictl" start
 "$repo_root/bin/localaictl" stop
+[[ "$(rg -c '^run0 -i /usr/bin/bash -c ' "$tmp_dir/commands")" == 2 ]]
 [[ -s "$tmp_dir/audit/$(date +%Y-%m-%d).jsonl" ]]
 rg -q '"config_hash":"' "$tmp_dir/audit/$(date +%Y-%m-%d).jsonl"
 
@@ -569,9 +593,9 @@ start_line="$(rg -n -- 'start localai.service' "$tmp_dir/commands" | head -n1 | 
 tls_line="$(rg -n -- 'start localai-tls-compose.service' "$tmp_dir/commands" | head -n1 | cut -d: -f1)"
 socket_line="$(rg -n -- 'start localai-tls-forward.socket' "$tmp_dir/commands" | head -n1 | cut -d: -f1)"
 (( start_line < tls_line && tls_line < socket_line ))
-rg -q -F "run0 -i $tmp_dir/systemctl --no-ask-password --user --machine=localai@.host start localai.service" "$tmp_dir/commands"
-rg -q -F "run0 -i $tmp_dir/systemctl --no-ask-password --user --machine=localai-tls@.host start localai-tls-compose.service" "$tmp_dir/commands"
-rg -q -F "run0 -i $tmp_dir/systemctl --no-ask-password start localai-tls-forward.socket localai-tls-forward.service" "$tmp_dir/commands"
+rg -q -F 'systemctl --no-ask-password --user --machine=localai@.host start localai.service' "$tmp_dir/commands"
+rg -q -F 'systemctl --no-ask-password --user --machine=localai-tls@.host start localai-tls-compose.service' "$tmp_dir/commands"
+rg -q -F 'systemctl --no-ask-password start localai-tls-forward.socket localai-tls-forward.service' "$tmp_dir/commands"
 if rg -q -F 'run0 --pipe --user=localai' "$tmp_dir/commands"; then
   printf 'Unexpected match in negative assertion\n' >&2
   exit 1
@@ -2285,5 +2309,28 @@ backend_start_line="$(rg -n ' start localai.service$' "$tmp_dir/commands" | tail
 tls_start_line="$(rg -n ' start localai-tls-compose.service$' "$tmp_dir/commands" | tail -n1 | cut -d: -f1)"
 socket_start_line="$(rg -n ' start localai-tls-forward.socket' "$tmp_dir/commands" | tail -n1 | cut -d: -f1)"
 (( backend_start_line < tls_start_line && tls_start_line < socket_start_line ))
+
+cat >"$tmp_dir/health-config" <<'EOF'
+LOCALAI_TLS_ENABLED=true
+LOCALAI_TLS_PUBLIC_SOCKET=true
+LOCALAI_TLS_PUBLIC_HOST=192.0.2.8
+LOCALAI_TLS_HOSTNAMES=localai.example.test
+EOF
+: >"$tmp_dir/root.crt"
+: >"$tmp_dir/commands"
+(
+  export LOCALAI_CONFIG_FILE="$tmp_dir/health-config" LOCALAI_FAKE_BACKEND_UNAVAILABLE=true
+  export LOCALAI_CURL_BIN="$tmp_dir/curl" LOCALAI_CURL_ARGS_FILE="$tmp_dir/curl-args"
+  export LOCALAI_CURL_STDIN_FILE="$tmp_dir/curl-stdin" LOCALAI_FAKE_TLS_UNTRUSTED=true
+  "$repo_root/bin/localaictl" status --json --health >"$tmp_dir/health-status" || [[ "$?" == 1 ]]
+  rg -q '"backend":"unknown".*"endpoint":"https://localai.example.test".*"backend_health":"ready","endpoint_health":"untrusted"' "$tmp_dir/health-status"
+  LOCALAI_STATUS_CACERT="$tmp_dir/root.crt" "$repo_root/bin/localaictl" status --json --health >"$tmp_dir/health-status" || [[ "$?" == 1 ]]
+  rg -q '"endpoint_health":"ready"' "$tmp_dir/health-status"
+  rg -q -F -x 'https://localai.example.test/readyz' "$tmp_dir/curl-args"
+  if rg -q -- '--insecure' "$tmp_dir/curl-args" || rg -q '^run0 ' "$tmp_dir/commands"; then
+    printf 'readiness unexpectedly bypassed certificate verification or requested elevation\n' >&2
+    exit 1
+  fi
+)
 
 printf 'localaictl tests passed\n'

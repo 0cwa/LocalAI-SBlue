@@ -263,9 +263,12 @@ controls. Endpoint values containing user information, query strings,
 fragments, or paths are rejected before display or copying. **Run endpoint
 health check** reports whether the endpoint answered, requires authentication,
 or was unreachable. The tray reads shared configuration through `localaictl`
-each time it checks status; polling never requests elevation. If a manager
-state is unavailable, the tray suggests `localaictl status --elevated` in a
-terminal. Backend and TLS log actions require confirmation first and then open
+each time it checks status. The Applications launcher opens in monitoring mode,
+and readiness checks do not request elevation. Explicit start and stop each use
+one elevation after first-administrator setup. For a private TLS CA, set
+`LOCALAI_STATUS_CACERT` or place the public CA certificate at
+`~/.local/share/localai-tray/ca.crt`. If a manager state is unavailable, the tray
+suggests `localaictl status --elevated` in a terminal. Backend and TLS log actions require confirmation first and then open
 the logs in a terminal; logs may contain secrets and must be reviewed and
 sanitized before sharing. The terminal stays open after the log command exits
 until you press Enter, so the output remains available to review. Remove the

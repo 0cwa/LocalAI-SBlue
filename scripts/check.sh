@@ -53,9 +53,9 @@ if command -v desktop-file-validate >/dev/null 2>&1; then
   desktop-file-validate "$desktop_entry_tmp"
 else
   printf 'desktop-file-validate not installed; checking required desktop keys.\n'
-  rg -q '^Exec=@EXEC@ --start$' localai-tray/localai-tray.desktop.in
   rg -q '^Icon=localai$' localai-tray/localai-tray.desktop.in
 fi
+rg -q '^Exec=@EXEC@$' localai-tray/localai-tray.desktop.in
 
 printf 'SVG parse localai-tray/localai.svg\n'
 python3 -c 'import xml.etree.ElementTree as ET; ET.parse("localai-tray/localai.svg")'

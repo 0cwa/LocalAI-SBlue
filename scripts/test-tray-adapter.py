@@ -11,7 +11,7 @@ assert spec and spec.loader
 adapter = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(adapter)
 
-assert adapter.command_args("status") == ["status", "--json"]
+assert adapter.command_args("status") == ["status", "--json", "--health"]
 assert adapter.command_args("start") == ["start"]
 assert adapter.command_args("doctor") == ["doctor"]
 try:
@@ -35,6 +35,10 @@ assert adapter.endpoint(plain).startswith("http://")
 
 unavailable = adapter.parse_status('{"backend":"unknown","tls_compose":"unknown","https_socket":"unknown","tls_enabled":true,"endpoint":"https://localhost"}')
 assert not adapter.stack_healthy(unavailable)
+assert not adapter.stack_reachable(unavailable)
+assert adapter.stack_reachable({**unavailable, "endpoint_health": "ready"})
+assert adapter.stack_reachable({**unavailable, "endpoint_health": "untrusted"})
+assert adapter.display_health("untrusted") == "certificate untrusted"
 assert adapter.display_state(unavailable["backend"]) == "unavailable"
 assert adapter.has_unavailable_manager(unavailable)
 assert not adapter.has_unavailable_manager(plain)

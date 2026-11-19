@@ -529,36 +529,71 @@ run_or_dry() {
   fi
 }
 
-start_stack() {
-  local result=success actions="backend-start"
-  if [[ "$dry_run" != 1 ]]; then
-    run_elevated /usr/bin/python3 "$backup_archive_helper" restore-marker-check || die "a previous backup restore is incomplete; managed services remain blocked pending recovery"
-  fi
-  if [[ "$dry_run" != 1 ]] && { [[ "$LOCALAI_AUTH" != true ]] || ! run_elevated /usr/bin/python3 /etc/localai/bootstrap-guard.py "$LOCALAI_DATA_PATH/database.db" >/dev/null 2>&1; }; then
-    bootstrap_admin
-    return $?
-  fi
-  if ! run_or_dry backend_systemctl start localai.service; then
-    log "start: backend failed; inspect with 'localaictl logs backend'"
-    audit start failure "$actions"
-    return 1
-  fi
+control_stack() {
+  local action="$1" result=success tls_user="" socket_unit="" actions rc=0
   if tls_enabled; then
-    actions+=",tls-start"
-    if ! run_or_dry tls_systemctl start "$LOCALAI_TLS_SERVICE_NAME"; then
-      log "start: TLS Compose service failed; inspect with 'localaictl logs tls'"
-      audit start failure "$actions"
-      return 1
-    fi
-    if [[ "$LOCALAI_TLS_PUBLIC_SOCKET" == true ]]; then
-      actions+=",socket-start"
-      if ! run_or_dry root_systemctl start "$LOCALAI_TLS_FORWARD_SOCKET_NAME" "$LOCALAI_TLS_FORWARD_SERVICE_NAME"; then
-        log "start: HTTPS socket failed; inspect systemd status and TLS logs"
-        result=failure
+    tls_user="$LOCALAI_TLS_USER"
+    [[ "$LOCALAI_TLS_PUBLIC_SOCKET" != true ]] || socket_unit="$LOCALAI_TLS_FORWARD_SOCKET_NAME"
+  fi
+  if [[ "$action" == start ]]; then
+    actions="backend-start"
+    [[ -z "$tls_user" ]] || actions+=,tls-start
+    [[ -z "$socket_unit" ]] || actions+=,socket-start
+  else
+    actions="backend-stop"
+    [[ -z "$tls_user" ]] || actions="tls-stop,$actions"
+    [[ -z "$socket_unit" ]] || actions="socket-stop,$actions"
+  fi
+
+  # Authenticate once. The elevated shell runs only the fixed service actions
+  # below and receives unit names as arguments, never as shell source.
+  # shellcheck disable=SC2016
+  if run_or_dry run_elevated /usr/bin/bash -c '
+    python_bin=$1 backup_helper=$2 auth=$3 database=$4 systemctl_bin=$5
+    action=$6 backend_user=$7 tls_user=$8 tls_unit=$9 socket_unit=${10} forward_unit=${11}
+    if [[ "$action" == start ]]; then
+      "$python_bin" "$backup_helper" restore-marker-check || exit 72
+      if [[ "$auth" != true ]] || ! "$python_bin" /etc/localai/bootstrap-guard.py "$database" >/dev/null 2>&1; then
+        exit 73
       fi
     fi
+    result=0
+    apply() {
+      local component=$1; shift
+      if ! "$systemctl_bin" --no-ask-password "$@"; then
+        printf "%s: %s failed\n" "$action" "$component" >&2
+        result=1
+      fi
+    }
+    backend() { apply backend --user --machine="$backend_user@.host" "$action" -- localai.service; }
+    tls() {
+      if [[ -n "$tls_user" ]]; then apply "TLS Compose service" --user --machine="$tls_user@.host" "$action" -- "$tls_unit"; fi
+    }
+    socket() {
+      if [[ -n "$socket_unit" ]]; then apply "HTTPS forwarding" "$action" -- "$socket_unit" "$forward_unit"; fi
+    }
+    if [[ "$action" == start ]]; then
+      backend; (( result == 0 )) || exit "$result"
+      tls; (( result == 0 )) || exit "$result"
+      socket
+    else
+      socket; tls; backend
+    fi
+    exit "$result"
+  ' localaictl-lifecycle /usr/bin/python3 "$backup_archive_helper" "$LOCALAI_AUTH" "$LOCALAI_DATA_PATH/database.db" \
+    "$systemctl_bin" "$action" "$LOCALAI_SERVICE_USER" "$tls_user" "$LOCALAI_TLS_SERVICE_NAME" "$socket_unit" "$LOCALAI_TLS_FORWARD_SERVICE_NAME"; then
+    :
+  else
+    rc=$?
+    if [[ "$action" == start ]]; then
+      case "$rc" in
+        72) die "a previous backup restore is incomplete; managed services remain blocked pending recovery" ;;
+        73) bootstrap_admin; return $? ;;
+      esac
+    fi
+    result=failure
   fi
-  audit start "$result" "$actions"
+  audit "$action" "$result" "$actions"
   [[ "$result" == success ]]
 }
 
@@ -681,51 +716,10 @@ bootstrap_admin() {
   log "Open the local backend in your browser and register the intended first administrator."
 }
 
-stop_stack() {
-  local result=success actions="backend-stop"
-  if tls_enabled && [[ "$LOCALAI_TLS_PUBLIC_SOCKET" == true ]]; then
-    actions="socket-stop,tls-stop,backend-stop"
-    if ! run_or_dry root_systemctl stop "$LOCALAI_TLS_FORWARD_SOCKET_NAME" "$LOCALAI_TLS_FORWARD_SERVICE_NAME"; then
-      log "stop: HTTPS socket failed to stop"
-      result=failure
-    fi
-  fi
-  if tls_enabled; then
-    [[ "$actions" == backend-stop ]] && actions="tls-stop,backend-stop"
-    if ! run_or_dry tls_systemctl stop "$LOCALAI_TLS_SERVICE_NAME"; then
-      log "stop: TLS Compose service failed to stop"
-      result=failure
-    fi
-  fi
-  if ! run_or_dry backend_systemctl stop localai.service; then
-    log "stop: backend failed to stop"
-    result=failure
-  fi
-  audit stop "$result" "$actions"
-  [[ "$result" == success ]]
-}
-
 status_json=0
-endpoint_url() {
-  local scheme host port default_port
-  if tls_enabled; then
-    if [[ "$LOCALAI_TLS_PUBLIC_SOCKET" == true ]]; then
-      scheme=https
-      host="$LOCALAI_TLS_PUBLIC_HOST"
-      port="$LOCALAI_TLS_PUBLIC_PORT"
-      default_port=443
-    else
-      scheme=https
-      host="$LOCALAI_TLS_INTERNAL_HOST"
-      port="$LOCALAI_TLS_INTERNAL_PORT"
-      default_port=443
-    fi
-  else
-    scheme=http
-    host="$LOCALAI_BIND_HOST"
-    port="$LOCALAI_BIND_PORT"
-    default_port=80
-  fi
+status_health=0
+format_url() {
+  local scheme="$1" host="$2" port="$3" default_port="$4"
   if [[ "$host" == *:* && "$host" != \[*\] ]]; then host="[$host]"; fi
   if [[ "$port" == "$default_port" ]]; then
     printf '%s://%s\n' "$scheme" "$host"
@@ -734,8 +728,42 @@ endpoint_url() {
   fi
 }
 
+backend_url() { format_url http "$LOCALAI_BIND_HOST" "$LOCALAI_BIND_PORT" 80; }
+
+endpoint_url() {
+  local host port tls_name
+  if tls_enabled; then
+    if [[ "$LOCALAI_TLS_PUBLIC_SOCKET" == true ]]; then
+      host="$LOCALAI_TLS_PUBLIC_HOST"
+      port="$LOCALAI_TLS_PUBLIC_PORT"
+      tls_name="${LOCALAI_TLS_HOSTNAMES%%,*}"
+      if [[ -n "${LOCALAI_CONFIG_SEEN[LOCALAI_TLS_HOSTNAMES]+x}" && "$tls_name" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]]; then
+        host="$tls_name"
+      fi
+    else
+      host="$LOCALAI_TLS_INTERNAL_HOST"
+      port="$LOCALAI_TLS_INTERNAL_PORT"
+    fi
+    format_url https "$host" "$port" 443
+  else
+    backend_url
+  fi
+}
+
+readiness() {
+  local url="$1" http_code curl_status cacert="${LOCALAI_STATUS_CACERT:-$script_dir/ca.crt}"
+  local -a args=(--noproxy '*' --silent --max-time 2 --output /dev/null --write-out '%{http_code}')
+  if [[ "$url" == https://* && -f "$cacert" ]]; then args+=(--cacert "$cacert"); fi
+  if http_code="$("$curl_bin" -q "${args[@]}" "$url/readyz" </dev/null 2>/dev/null)"; then
+    if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then printf 'ready\n'; else printf 'not_ready\n'; fi
+  else
+    curl_status=$?
+    if [[ "$curl_status" == 60 ]]; then printf 'untrusted\n'; else printf 'unreachable\n'; fi
+  fi
+}
+
 status() {
-  local backend tls socket endpoint tls_configured
+  local backend tls socket endpoint tls_configured backend_health endpoint_health health_json=""
   backend="$(backend_state)"
   tls="disabled"
   socket="disabled"
@@ -746,6 +774,12 @@ status() {
   endpoint="$(endpoint_url)"
   tls_configured=false
   tls_enabled && tls_configured=true
+  if [[ "$status_health" == 1 ]]; then
+    backend_health="$(readiness "$(backend_url)")"
+    endpoint_health="$backend_health"
+    [[ "$tls_configured" == false ]] || endpoint_health="$(readiness "$endpoint")"
+    printf -v health_json ',"backend_health":"%s","endpoint_health":"%s"' "$backend_health" "$endpoint_health"
+  fi
   if [[ "$backend" == unknown || "$tls" == unknown || "$socket" == unknown ]]; then
     if [[ "$status_elevated" == 1 ]]; then
       printf 'localaictl: service-manager status is unavailable; unknown does not mean inactive. Check that the configured user manager is running and reachable.\n' >&2
@@ -754,10 +788,13 @@ status() {
     fi
   fi
   if [[ "$status_json" == 1 ]]; then
-    printf '{"backend":"%s","tls_compose":"%s","https_socket":"%s","tls_enabled":%s,"endpoint":"%s"}\n' \
-      "$backend" "$tls" "$socket" "$tls_configured" "$endpoint"
+    printf '{"backend":"%s","tls_compose":"%s","https_socket":"%s","tls_enabled":%s,"endpoint":"%s"%s}\n' \
+      "$backend" "$tls" "$socket" "$tls_configured" "$endpoint" "$health_json"
   else
     printf 'backend: %s\ntls-compose: %s\nhttps-socket: %s\nendpoint: %s\n' "$backend" "$tls" "$socket" "$endpoint"
+    if [[ "$status_health" == 1 ]]; then
+      printf 'backend-health: %s\nendpoint-health: %s\n' "$backend_health" "$endpoint_health"
+    fi
   fi
   [[ "$backend" == active && ( "$tls_configured" == false || ( "$tls" == active && ( "$socket" == active || "$socket" == disabled ) ) ) ]]
 }
@@ -1461,7 +1498,7 @@ restore_exit_cleanup() {
 
 usage() {
   cat <<'EOF'
-Usage: localaictl --version | [--dry-run] <bootstrap-admin|start|stop|restart|status [--json] [--elevated]|logs [backend|tls|all]|doctor|backup [--exclude-models] <dest>|restore [--yes] <src>>
+Usage: localaictl --version | [--dry-run] <bootstrap-admin|start|stop|restart|status [--json] [--health] [--elevated]|logs [backend|tls|all]|doctor|backup [--exclude-models] <dest>|restore [--yes] <src>>
 
 The command controls only the known LocalAI backend, TLS Compose service, and
 TLS forward socket. It does not accept arbitrary systemd or Podman commands.
@@ -1477,6 +1514,8 @@ LOCALAI_DOCTOR_INSECURE=true only as an explicit temporary diagnostic choice.
 
 Status reads do not prompt. Use status --elevated from a terminal when a
 service manager does not allow the current user to read its state.
+Use status --health to check HTTP readiness without credentials. For a local
+TLS CA, set LOCALAI_STATUS_CACERT to the trusted public certificate.
 EOF
 }
 
@@ -1519,7 +1558,7 @@ while [[ "$#" -gt 0 ]]; do
     start)
       shift
       [[ "$#" == 0 ]] || die "start accepts no arguments"
-      start_stack
+      control_stack start
       exit $?
       ;;
     backup)
@@ -1538,13 +1577,13 @@ while [[ "$#" -gt 0 ]]; do
     stop)
       shift
       [[ "$#" == 0 ]] || die "stop accepts no arguments"
-      stop_stack
+      control_stack stop
       exit $?
       ;;
     restart)
       shift
       [[ "$#" == 0 ]] || die "restart accepts no arguments"
-      stop_stack && start_stack
+      control_stack stop && control_stack start
       exit $?
       ;;
     status)
@@ -1552,8 +1591,9 @@ while [[ "$#" -gt 0 ]]; do
       while [[ "$#" -gt 0 ]]; do
         case "$1" in
           --json) status_json=1 ;;
+          --health) status_health=1 ;;
           --elevated) status_elevated=1 ;;
-          *) die "status accepts only --json and --elevated" ;;
+          *) die "status accepts only --json, --health, and --elevated" ;;
         esac
         shift
       done

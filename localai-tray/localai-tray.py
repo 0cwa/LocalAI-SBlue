@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
 
 from adapter import (
     command_args,
+    display_health,
     display_state,
     doctor_summary,
     endpoint,
@@ -25,7 +26,7 @@ from adapter import (
     parse_start_requested,
     parse_status,
     should_start_after_status,
-    stack_healthy,
+    stack_reachable,
 )
 
 
@@ -182,8 +183,8 @@ class LocalAITray(QSystemTrayIcon):
     def _set_status(self, status: dict[str, object] | None) -> None:
         self._status = status
         if status is None:
-            text = "Backend: unavailable · TLS: unavailable · HTTPS: unavailable"
-            healthy = False
+            text = "LocalAI: status unavailable"
+            reachable = False
             endpoint_text = "configuration unavailable"
             access_hint = ""
             self._manager_action.setVisible(False)
@@ -191,22 +192,21 @@ class LocalAITray(QSystemTrayIcon):
             backend = display_state(status.get("backend", "unknown"))
             tls = display_state(status.get("tls_compose", "disabled"))
             socket = display_state(status.get("https_socket", "disabled"))
-            text = f"Backend: {backend} · TLS: {tls} · HTTPS: {socket}"
-            healthy = stack_healthy(status)
-            try:
-                endpoint_text = endpoint(status)
-            except ValueError:
-                endpoint_text = "configuration unavailable"
-            access_hint = ""
+            backend_health = display_health(status.get("backend_health"))
+            endpoint_health = display_health(status.get("endpoint_health"))
+            text = f"LocalAI: {endpoint_health} · Backend: {backend_health}"
+            reachable = stack_reachable(status)
+            endpoint_text = endpoint(status)
+            access_hint = f"\nSystemd — backend: {backend} · TLS: {tls} · HTTPS socket: {socket}"
             if has_unavailable_manager(status):
-                access_hint = "\nRun localaictl status --elevated in a terminal for manager details."
+                access_hint += "\nRun localaictl status --elevated in a terminal for manager details."
                 self._manager_action.setText("Manager status unavailable · run localaictl status --elevated in a terminal")
                 self._manager_action.setVisible(True)
             else:
                 self._manager_action.setVisible(False)
         self._status_action.setText(text)
         self.setToolTip(f"LocalAI — {text}\n{endpoint_text}{access_hint}")
-        self._start_action.setEnabled(not self._controller.busy and not healthy)
+        self._start_action.setEnabled(not self._controller.busy and not reachable)
         self._stop_action.setEnabled(not self._controller.busy and status is not None)
         self._quit_stop_action.setEnabled(not self._controller.busy)
 
@@ -283,9 +283,10 @@ class LocalAITray(QSystemTrayIcon):
         if operation == "status":
             parsed = status if isinstance(status, dict) else None
             self._set_status(parsed)
-            if should_start_after_status(self._start_requested, parsed):
+            if self._start_requested and parsed is not None:
                 self._start_requested = False
-                self.start_service()
+                if should_start_after_status(True, parsed):
+                    self.start_service()
             return
         if operation == "doctor":
             self._show_information("LocalAI endpoint health", output)
