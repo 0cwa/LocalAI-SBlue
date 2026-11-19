@@ -258,6 +258,7 @@ fi
     cat >"$tmp_dir/validated-Caddyfile"
     return "$validation_status"
   }
+  selinuxenabled() { return 1; }
   run0_pipe() { [[ "$1" == /usr/bin/install ]] && cp -- "${@: -2}"; }
   log() { :; }
   die() { printf '%s\n' "$*" >&2; exit 1; }
@@ -275,6 +276,12 @@ fi
 
 # Static template checks protect the boot/readiness contract without invoking
 # systemd, Podman, SELinux, or a host installer in CI.
+restore_marker_guard='ExecStartPre=/usr/bin/test ! -e /var/lib/.localaictl-backup-restore.pending'
+for service_template in \
+  "$repo_root/secureblue-localai-install/localai.service.in" \
+  "$repo_root/localai-podman-compose/localai-tls-compose.service.in"; do
+  rg -q -x -F "$restore_marker_guard" "$service_template"
+done
 rg -q '^FreeBind=true$' "$repo_root/localai-podman-compose/localai-tls-forward.socket.in"
 rg -q '^Restart=on-failure$' "$repo_root/localai-podman-compose/localai-tls-forward.service.in"
 rg -q '^StartLimitBurst=5$' "$repo_root/localai-podman-compose/localai-tls-forward.service.in"

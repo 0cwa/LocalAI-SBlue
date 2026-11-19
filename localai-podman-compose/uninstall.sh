@@ -248,27 +248,53 @@ run_tls_unit() {
   run_as_tls "$@"
 }
 
+tls_host_unit_path() {
+  printf '/etc/systemd/system/%s\n' "$1"
+}
+
 stop_service() {
-  if [[ -f "/etc/systemd/system/$tls_forward_socket_name" ]]; then
+  if [[ -f "$(tls_host_unit_path "$tls_forward_socket_name")" ]]; then
     log "Disabling and stopping public HTTPS socket proxy if present"
-    run0_pipe /usr/bin/systemctl disable --now "$tls_forward_socket_name" || true
+    if ! run0_pipe /usr/bin/systemctl disable --now "$tls_forward_socket_name"; then
+      localai_installer_error "Could not disable and stop the public HTTPS socket."
+      return 1
+    fi
   fi
-  if [[ -f "/etc/systemd/system/$tls_forward_service_name" ]]; then
-    run0_pipe /usr/bin/systemctl stop "$tls_forward_service_name" || true
+  if [[ -f "$(tls_host_unit_path "$tls_forward_service_name")" ]]; then
+    if ! run0_pipe /usr/bin/systemctl stop "$tls_forward_service_name"; then
+      localai_installer_error "Could not stop the public HTTPS socket proxy."
+      return 1
+    fi
   fi
 
   if [[ -n "${tls_uid:-}" ]]; then
-    if [[ -f "$tls_state_dir/.config/systemd/user/$tls_service_name" ]]; then
-      log "Disabling and stopping $tls_service_name in the $tls_user user manager if present"
-      run_as_tls /usr/bin/systemctl --user disable --now "$tls_service_name" || true
-    fi
+    stop_tls_user_unit_if_present "$tls_service_name" "TLS user service" || return 1
     if [[ "$legacy_tls_service_name" != "$tls_service_name" ]]; then
-      if [[ -f "$tls_state_dir/.config/systemd/user/$legacy_tls_service_name" ]]; then
-        log "Disabling legacy direct-Caddy unit $legacy_tls_service_name if present"
-        run_as_tls /usr/bin/systemctl --user disable --now "$legacy_tls_service_name" || true
-      fi
+      stop_tls_user_unit_if_present "$legacy_tls_service_name" "legacy TLS user service" || return 1
     fi
   fi
+}
+
+stop_tls_user_unit_if_present() {
+  local unit="$1" description="$2" manager_status=0
+  [[ -f "$tls_state_dir/.config/systemd/user/$unit" ]] || return 0
+  localai_installer_user_manager_is_active "$tls_uid" || manager_status=$?
+  case "$manager_status" in
+    0)
+      log "Disabling and stopping $description in the $tls_user user manager"
+      if ! run_as_tls /usr/bin/systemctl --user disable --now "$unit"; then
+        localai_installer_error "Could not disable and stop $description."
+        return 1
+      fi
+      ;;
+    3)
+      log "The $tls_user user manager is inactive; no $description can be running."
+      ;;
+    *)
+      localai_installer_error "Could not determine whether the $tls_user user manager is active."
+      return 1
+      ;;
+  esac
 }
 
 confirm_tls_service_account_removal() {
@@ -291,6 +317,7 @@ remove_unit_and_config() {
   local user_unit="$tls_state_dir/.config/systemd/user/$tls_service_name"
   local compose_file="$tls_compose_dir/$tls_compose_file_name"
   log "Removing TLS proxy unit and compose artifacts"
+  remove_tls_user_unit_enablement
   if [[ -e "$user_unit" ]]; then
     localai_installer_check_managed_file "$user_unit" "TLS user unit" "${tls_uid:-0}" \
       '# Managed by LocalAI secureblue TLS installer.' 'Description=LocalAI TLS reverse proxy compose stack' || die "Refusing to remove an unrelated TLS unit."
@@ -318,17 +345,46 @@ remove_unit_and_config() {
     run_as_tls /usr/bin/systemctl --user daemon-reload || true
   fi
 
-  if [[ -e "/etc/systemd/system/$tls_forward_service_name" ]]; then
-    localai_installer_check_managed_file "/etc/systemd/system/$tls_forward_service_name" "TLS host socket-proxy unit" 0 \
+  if [[ -e "$(tls_host_unit_path "$tls_forward_service_name")" ]]; then
+    localai_installer_check_managed_file "$(tls_host_unit_path "$tls_forward_service_name")" "TLS host socket-proxy unit" 0 \
       '# Managed by LocalAI secureblue TLS installer.' 'Description=LocalAI HTTPS socket proxy' || die "Refusing to remove an unrelated host unit."
-    run0_pipe /usr/bin/rm -f -- "/etc/systemd/system/$tls_forward_service_name"
+    run0_pipe /usr/bin/rm -f -- "$(tls_host_unit_path "$tls_forward_service_name")"
   fi
-  if [[ -e "/etc/systemd/system/$tls_forward_socket_name" ]]; then
-    localai_installer_check_managed_file "/etc/systemd/system/$tls_forward_socket_name" "TLS host socket unit" 0 \
+  if [[ -e "$(tls_host_unit_path "$tls_forward_socket_name")" ]]; then
+    localai_installer_check_managed_file "$(tls_host_unit_path "$tls_forward_socket_name")" "TLS host socket unit" 0 \
       '# Managed by LocalAI secureblue TLS installer.' 'Description=LocalAI HTTPS socket' || die "Refusing to remove an unrelated host unit."
-    run0_pipe /usr/bin/rm -f -- "/etc/systemd/system/$tls_forward_socket_name"
+    run0_pipe /usr/bin/rm -f -- "$(tls_host_unit_path "$tls_forward_socket_name")"
   fi
   run0_pipe /usr/bin/systemctl daemon-reload
+}
+
+remove_tls_user_unit_enablement() {
+  local expected_uid="${tls_uid:-0}" unit_dir="$tls_state_dir/.config/systemd/user"
+  local wants_dir="$tls_state_dir/.config/systemd/user/default.target.wants"
+  local unit link target resolved_target expected_target owner
+  local -a units=("$tls_service_name")
+  [[ "$legacy_tls_service_name" == "$tls_service_name" ]] || units+=("$legacy_tls_service_name")
+
+  if [[ ! -e "$wants_dir" && ! -L "$wants_dir" ]]; then return 0; fi
+  localai_installer_check_directory_chain "$wants_dir" "TLS unit enablement directory" "$expected_uid" || die "Refusing unsafe TLS unit enablement directory."
+
+  for unit in "${units[@]}"; do
+    link="$wants_dir/$unit"
+    [[ -e "$link" || -L "$link" ]] || continue
+    [[ -L "$link" ]] || die "Refusing to remove an unexpected non-symlink TLS enablement entry."
+    owner="$(/usr/bin/stat -c '%u' -- "$link")" || die "Could not inspect TLS unit enablement ownership."
+    [[ "$owner" == "$expected_uid" ]] || die "Refusing to remove TLS unit enablement not owned by the service account."
+    target="$(/usr/bin/readlink -- "$link")" || die "Could not inspect TLS unit enablement target."
+    if [[ "$target" == /* ]]; then
+      resolved_target="$(/usr/bin/realpath -m -- "$target")" || die "Could not resolve TLS unit enablement target."
+    else
+      resolved_target="$(/usr/bin/realpath -m -- "$wants_dir/$target")" || die "Could not resolve TLS unit enablement target."
+    fi
+    expected_target="$(/usr/bin/realpath -m -- "$unit_dir/$unit")" || die "Could not resolve managed TLS unit path."
+    [[ "$resolved_target" == "$expected_target" ]] || die "Refusing to remove a TLS enablement link with an unexpected target."
+    log "Removing stale TLS user-unit enablement link for $unit"
+    run0_pipe /usr/bin/rm -f -- "$link"
+  done
 }
 
 selinux_port_state_file() {
@@ -336,28 +392,31 @@ selinux_port_state_file() {
 }
 
 tcp_port_type() {
-  local port="$1"
-  semanage port -l | awk -v port="$port" '
+  local port="$1" listing
+  listing="$(semanage port -l)" || return 1
+  printf '%s\n' "$listing" | awk -v port="$port" '
     $2 == "tcp" {
       for (i = 3; i <= NF; i++) {
-        item = $i
-        gsub(",", "", item)
-        split(item, range, "-")
-        if (range[2] == "" && range[1] == port) {
-          print $1
-          exit
-        }
-        if (range[2] != "" && port >= range[1] && port <= range[2]) {
-          print $1
-          exit
+        item_count = split($i, items, ",")
+        for (j = 1; j <= item_count; j++) {
+          count = split(items[j], bounds, "-")
+          if (count == 1 && bounds[1] == port) {
+            exact = $1
+          } else if (count == 2 && bounds[1] <= port && port <= bounds[2] && range == "") {
+            range = $1
+          }
         }
       }
+    }
+    END {
+      if (exact != "") print exact
+      else if (range != "") print range
     }
   '
 }
 
 restore_one_selinux_port_label() {
-  local role="$1"
+  local role="$1" local_override
   local state_file state action="" port="" previous_type="" new_type="" current_type
   state_file="$(selinux_port_state_file "$role")" || die "Invalid SELinux metadata role."
   [[ -e "$state_file" || -L "$state_file" ]] || return 0
@@ -365,8 +424,11 @@ restore_one_selinux_port_label() {
 
   state="$(localai_installer_read_selinux_port_state "$state_file")" || die "Refusing untrusted SELinux rollback metadata."
   IFS='|' read -r action port previous_type new_type <<< "$state"
-  current_type="$(tcp_port_type "$port")"
-  if [[ "$current_type" == "$new_type" && "$action" == add ]]; then
+  current_type="$(tcp_port_type "$port")" || die "Could not resolve SELinux type for TCP port $port."
+  local_override="$(tcp_port_local_override "$port")" || die "Could not inspect local SELinux port override for TCP port $port."
+  if [[ "$local_override" != "exact|$new_type" ]]; then
+    log "SELinux TCP port $port no longer has the tracked local exact override; leaving the administrator's change intact."
+  elif [[ "$current_type" == "$new_type" && "$action" == add ]]; then
     log "Removing SELinux TCP port label for $port"
     run0_pipe semanage port -d -p tcp "$port" || die "Could not remove tracked SELinux port label $port."
   elif [[ "$current_type" == "$new_type" && "$action" == modify ]]; then
@@ -405,6 +467,21 @@ remove_state() {
   [[ "$purge_state" == "1" ]] || return 0
   local expected_uid="${tls_uid:-0}"
   local path
+  if [[ -n "${tls_uid:-}" && "$remove_user" != 1 ]]; then
+    local process_status=0
+    tls_user_processes_running "$tls_uid" || process_status=$?
+    case "$process_status" in
+      0)
+        localai_installer_error "Refusing to purge TLS state while the service account still has running processes. Stop those processes or explicitly approve service-account removal."
+        return 1
+        ;;
+      1) ;;
+      *)
+        localai_installer_error "Could not verify whether the TLS service account still has running processes."
+        return 1
+        ;;
+    esac
+  fi
   local -a paths=(
     "$tls_state_dir" "$tls_cache_dir" "$tls_certs_dir" "$tls_config_dir"
     "$tls_compose_dir" "$tls_state_dir/data" "$tls_state_dir/config"
@@ -443,6 +520,97 @@ remove_state() {
   done
 }
 
+tcp_port_match_from_listing() {
+  local listing="$1" port="$2"
+  printf '%s\n' "$listing" | awk -v port="$port" '
+    $2 == "tcp" {
+      for (i = 3; i <= NF; i++) {
+        item_count = split($i, items, ",")
+        for (j = 1; j <= item_count; j++) {
+          count = split(items[j], bounds, "-")
+          if (count == 1 && bounds[1] == port) exact = $1
+          else if (count == 2 && bounds[1] <= port && port <= bounds[2] && range == "") range = $1
+        }
+      }
+    }
+    END { if (exact != "") print "exact|" exact; else if (range != "") print "range|" range }
+  '
+}
+
+tcp_port_local_override() {
+  local port="$1" listing
+  listing="$(semanage port -l -C)" || return 1
+  tcp_port_match_from_listing "$listing" "$port"
+}
+
+tls_user_processes_running() {
+  local uid="$1" status=0 pid manager_status=0 manager_pid=0 manager_cgroup=""
+  local pids
+  pids="$(/usr/bin/pgrep -u "$uid" 2>/dev/null)" || status=$?
+  case "$status" in
+    0) ;;
+    1) return 1 ;;
+    *) return 2 ;;
+  esac
+
+  localai_installer_user_manager_is_active "$uid" || manager_status=$?
+  case "$manager_status" in
+    0)
+      manager_pid="$(/usr/bin/systemctl show --property=MainPID --value "user@$uid.service" 2>/dev/null)" || return 2
+      manager_cgroup="$(/usr/bin/systemctl show --property=ControlGroup --value "user@$uid.service" 2>/dev/null)" || return 2
+      [[ "$manager_pid" =~ ^[0-9]+$ && "$manager_pid" -gt 1 && "$manager_cgroup" =~ ^/[A-Za-z0-9_./@-]+$ ]] || return 2
+      ;;
+    3) ;;
+    *) return 2 ;;
+  esac
+
+  while IFS= read -r pid; do
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 2
+    if [[ "$pid" == "$manager_pid" ]]; then
+      local pid_status=0
+      tls_user_pid_is_manager "$pid" "$uid" "$manager_pid" "$manager_cgroup" || pid_status=$?
+      case "$pid_status" in
+        0|3) continue ;;
+        1) return 0 ;;
+        *) return 2 ;;
+      esac
+    fi
+    return 0
+  done <<< "$pids"
+  return 1
+}
+
+tls_user_pid_is_manager() {
+  local pid="$1" uid="$2" manager_pid="$3" manager_cgroup="$4" proc_root="${5:-/proc}"
+  local process_dir="$proc_root/$pid" executable real_uid effective_uid cgroup_path
+  local -a cmdline=()
+  [[ "$pid" == "$manager_pid" ]] || return 1
+  [[ -d "$process_dir" ]] || return 3
+  executable="$(/usr/bin/readlink -f -- "$process_dir/exe")" || return 2
+  [[ "$executable" == /usr/lib/systemd/systemd ]] || return 1
+  mapfile -d '' -t cmdline <"$process_dir/cmdline" || return 2
+  [[ "${cmdline[1]:-}" == --user ]] || return 1
+  read -r real_uid effective_uid < <(/usr/bin/awk '$1 == "Uid:" { print $2, $3; found = 1; exit } END { if (!found) exit 1 }' "$process_dir/status") || return 2
+  [[ "$real_uid" == "$uid" && "$effective_uid" == "$uid" ]] || return 1
+  cgroup_path="$(/usr/bin/awk -F: '$1 == "0" && $2 == "" { print $3; found = 1; exit } END { if (!found) exit 1 }' "$process_dir/cgroup")" || return 2
+  [[ "$cgroup_path" == "$manager_cgroup/init.scope" ]]
+}
+
+wait_for_tls_user_processes() {
+  local attempt status
+  [[ -n "${tls_uid:-}" ]] || return 0
+  for ((attempt = 1; attempt <= 30; attempt += 1)); do
+    status=0
+    tls_user_processes_running "$tls_uid" || status=$?
+    case "$status" in
+      1) return 0 ;;
+      2) die "Could not verify whether the TLS service account processes have exited." ;;
+    esac
+    if [[ "$attempt" -lt 30 ]]; then sleep 1; fi
+  done
+  die "Could not stop every process for the TLS service account."
+}
+
 disable_tls_lifecycle_config() {
   [[ -f "$canonical_config" ]] || return 0
   localai_installer_update_config "$canonical_config" LOCALAI_TLS_ENABLED false || die "Could not update TLS lifecycle config."
@@ -457,14 +625,27 @@ disable_tls_user_linger() {
   run0_pipe /usr/bin/loginctl disable-linger "$tls_user" || true
   log "Terminating all processes for the explicitly approved TLS service account removal"
   run0_pipe /usr/bin/loginctl terminate-user "$tls_user" || true
+  wait_for_tls_user_processes
 }
 
 remove_tls_user() {
+  local userdel_status attempt
   [[ "$remove_user" == "1" ]] || return 0
   if getent passwd "$tls_user" >/dev/null; then
     [[ "$remove_user_confirmed" == "1" ]] || die "Refusing TLS service-account deletion without prior confirmation."
     log "Removing service user $tls_user"
-    run0_pipe /usr/sbin/userdel "$tls_user" || true
+    for ((attempt = 1; attempt <= 30; attempt += 1)); do
+      userdel_status=0
+      LC_ALL=C run0_pipe /usr/sbin/userdel "$tls_user" >/dev/null 2>&1 || userdel_status=$?
+      if ! getent passwd "$tls_user" >/dev/null; then
+        return 0
+      fi
+      if [[ "$userdel_status" != 8 ]]; then
+        die "Could not remove the TLS service account."
+      fi
+      if [[ "$attempt" -lt 30 ]]; then sleep 1; fi
+    done
+    die "Could not remove the TLS service account after waiting for its processes to exit."
   fi
 }
 
@@ -505,7 +686,7 @@ remove_container
 remove_unit_and_config
 restore_selinux_port_labels
 disable_tls_lifecycle_config
-remove_state
 disable_tls_user_linger
 remove_tls_user
+remove_state
 log "Compose-based TLS proxy uninstall complete."
